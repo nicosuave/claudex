@@ -21,20 +21,20 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::with_approval_timeout(1).await
+    }
+
+    async fn with_approval_timeout(seconds: u64) -> Self {
         let state = tempfile::Builder::new()
             .prefix("reconnect-")
             .tempdir_in("/tmp")
             .unwrap();
         let socket = state.path().join("rpc.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
-            .args([
-                "app-server",
-                "--claude",
-                env!("CARGO_BIN_EXE_fake-claude"),
-                "--approval-timeout-seconds",
-                "1",
-                "--listen",
-            ])
+            .args(["app-server", "--claude", env!("CARGO_BIN_EXE_fake-claude")])
+            .arg("--approval-timeout-seconds")
+            .arg(seconds.to_string())
+            .arg("--listen")
             .arg(format!("unix-lines://{}", socket.display()))
             .arg("--state-dir")
             .arg(state.path())
@@ -285,16 +285,18 @@ async fn approval_and_question_replay_keep_ids_and_pause_disconnected_time() {
 
 #[tokio::test]
 async fn reconnect_resumes_the_remaining_approval_budget_instead_of_resetting_it() {
-    let server = Server::start().await;
+    let server = Server::with_approval_timeout(4).await;
     let mut owner = server.connect().await;
     let thread = owner.thread().await;
     let turn = owner.turn(&thread, "tool").await;
     let original = owner
         .until(|value| value["method"] == "item/commandExecution/requestApproval")
         .await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Keep a wide gap between the remaining budget (1.5s) and a reset (4s),
+    // allowing CI scheduling and backend completion without accepting a reset.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     owner.close().await;
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    tokio::time::sleep(Duration::from_millis(4300)).await;
     let mut replacement = server.connect().await;
     let snapshot = replacement
         .ok("thread/resume", json!({"threadId":thread}))
@@ -304,7 +306,7 @@ async fn reconnect_resumes_the_remaining_approval_budget_instead_of_resetting_it
         .until(|value| value["method"] == "item/commandExecution/requestApproval")
         .await;
     assert_eq!(replay, original);
-    let completed = tokio::time::timeout(Duration::from_millis(800), replacement.completed(&turn))
+    let completed = tokio::time::timeout(Duration::from_secs(3), replacement.completed(&turn))
         .await
         .expect("reconnect reset the approval timeout instead of retaining its remaining budget");
     assert!(
