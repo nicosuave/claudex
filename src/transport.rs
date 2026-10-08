@@ -231,6 +231,14 @@ where
                 }
                 Some(Ok(Message::Ping(data))) => if sink.send(Message::Pong(data)).await.is_err() { break; },
                 Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(Message::Close(_))) => {
+                    // Reading Close queues Tungstenite's reply. Flush it before
+                    // dropping the connection so peers can finish the handshake.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1), sink.flush()
+                    ).await;
+                    break;
+                }
                 _ => break,
             }
         }

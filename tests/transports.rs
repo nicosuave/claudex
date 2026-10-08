@@ -315,6 +315,18 @@ async fn desktop_bootstrap_and_proxy_carry_websocket_chat_and_approval() {
         }
     }
     ws.close(None).await.unwrap();
+    // Finish the close handshake before dropping the proxy's stdout reader.
+    // Otherwise its pending close-frame write can correctly fail with EPIPE.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = ws.next().await.unwrap().unwrap();
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     drop(ws);
     assert!(
         tokio::time::timeout(Duration::from_secs(5), proxy.wait())
