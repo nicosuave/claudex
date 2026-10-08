@@ -9,16 +9,32 @@ This is a working core implementation, **not complete Codex feature parity**. Un
 ## macOS desktop installation
 
 ```sh
-cargo build --locked --release --bin claude-codex-server
-./target/release/claude-codex-server install
-./target/release/claude-codex-server doctor
+brew install nicosuave/tap/claudex
+claudex install
+claudex doctor
 ```
 
-Enable Remote Login for your user and authenticate Claude first. The installer
+Install Codex desktop and Claude Code, run `claude auth login`, and enable
+**System Settings > General > Sharing > Remote Login** for your user first. Run
+the installer as your login user, without `sudo`. The installer
 copies the binary to a stable per-user location, creates its own LaunchAgent and
 SSH connection, and checks service readiness. Select `claude-codex-local` in Codex
 Settings > Connections. See [DESKTOP.md](DESKTOP.md) for prerequisites, upgrades,
 service commands, uninstall behavior, and the precise local trust boundary.
+
+Prebuilt macOS (Apple Silicon/Intel) and Linux (ARM64/x86-64) binaries and SHA-256
+checksums are on [GitHub Releases](https://github.com/nicosuave/claudex/releases).
+macOS binaries are Developer ID signed and notarized. The desktop installer is
+macOS-only; Linux can run `claudex app-server --stdio`.
+
+To upgrade the installed desktop service after upgrading the formula:
+
+```sh
+brew upgrade nicosuave/tap/claudex
+claudex install
+```
+
+Wait for active chats to finish before upgrading the service.
 
 ## Build and run
 
@@ -122,3 +138,7 @@ Primary references:
 - [Claude Agent SDK subprocess implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
 
 The checked-in schema was generated with `codex app-server generate-json-schema --experimental` from the installed version, rather than fetched from a moving branch. See [NOTICE](NOTICE) for attribution.
+
+CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
+[releasing](docs/releasing.md) for the tagged Linux workflow, local macOS signing,
+and Homebrew update process.

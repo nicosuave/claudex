@@ -567,8 +567,23 @@ impl Backend {
             id: id.clone(),
         };
         tokio::time::timeout(timeout, async {
-            self.send(json!({"type":"control_request", "request_id":id, "request":request}))
-                .await?;
+            if let Err(error) = self
+                .send(json!({"type":"control_request", "request_id":id, "request":request}))
+                .await
+            {
+                // A child can exit before the write completes. send cancels the
+                // supervisor, which drains stderr before failing pending requests.
+                // Keep that diagnostic instead of reporting only a broken pipe.
+                // Drop any sender still in the map: a finished supervisor may
+                // have drained the map before this request was registered.
+                if self.task.as_ref().is_none_or(|task| task.is_finished()) {
+                    self.pending.lock().unwrap().remove(&id);
+                }
+                return match rx.await {
+                    Ok(Err(message)) => Err(error.context(message)),
+                    _ => Err(error),
+                };
+            }
             rx.await
                 .context("Claude control response channel closed")?
                 .map_err(|error| anyhow!(error))

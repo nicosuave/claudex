@@ -7,7 +7,7 @@ normal authentication is available. SSH transports the desktop connection.
 
 ## Install
 
-You need macOS, Rust with edition 2024 support, Codex desktop, and an authenticated
+You need macOS, Codex desktop, and an authenticated
 Claude Code CLI supporting `--system-prompt-snapshot` (tested with 2.1.294).
 Run `claude auth login` in a local terminal if necessary. Enable **Remote Login**
 for your user in **System Settings > General > Sharing**. The installer does not
@@ -15,14 +15,25 @@ enable Remote Login or change system settings. Run these commands as your normal
 login user, without `sudo`:
 
 ```sh
-cargo build --locked --release --bin claude-codex-server
-./target/release/claude-codex-server install
-./target/release/claude-codex-server doctor
+brew install nicosuave/tap/claudex
+claudex install
+claudex doctor
 ```
 
-If installed, use `mbx build` in place of `cargo build` for compiler caching.
-There is no published binary download assumed by these instructions. After
-installation, the checkout can move: the installed binary lives at
+Homebrew installs the signed, notarized release binary; Rust is not required.
+You can also unpack the matching archive from
+[GitHub Releases](https://github.com/nicosuave/claudex/releases), verify its
+`.sha256` checksum, and run `./claudex install`.
+
+To build from source instead, install Rust with edition 2024 support and run:
+
+```sh
+cargo build --locked --release --bin claude-codex-server
+./target/release/claude-codex-server install
+```
+
+Use `mbx build` in place of `cargo build` when Boxington is installed.
+After installation, the checkout can move: the installed binary lives at
 `~/Library/Application Support/claude-codex/bin/claude-codex-server`.
 
 The installer resolves `claude` and genuine `codex` from PATH, with a fallback to
@@ -70,7 +81,8 @@ model request. `service status` prints installed, loaded, and ready separately.
 The service label is `com.claude-codex.desktop`; logs are in
 `~/Library/Application Support/claude-codex/logs/server.log`.
 
-To upgrade, build the new source and run its `install` command again. The
+To upgrade, run `brew upgrade nicosuave/tap/claudex`, then `claudex install`.
+For a source installation, build the new source and run its `install` command again. The
 installer copies the binary and refreshes the service, preserving conversation
 state, the dedicated identity, and unrelated SSH entries. Wait for active chats
 to finish first. Stop, restart, and uninstall refuse active saved turns unless
