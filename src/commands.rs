@@ -531,7 +531,7 @@ fn spawn(
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut window,
+            &raw mut window,
         )
     } < 0
     {

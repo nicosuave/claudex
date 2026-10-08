@@ -2002,7 +2002,7 @@ impl Server {
     }
 
     async fn backend_event(&mut self, id: &str, turn_id: &str, event: BackendEvent) {
-        if !self.active.get(id).is_some_and(|a| a.id == turn_id) {
+        if self.active.get(id).is_none_or(|a| a.id != turn_id) {
             return;
         }
         match event {
@@ -2631,10 +2631,10 @@ impl Server {
         // The desktop can finish a tool during reconnect and send its cached
         // response as soon as initialization completes, before thread/resume.
         if !self.claim_detached_turn(client, &thread_id)
-            || !self
+            || self
                 .pending
                 .get(key)
-                .is_some_and(|p| p.owner == Some(client))
+                .is_none_or(|p| p.owner != Some(client))
         {
             return;
         }
