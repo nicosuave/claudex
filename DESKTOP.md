@@ -17,10 +17,12 @@ login user, without `sudo`:
 ```sh
 brew install nicosuave/tap/claudex
 claudex install
-claudex doctor
 ```
 
 Homebrew installs the signed, notarized release binary; Rust is not required.
+`claudex install` sets up the desktop service and connection and checks readiness.
+For optional diagnostics afterward, run `claudex doctor`; it does not install or
+upgrade anything.
 You can also unpack the matching archive from
 [GitHub Releases](https://github.com/nicosuave/claudex/releases), verify its
 `.sha256` checksum, and run `./claudex install`.
@@ -82,6 +84,8 @@ The service label is `com.claude-codex.desktop`; logs are in
 `~/Library/Application Support/claude-codex/logs/server.log`.
 
 To upgrade, run `brew upgrade nicosuave/tap/claudex`, then `claudex install`.
+Homebrew updates the command-line tool; the second command refreshes the separate
+stable binary used by the desktop service. Both steps are currently required.
 For a source installation, build the new source and run its `install` command again. The
 installer copies the binary and refreshes the service, preserving conversation
 state, the dedicated identity, and unrelated SSH entries. Wait for active chats

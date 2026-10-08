@@ -8,18 +8,30 @@ This is a working core implementation, **not complete Codex feature parity**. Un
 
 ## macOS desktop installation
 
-```sh
-brew install nicosuave/tap/claudex
-claudex install
-claudex doctor
-```
-
 Install Codex desktop and Claude Code, run `claude auth login`, and enable
-**System Settings > General > Sharing > Remote Login** for your user first. Run
-the installer as your login user, without `sudo`. The installer
-copies the binary to a stable per-user location, creates its own LaunchAgent and
-SSH connection, and checks service readiness. Select `claude-codex-local` in Codex
-Settings > Connections. See [DESKTOP.md](DESKTOP.md) for prerequisites, upgrades,
+**System Settings > General > Sharing > Remote Login** for your user first.
+
+1. Install the command-line tool:
+
+   ```sh
+   brew install nicosuave/tap/claudex
+   ```
+
+2. Set up the desktop connection as your login user, without `sudo`:
+
+   ```sh
+   claudex install
+   ```
+
+   This copies the binary to a stable per-user location, creates its LaunchAgent
+   and SSH connection, and checks service readiness.
+
+3. Select `claude-codex-local` in Codex **Settings > Connections**.
+
+If you need to diagnose a connection problem, run `claudex doctor`. It checks
+the setup; it does not install or upgrade anything.
+
+See [DESKTOP.md](DESKTOP.md) for prerequisites, upgrades,
 service commands, uninstall behavior, and the precise local trust boundary.
 
 Prebuilt macOS (Apple Silicon/Intel) and Linux (ARM64/x86-64) binaries and SHA-256
@@ -27,14 +39,19 @@ checksums are on [GitHub Releases](https://github.com/nicosuave/claudex/releases
 macOS binaries are Developer ID signed and notarized. The desktop installer is
 macOS-only; Linux can run `claudex app-server --stdio`.
 
-To upgrade the installed desktop service after upgrading the formula:
+### Upgrade
+
+Wait for active chats to finish. Update the Homebrew binary, then copy that
+updated binary into the desktop service and restart it:
 
 ```sh
 brew upgrade nicosuave/tap/claudex
 claudex install
 ```
 
-Wait for active chats to finish before upgrading the service.
+The second command refreshes an existing installation and preserves conversations
+and the SSH identity. It is currently required because the service runs its own
+stable copy of the binary; `brew upgrade` alone does not update that copy.
 
 ## Build and run
 
