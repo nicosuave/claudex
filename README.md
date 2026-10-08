@@ -1,4 +1,4 @@
-# claude-codex-server
+# Claudex
 
 A Rust facade that exposes the Codex app-server thread/turn protocol over Claude Code's bidirectional `claude -p` transport. Clients send Codex JSON-RPC messages; Claude does the inference and tool execution.
 
