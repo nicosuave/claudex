@@ -1,0 +1,6 @@
+/target/
+/.agents/
+/.state/
+/work/
+/dist/
+.DS_Store

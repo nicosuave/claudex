@@ -1,0 +1,137 @@
+# Codex desktop through a dedicated localhost SSH connection
+
+The macOS installer copies the facade to a stable per-user location and creates a
+login-session LaunchAgent, a dedicated localhost SSH identity, and the
+`claude-codex-local` SSH alias. Claude runs in the GUI login session, where its
+normal authentication is available. SSH transports the desktop connection.
+
+## Install
+
+You need macOS, Rust with edition 2024 support, Codex desktop, and an authenticated
+Claude Code CLI supporting `--system-prompt-snapshot` (tested with 2.1.294).
+Run `claude auth login` in a local terminal if necessary. Enable **Remote Login**
+for your user in **System Settings > General > Sharing**. The installer does not
+enable Remote Login or change system settings. Run these commands as your normal
+login user, without `sudo`:
+
+```sh
+cargo build --locked --release --bin claude-codex-server
+./target/release/claude-codex-server install
+./target/release/claude-codex-server doctor
+```
+
+If installed, use `mbx build` in place of `cargo build` for compiler caching.
+There is no published binary download assumed by these instructions. After
+installation, the checkout can move: the installed binary lives at
+`~/Library/Application Support/claude-codex/bin/claude-codex-server`.
+
+The installer resolves `claude` and genuine `codex` from PATH, with a fallback to
+`/Applications/Codex.app/Contents/Resources/codex` for Codex. Use `--claude
+/absolute/path/to/claude` when needed. `CLAUDE_CODEX_PLUGIN_EXECUTABLE` selects a
+particular genuine Codex binary; `CLAUDE_CODEX_PLUGIN_HOME` selects its existing
+home, normally `~/.codex`. These paths are recorded in the dedicated launchers.
+The facade does not copy credentials or replace either CLI.
+
+In **Codex Settings > Connections**, add or select **claude-codex-local**. Refresh
+the picker if it was already open. Choose identity-file authentication and select
+`~/Library/Application Support/claude-codex/id_ed25519` (the installer prints the
+expanded path). Port is **22**; the display name can be **Claude**. Select this
+connection for your project/chat and choose a Claude model, such as `opus`.
+Do not substitute plain `localhost`, which can select your ordinary SSH identity.
+
+Use **Workspace write** and **Approve for me** for native Claude auto review.
+Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit
+sandbox escapes ask for approval. MCP integrations and hooks remain trusted
+services outside that sandbox. Full access and manual approval modes are also
+available; read-only profiles are unsupported.
+
+If native auto review denies a tool before creating a permission callback, the
+facade cannot turn that denial into an approval dialog. Select **Ask for approval**
+for that chat in the desktop, then ask Claude to retry the specific action. This
+uses the native manual approval path; do not add a global allow rule to recover
+one denied action. An explicit configured deny rule can still prevent execution.
+
+## Manage the service
+
+Use the installed executable after moving or removing the build checkout:
+
+```sh
+facade="$HOME/Library/Application Support/claude-codex/bin/claude-codex-server"
+"$facade" doctor
+"$facade" service status
+"$facade" service stop
+"$facade" service start
+"$facade" service restart
+```
+
+`doctor` checks native executable compatibility, the private WebSocket handshake,
+the dedicated SSH route, and Claude's authentication status. It does not make a
+model request. `service status` prints installed, loaded, and ready separately.
+The service label is `com.claude-codex.desktop`; logs are in
+`~/Library/Application Support/claude-codex/logs/server.log`.
+
+To upgrade, build the new source and run its `install` command again. The
+installer copies the binary and refreshes the service, preserving conversation
+state, the dedicated identity, and unrelated SSH entries. Wait for active chats
+to finish first. Stop, restart, and uninstall refuse active saved turns unless
+you explicitly pass `--force`; forcing interrupts those turns. SSH transport
+reconnection preserves live turns, but restarting the facade process does not.
+
+```sh
+"$facade" service uninstall  # Remove only the LaunchAgent; keep the SSH connection.
+"$facade" uninstall          # Remove the LaunchAgent and managed SSH entries.
+```
+
+Both retain conversations, binaries, logs, and identity files. Full uninstall
+removes only the exact dedicated key authorization, not other authorized keys.
+Existing SSH config symlinks and file permissions are preserved. Legacy shell
+entry points delegate to the native installer/service manager; preparation-only
+mode is no longer available.
+
+## Installation boundary
+
+All instance files are under `~/Library/Application Support/claude-codex`, except
+its LaunchAgent in `~/Library/LaunchAgents` and the managed SSH entries in
+`~/.ssh/config` and `~/.ssh/authorized_keys`. The alias is prepended as a literal
+Host block so desktop discovery can find it. It restricts identity selection to
+the dedicated key and pins the localhost SSH host key. The authorized key accepts
+only loopback connections, disables forwarding and PTYs, and uses a forced
+launcher. It can still execute commands as your user; it is not a separate OS
+security principal.
+
+| Environment variable | Dedicated value |
+| --- | --- |
+| `CODEX_INSTALL_DIR` | Instance `bin` directory |
+| `CODEX_HOME` | Instance `codex-home` directory |
+| `CLAUDE_CODEX_HOME` | Instance `state` directory |
+| `CLAUDE_CODEX_SOCKET_DIR` | Instance `sockets` directory |
+| `CLAUDE_CODE_EXECUTABLE` | Resolved Claude CLI path |
+| `CLAUDE_CODEX_PLUGIN_EXECUTABLE` | Resolved genuine Codex CLI path |
+| `CLAUDE_CODEX_PLUGIN_HOME` | Existing Codex home |
+
+Genuine Codex supplies plugin services from its existing registry and auth;
+facade conversations use separate storage. The ordinary Codex connection and
+shell profiles remain unchanged. `CODEX_SSH_SKIP_APP_SERVER_BOOT=true` makes SSH
+use the already-running login-session service via `app-server proxy`.
+
+## Verification and limitations
+
+The protocol is pinned to Codex CLI 0.160.0. It is a supported subset, not complete
+feature parity. See [COMPATIBILITY.md](COMPATIBILITY.md) and the
+[desktop integration audit](docs/desktop-integration-audit.md). Native desktop
+pixels/menu interaction have not been automatically verified. Transport/RPC
+checks and opt-in live model probes cover separate parts of the integration.
+
+These optional probes make real Claude model requests and archive their test chats:
+
+```sh
+mbx build --locked --example desktop_smoke --example reconnect_smoke
+./target/debug/examples/desktop_smoke claude-codex-local opus
+./target/debug/examples/reconnect_smoke claude-codex-local opus
+```
+
+The first checks model/folder discovery, desktop-tool exchange, saved-path resume,
+timeline, host commands and queued native recall. The second reconnects during a
+pending desktop tool, checks stable request identity and returns a fresh token.
+For startup problems, inspect `doctor` and the instance log. Refresh the desktop
+connection after an upgrade to clear cached host capability information.

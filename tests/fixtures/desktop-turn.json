@@ -1,0 +1,49 @@
+{
+  "source": "app-shared-6c00c2afcf84.js",
+  "expressionSha256": "18fb2b26281d167904e27ec86f245663fdcedc4650675b28415b17836cf0fa22",
+  "request": {
+    "threadId": "$THREAD_ID",
+    "disabledPluginIds": [],
+    "turnTrigger": "submit",
+    "clientUserMessageId": "desktop-client-message",
+    "additionalContext": {},
+    "input": [
+      {
+        "type": "text",
+        "text": "desktop payload",
+        "text_elements": []
+      }
+    ],
+    "toolOutput": null,
+    "environments": null,
+    "cwd": "$CWD",
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "user",
+    "sandboxPolicy": {
+      "type": "dangerFullAccess"
+    },
+    "permissions": null,
+    "runtimeWorkspaceRoots": [
+      "$CWD"
+    ],
+    "model": "fable",
+    "cyberAccessProgram": null,
+    "serviceTier": null,
+    "effort": "max",
+    "multiAgentMode": "explicitRequestOnly",
+    "summary": "detailed",
+    "personality": "pragmatic",
+    "responsesapiClientMetadata": {
+      "workspace_kind": "project"
+    },
+    "outputSchema": null,
+    "collaborationMode": {
+      "mode": "default",
+      "settings": {
+        "model": "fable",
+        "reasoning_effort": "max",
+        "developer_instructions": null
+      }
+    }
+  }
+}

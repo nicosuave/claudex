@@ -1,0 +1,42 @@
+[package]
+name = "claude-codex-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A Rust Codex app-server protocol facade for Claude Code"
+readme = "README.md"
+# Distribution is an allowlist: never ship local transcripts, extracted app
+# bundles, private work notes, installation state, or compiler output.
+include = ["src/**", "tests/**", "examples/**", "scripts/**", "protocol/**", "licenses/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "DESKTOP.md", "COMPATIBILITY.md", "LICENSE", "NOTICE"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = { version = "0.3", features = ["sink"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+jsonschema = { version = "0.33", default-features = false }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.28"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "fake-claude"
+path = "tests/fixtures/fake_claude.rs"
+required-features = ["test-backend"]
+
+[features]
+test-backend = []
+
+[[bin]]
+name = "approval-claude"
+path = "tests/fixtures/approval_claude.rs"
+required-features = ["test-backend"]
