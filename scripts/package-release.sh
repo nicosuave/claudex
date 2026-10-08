@@ -12,7 +12,10 @@ target=$2
 platform=$3
 arch=$4
 manifest_version=$(awk '/^version = / {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)
-[[ "$version" == "$manifest_version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+[[ "$version" == "$manifest_version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "Release version must match Cargo.toml and use MAJOR.MINOR.PATCH" >&2
+  exit 1
+}
 case "$target:$platform:$arch" in
   aarch64-apple-darwin:macos:arm64|x86_64-apple-darwin:macos:x86_64|aarch64-unknown-linux-gnu:linux:arm64|x86_64-unknown-linux-gnu:linux:x86_64) ;;
   *) echo "Unsupported release target/platform/architecture" >&2; exit 2 ;;

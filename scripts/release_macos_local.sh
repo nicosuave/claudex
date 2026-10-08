@@ -6,7 +6,10 @@ cd "$root"
 repo=nicosuave/claudex
 manifest_version=$(awk '/^version = / {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)
 version=${1:-$manifest_version}
-[[ "$version" == "$manifest_version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+[[ "$version" == "$manifest_version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "Release version must match Cargo.toml and use MAJOR.MINOR.PATCH" >&2
+  exit 1
+}
 tag="v$version"
 profile=${NOTARY_PROFILE:-sidequery-notarization}
 artifacts="$root/target/release-assets"

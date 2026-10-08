@@ -45,7 +45,7 @@ fn published_archives_have_executable_licenses_and_verifiable_checksums() {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         run(
             root,
-            "bash",
+            "/bin/bash",
             &[
                 "scripts/package-release.sh",
                 "1.2.3",
@@ -77,7 +77,7 @@ fn published_archives_have_executable_licenses_and_verifiable_checksums() {
             );
         }
     }
-    let mismatch = Command::new("bash")
+    let mismatch = Command::new("/bin/bash")
         .args([
             "scripts/package-release.sh",
             "1.2.4",
