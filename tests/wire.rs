@@ -164,6 +164,84 @@ struct Client {
     serial: u64,
 }
 
+#[tokio::test]
+async fn configured_workspace_defaults_are_visible_and_explicit_policies_win() {
+    let state = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        state.path().join("workspace-defaults.json"),
+        json!({"writable_roots":[cache.path()],"network_access":true}).to_string(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let config = client.ok("config/read", json!({})).await;
+    assert_eq!(
+        config["config"]["sandbox_workspace_write"]["network_access"],
+        true
+    );
+    assert_eq!(
+        config["config"]["sandbox_workspace_write"]["writable_roots"],
+        json!([cache.path()])
+    );
+    for params in [
+        json!({}),
+        json!({"permissions":":workspace"}),
+        json!({"sandbox":"workspace-write"}),
+    ] {
+        let started = client.ok("thread/start", params).await;
+        assert_eq!(started["sandbox"]["networkAccess"], true);
+        assert_eq!(started["sandbox"]["writableRoots"], json!([cache.path()]));
+    }
+    let restricted = json!({"type":"workspaceWrite","networkAccess":false,"writableRoots":[],
+        "excludeSlashTmp":false,"excludeTmpdirEnvVar":false});
+    let started = client
+        .ok("thread/start", json!({"sandboxPolicy":restricted}))
+        .await;
+    assert_eq!(started["sandbox"], restricted);
+    let combined = client
+        .ok(
+            "thread/start",
+            json!({"sandbox":"workspace-write","sandboxPolicy":restricted}),
+        )
+        .await;
+    assert_eq!(combined["sandbox"], restricted);
+    let id = &started["thread"]["id"];
+    let resumed = client.ok("thread/resume", json!({"threadId":id})).await;
+    assert_eq!(resumed["sandbox"], restricted);
+    let resumed = client
+        .ok(
+            "thread/resume",
+            json!({"threadId":id,"permissions":":workspace"}),
+        )
+        .await;
+    assert_eq!(resumed["sandbox"]["networkAccess"], true);
+    let forked = client
+        .ok(
+            "thread/fork",
+            json!({"threadId":id,"sandboxPolicy":restricted}),
+        )
+        .await;
+    assert_eq!(forked["sandbox"], restricted);
+    for (selection, expected_network) in [
+        (json!({"permissions":":workspace"}), true),
+        (json!({"sandboxPolicy":restricted}), false),
+    ] {
+        let mut params = selection;
+        params["threadId"] = id.clone();
+        params["input"] = json!([{"type":"text","text":"hello","text_elements":[]}]);
+        let turn = client.ok("turn/start", params).await;
+        client.completed(turn["turn"]["id"].as_str().unwrap()).await;
+        let resumed = client.ok("thread/resume", json!({"threadId":id})).await;
+        assert_eq!(resumed["sandbox"]["networkAccess"], expected_network);
+    }
+    let full = client
+        .ok("thread/start", json!({"permissions":":danger-full-access"}))
+        .await;
+    assert_eq!(full["sandbox"]["type"], "dangerFullAccess");
+    client.close().await;
+}
+
 impl Client {
     async fn spawn(state: &Path) -> Self {
         Self::spawn_with_args(state, &[]).await

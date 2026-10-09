@@ -58,6 +58,49 @@ sandbox escapes ask for approval. MCP integrations and hooks remain trusted
 services outside that sandbox. Full access and manual approval modes are also
 available; read-only profiles are unsupported.
 
+### Development sandbox settings
+
+To allow routine network access and writes to build caches, create
+`~/Library/Application Support/claude-codex/state/workspace-defaults.json`:
+
+```json
+{
+  "network_access": true,
+  "writable_roots": ["/absolute/path/to/cache"]
+}
+```
+
+For a custom `--state-dir`, place the file there instead. Roots must be existing
+absolute directories; `~` is not expanded. The service reads this file at startup
+and reports its grants through `config/read`. Restart the idle service and refresh
+the desktop connection after editing it. New chats and explicit selections of the
+Workspace preset use these defaults. Existing chats retain their saved policy
+until you reselect the preset; explicit `sandboxPolicy` requests always win,
+including `networkAccess: false`. Without this file, the restrictive defaults stay
+unchanged. Do not put this host configuration in a repository's Claude settings.
+
+In your user Claude settings (`~/.claude/settings.json`), these native options can
+remove common development friction:
+
+```json
+{
+  "sandbox": {
+    "allowUnsandboxedCommands": true,
+    "enableWeakerNetworkIsolation": true,
+    "network": { "allowLocalBinding": true }
+  }
+}
+```
+
+Unsandboxed retries still require desktop approval; an existing `false` prohibits
+them. On macOS, `enableWeakerNetworkIsolation` permits access to the system TLS
+trust service for Go tools such as `gh`; it does not disable certificate checking.
+This opens access to that service beyond the network proxy boundary. Local binding
+is honored only when the selected workspace policy grants network access. Unix
+sockets and command exclusions remain restricted. Existing native deny rules are
+preserved. Each new turn reloads native settings; changing them does not require
+a service restart.
+
 If native auto review denies a tool before creating a permission callback, the
 facade cannot turn that denial into an approval dialog. Select **Ask for approval**
 for that chat in the desktop, then ask Claude to retry the specific action. This
