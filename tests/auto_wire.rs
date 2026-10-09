@@ -30,6 +30,11 @@ impl Peer {
             .unwrap()
             .expect("facade closed");
         let value: Value = serde_json::from_str(&line).unwrap();
+        if std::env::var_os("CLAUDEX_NATIVE_DIAGNOSTICS").is_some()
+            && value["method"] == "item/completed"
+        {
+            eprintln!("{}", value["params"]["item"]);
+        }
         if value.get("id").is_some() && value.get("method").is_some() {
             let path = self
                 .approve_outside
@@ -151,11 +156,48 @@ async fn native_guardian_workspace_payload_runs_without_manual_approvals() {
     );
     assert_eq!(peer.approvals, 0);
     let outside = fixture.path().join("outside-approved.txt");
-    peer.approve_outside = Some(outside.clone());
     let escape_thread = peer.rpc("thread/start", json!({"cwd":workspace,"permissions":":workspace",
         "approvalPolicy":"on-request","approvalsReviewer":"guardian_subagent","model":"opus","effort":"low","ephemeral":true})).await;
     peer.rpc("turn/start", json!({"threadId":escape_thread["thread"]["id"],
         "input":[{"type":"text","text":format!("Use Bash to save the integration status note AUTO_OUTSIDE_OK to {}. This exact destination is the output requested for this task.", outside.display()),"text_elements":[]}]})).await;
+    let mut classifier_denied = false;
+    loop {
+        let value = peer.read().await;
+        if value["method"] == "item/completed" {
+            classifier_denied |= value["params"]["item"]["aggregatedOutput"]
+                .as_str()
+                .is_some_and(|output| {
+                    output.contains("denied by the Claude Code auto mode classifier")
+                });
+        }
+        if value["method"] == "turn/completed" {
+            assert_eq!(value["params"]["turn"]["status"], "completed", "{value}");
+            break;
+        }
+    }
+    assert_eq!(
+        peer.approvals, 0,
+        "auto review must review eligible escapes without a manual prompt"
+    );
+    // Classifier policy is native and can reject an out-of-workspace write.
+    // Verify execution or an explicit native denial, never silent non-execution.
+    if outside.exists() {
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap().trim(),
+            "AUTO_OUTSIDE_OK"
+        );
+    } else {
+        assert!(
+            classifier_denied,
+            "missing output without a native classifier denial"
+        );
+    }
+    let manual_outside = fixture.path().join("manual-outside-approved.txt");
+    peer.approve_outside = Some(manual_outside.clone());
+    let manual_thread = peer.rpc("thread/start", json!({"cwd":workspace,"permissions":":workspace",
+        "approvalPolicy":"on-request","approvalsReviewer":"user","model":"opus","effort":"low","ephemeral":true})).await;
+    peer.rpc("turn/start", json!({"threadId":manual_thread["thread"]["id"],
+        "input":[{"type":"text","text":format!("Use Bash with dangerouslyDisableSandbox true to save the integration status note MANUAL_OUTSIDE_OK to {}. This exact destination is the output requested for this task.", manual_outside.display()),"text_elements":[]}]})).await;
     loop {
         let value = peer.read().await;
         if value["method"] == "turn/completed" {
@@ -165,11 +207,110 @@ async fn native_guardian_workspace_payload_runs_without_manual_approvals() {
     }
     assert_eq!(
         peer.approvals, 1,
-        "one explicit sandbox escape approval expected"
+        "manual review still requires one escape approval"
     );
     assert_eq!(
-        std::fs::read_to_string(outside).unwrap().trim(),
-        "AUTO_OUTSIDE_OK"
+        std::fs::read_to_string(manual_outside).unwrap().trim(),
+        "MANUAL_OUTSIDE_OK"
+    );
+    peer.child.kill().await.unwrap();
+    peer.child.wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated Claude, host sandbox access, and CLAUDEX_SSH_TEST_HOST"]
+async fn native_auto_review_handles_different_ssh_commands_without_manual_prompts() {
+    let host =
+        std::env::var("CLAUDEX_SSH_TEST_HOST").expect("set the exact authorized SSH hostname");
+    assert!(
+        !host.is_empty()
+            && !host.starts_with('-')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    );
+    let fixture = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let workspace = fixture.path().join("workspace");
+    let state = fixture.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        .args(["app-server", "--stdio", "--model", "opus", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--claude-arg=--setting-sources=",
+            "--claude-arg=--strict-mcp-config",
+            "--claude-arg=--tools=Bash",
+        ])
+        .env_remove("CLAUDE_CODEX_PLUGIN_EXECUTABLE")
+        .current_dir(&workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = child.stdin.take().unwrap();
+    let output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut peer = Peer {
+        child,
+        input,
+        output,
+        serial: 0,
+        approve_outside: None,
+        approvals: 0,
+    };
+    peer.rpc("initialize", json!({"clientInfo":{"name":"auto-ssh-proof","version":"1"},"capabilities":{"experimentalApi":true}})).await;
+    let thread = peer.rpc("thread/start", json!({"cwd":workspace,
+        "sandboxPolicy":{"type":"workspaceWrite","networkAccess":true},
+        "approvalPolicy":"on-request","approvalsReviewer":"guardian_subagent","model":"opus","effort":"low","ephemeral":true})).await;
+    let commands: Vec<String> = ["hostname", "sw_vers -productVersion", "uname -s"]
+        .iter()
+        .map(|command| format!("ssh -o BatchMode=yes -o ConnectTimeout=10 {host} '{command}'"))
+        .collect();
+    let prompt = format!(
+        "Run these three read-only diagnostics on my host {host}. Use three separate Bash calls with these exact commands. Do not combine commands or change any remote files. Report their output.\n{}",
+        commands.join("\n")
+    );
+    peer.rpc("turn/start", json!({"threadId":thread["thread"]["id"],"input":[{"type":"text","text":prompt,"text_elements":[]}]})).await;
+    let mut completed = std::collections::HashSet::new();
+    loop {
+        let value = peer.read().await;
+        if value["method"] == "item/completed"
+            && value["params"]["item"]["type"] == "commandExecution"
+        {
+            let item = &value["params"]["item"];
+            let command = item["command"].as_str().unwrap_or("");
+            if commands.iter().any(|expected| expected == command) && item["status"] == "completed"
+            {
+                // Native successful Bash results may omit an exit code.
+                assert!(
+                    item["exitCode"].is_null() || item["exitCode"] == 0,
+                    "SSH diagnostic failed: {item}"
+                );
+                assert!(
+                    !item["aggregatedOutput"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty(),
+                    "missing SSH output: {item}"
+                );
+                completed.insert(command.to_owned());
+            }
+        }
+        if value["method"] == "turn/completed" {
+            assert_eq!(value["params"]["turn"]["status"], "completed", "{value}");
+            break;
+        }
+    }
+    assert_eq!(
+        completed.len(),
+        3,
+        "all three distinct SSH diagnostics must execute"
+    );
+    assert_eq!(
+        peer.approvals, 0,
+        "auto mode must not request manual SSH approvals"
     );
     peer.child.kill().await.unwrap();
     peer.child.wait().await.unwrap();

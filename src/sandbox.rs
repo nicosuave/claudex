@@ -8,6 +8,50 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Host-owned defaults advertised to the desktop. Explicit per-turn policies
+/// remain authoritative; project Claude settings cannot widen these roots.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceDefaults {
+    pub writable_roots: Vec<PathBuf>,
+    pub network_access: bool,
+}
+
+impl WorkspaceDefaults {
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join("workspace-defaults.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error).context("reading workspace defaults"),
+        };
+        let defaults: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid workspace defaults in {}", path.display()))?;
+        defaults.policy().validate()?;
+        Ok(defaults)
+    }
+
+    pub fn policy(&self) -> Policy {
+        Policy::WorkspaceWrite {
+            writable_roots: self.writable_roots.clone(),
+            network_access: self.network_access,
+            exclude_slash_tmp: false,
+            exclude_tmpdir_env_var: false,
+        }
+    }
+
+    pub fn desktop_config(&self) -> Value {
+        json!({
+            "writable_roots": self.writable_roots,
+            "network_access": self.network_access,
+            "exclude_slash_tmp": false,
+            "exclude_tmpdir_env_var": false
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Policy {
@@ -64,7 +108,12 @@ impl Policy {
         Ok(())
     }
 
-    pub fn apply_native(&self, settings: &mut Value, cwd: &Path) -> Result<()> {
+    pub fn apply_native(
+        &self,
+        settings: &mut Value,
+        cwd: &Path,
+        permission_mode: &str,
+    ) -> Result<()> {
         let Self::WorkspaceWrite {
             writable_roots,
             network_access,
@@ -104,10 +153,13 @@ impl Policy {
             .or_insert(json!([]))
             .as_array_mut()
             .context("permissions.ask must be an array")?;
-        // Native auto can deny an unsandboxed retry without surfacing a host
-        // callback. Route this explicit full-boundary escape to the desktop's
-        // approval flow so a blocked build has an actionable recovery path.
-        if !ask.contains(&json!("Bash(dangerouslyDisableSandbox:true)")) {
+        // Manual review must expose sandbox escapes to the desktop. Auto mode
+        // must instead let Claude's classifier review them: an injected ask rule
+        // forces every escape back to the human, defeating Approve for me.
+        // Preserve any explicit user/managed ask rules loaded above.
+        if permission_mode != "auto"
+            && !ask.contains(&json!("Bash(dangerouslyDisableSandbox:true)"))
+        {
             ask.push(json!("Bash(dangerouslyDisableSandbox:true)"));
         }
         let mut protected = Vec::new();
@@ -161,7 +213,11 @@ impl Policy {
         );
         network.insert("allowUnixSockets".into(), json!([]));
         network.insert("allowAllUnixSockets".into(), json!(false));
-        network.insert("allowLocalBinding".into(), json!(false));
+        // Local development servers are opt-in native settings, and only apply
+        // to profiles that already grant network access.
+        if !network_access {
+            network.insert("allowLocalBinding".into(), json!(false));
+        }
         // Use the native allowlist-checking proxy rather than an external proxy
         // whose egress policy is not described by this workspace profile.
         network.remove("httpProxyPort");
@@ -247,7 +303,7 @@ impl Policy {
         {
             bail!("Native settings grant network access beyond the requested workspace policy");
         }
-        if effective["sandbox"]["network"]["allowLocalBinding"] == true
+        if (!network_access && effective["sandbox"]["network"]["allowLocalBinding"] == true)
             || !effective["sandbox"]["network"]["httpProxyPort"].is_null()
             || !effective["sandbox"]["network"]["socksProxyPort"].is_null()
         {

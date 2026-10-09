@@ -172,6 +172,7 @@ pub struct Server {
     plugin_manager: Arc<crate::plugin_runtime::Manager>,
     config: ServerConfig,
     defaults: ModelDefaults,
+    workspace_defaults: crate::sandbox::WorkspaceDefaults,
     model_catalog: Option<Vec<Value>>,
     store: Store,
     records: BTreeMap<String, Record>,
@@ -188,12 +189,14 @@ impl Server {
     pub fn new(config: ServerConfig, store: Store, events: mpsc::Sender<Event>) -> Result<Self> {
         let records = store.load()?;
         let defaults = store.load_defaults(config.default_model.clone())?;
+        let workspace_defaults = crate::sandbox::WorkspaceDefaults::load(store.root())?;
         // Compile the supported wire contracts once, before accepting connections.
         Schemas::get();
         Ok(Self {
             plugin_manager: Arc::default(),
             config,
             defaults,
+            workspace_defaults,
             model_catalog: None,
             store,
             records,
@@ -533,7 +536,18 @@ impl Server {
         method: &str,
         p: &Value,
     ) -> RpcResult<Option<Value>> {
-        let (params, warnings) = crate::desktop::normalize(method, p)?;
+        let (mut params, warnings) = crate::desktop::normalize(method, p)?;
+        // Named workspace presets use the host defaults. Never override an
+        // explicit sandboxPolicy, including an explicit networkAccess=false.
+        if matches!(
+            method,
+            "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
+        ) && (p["permissions"] == ":workspace"
+            || (params["sandbox"] == "workspace-write" && params["sandboxPolicy"].is_null()))
+        {
+            params.as_object_mut().unwrap().remove("sandbox");
+            params["sandboxPolicy"] = json!(self.workspace_defaults.policy());
+        }
         let p = &params;
         for message in warnings {
             self.send(
@@ -727,7 +741,7 @@ impl Server {
                 let mut settings =
                     Settings::new(self.config.default_cwd.clone(), self.defaults.model.clone());
                 settings.effort = self.defaults.effort.clone();
-                settings.sandbox = crate::sandbox::Policy::workspace();
+                settings.sandbox = self.workspace_defaults.policy();
                 settings.apply(p)?;
                 let record = Record::new(
                     settings,
@@ -1418,17 +1432,11 @@ impl Server {
                 config.insert("approval_policy".into(), json!("on-request"));
                 config.insert("approvals_reviewer".into(), json!("user"));
                 config.insert("sandbox_mode".into(), json!("workspace-write"));
-                // These are facade defaults, not the plugin sidecar's workspace
-                // permissions. Explicit values also prevent sidecar config from
-                // turning the desktop's standard workspace preset into Custom.
+                // These are host-configured facade defaults, not the plugin
+                // sidecar's permissions. The desktop must show the actual grants.
                 config.insert(
                     "sandbox_workspace_write".into(),
-                    json!({
-                        "writable_roots": [],
-                        "network_access": false,
-                        "exclude_slash_tmp": false,
-                        "exclude_tmpdir_env_var": false
-                    }),
+                    self.workspace_defaults.desktop_config(),
                 );
                 if let Some(sidecar_config) = crate::plugin_runtime::configured(
                     p["cwd"]
