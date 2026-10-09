@@ -54,8 +54,8 @@ Do not substitute plain `localhost`, which can select your ordinary SSH identity
 
 Use **Workspace write** and **Approve for me** for native Claude auto review.
 Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit
-sandbox escapes ask for approval. MCP integrations and hooks remain trusted
-services outside that sandbox. Full access and manual approval modes are also
+sandbox escapes use the selected automatic or manual reviewer. MCP integrations
+and hooks remain trusted services outside that sandbox. Full access and manual approval modes are also
 available; read-only profiles are unsupported.
 
 ### Development sandbox settings
@@ -92,14 +92,22 @@ remove common development friction:
 }
 ```
 
-Unsandboxed retries still require desktop approval; an existing `false` prohibits
-them. On macOS, `enableWeakerNetworkIsolation` permits access to the system TLS
+Unsandboxed retries use native automatic review under **Approve for me** and
+desktop approval under **Ask for approval**; an existing `false` prohibits them.
+Explicit native ask/deny rules remain authoritative. On macOS,
+`enableWeakerNetworkIsolation` permits access to the system TLS
 trust service for Go tools such as `gh`; it does not disable certificate checking.
 This opens access to that service beyond the network proxy boundary. Local binding
 is honored only when the selected workspace policy grants network access. Unix
 sockets and command exclusions remain restricted. Existing native deny rules are
 preserved. Each new turn reloads native settings; changing them does not require
 a service restart.
+
+Claude’s network sandbox uses a proxy even with network access enabled; raw SSH
+can still need an unsandboxed retry. The selected automatic reviewer can approve
+that retry without a manual prompt. Codex can permit native TCP directly when
+network access is enabled without a managed proxy. The two runtimes do not have
+identical network enforcement or classifier decisions.
 
 If native auto review denies a tool before creating a permission callback, the
 facade cannot turn that denial into an approval dialog. Select **Ask for approval**

@@ -254,7 +254,9 @@ fn launch_settings(
     supplied |= !native.is_empty();
     merge_settings(&mut settings, options.native_settings.clone());
     if options.sandbox.is_workspace() {
-        options.sandbox.apply_native(&mut settings, &options.cwd)?;
+        options
+            .sandbox
+            .apply_native(&mut settings, &options.cwd, &options.permission_mode)?;
         supplied = true;
     }
     Ok((args, supplied.then_some(settings)))

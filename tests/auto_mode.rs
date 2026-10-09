@@ -125,7 +125,7 @@ fn native_settings_keep_restrictions_and_unrelated_settings_without_widening_roo
     let mut settings =
         load_settings_from(&project, &user, &project, &["user", "project", "local"]).unwrap();
     Policy::workspace()
-        .apply_native(&mut settings, &project)
+        .apply_native(&mut settings, &project, "acceptEdits")
         .unwrap();
     assert_eq!(
         settings["permissions"]["deny"][0],
@@ -168,7 +168,9 @@ fn resolved_native_sandbox_is_checked_before_any_user_work() {
     let fixture = tempfile::tempdir().unwrap();
     let policy = Policy::workspace();
     let mut effective = json!({});
-    policy.apply_native(&mut effective, fixture.path()).unwrap();
+    policy
+        .apply_native(&mut effective, fixture.path(), "acceptEdits")
+        .unwrap();
     let settings = json!({"effective":effective});
     let status = json!({"supported":true,"enabled":true,"enabled_in_settings":true,
         "excluded_commands":[],"restrictions":{"fs_allow_write":[fixture.path().canonicalize().unwrap()],
@@ -200,6 +202,38 @@ fn resolved_native_sandbox_is_checked_before_any_user_work() {
     let mut bad = settings.clone();
     bad["effective"]["sandbox"]["filesystem"]["disabled"] = json!(true);
     assert!(policy.verify_native(&bad, &status, fixture.path()).is_err());
+}
+
+#[test]
+fn auto_review_does_not_inject_manual_escape_approvals() {
+    use claude_codex_server::sandbox::Policy;
+    let fixture = tempfile::tempdir().unwrap();
+    let escape_rule = json!("Bash(dangerouslyDisableSandbox:true)");
+    for mode in ["auto", "acceptEdits", "dontAsk"] {
+        let mut settings = json!({});
+        Policy::workspace()
+            .apply_native(&mut settings, fixture.path(), mode)
+            .unwrap();
+        assert_eq!(
+            settings["permissions"]["ask"]
+                .as_array()
+                .unwrap()
+                .contains(&escape_rule),
+            mode != "auto"
+        );
+    }
+    // Explicit operator asks/denies still apply in auto mode.
+    let mut settings = json!({"permissions":{"ask":[escape_rule],"deny":["Bash(rm:*)"]}});
+    Policy::workspace()
+        .apply_native(&mut settings, fixture.path(), "auto")
+        .unwrap();
+    assert!(
+        settings["permissions"]["ask"]
+            .as_array()
+            .unwrap()
+            .contains(&escape_rule)
+    );
+    assert_eq!(settings["permissions"]["deny"], json!(["Bash(rm:*)"]));
 }
 
 #[test]
@@ -246,7 +280,9 @@ fn local_servers_require_network_access_and_an_explicit_native_setting() {
                 "enableWeakerNetworkIsolation":true,
                 "network":{"allowLocalBinding":allow_binding}
             }});
-            policy.apply_native(&mut native, fixture.path()).unwrap();
+            policy
+                .apply_native(&mut native, fixture.path(), "acceptEdits")
+                .unwrap();
             assert_eq!(
                 native["sandbox"]["network"]["allowLocalBinding"],
                 network_access && allow_binding
@@ -276,7 +312,9 @@ fn local_servers_require_network_access_and_an_explicit_native_setting() {
         ..Default::default()
     }
     .policy();
-    policy.apply_native(&mut native, fixture.path()).unwrap();
+    policy
+        .apply_native(&mut native, fixture.path(), "acceptEdits")
+        .unwrap();
     assert_ne!(native["sandbox"]["network"]["allowLocalBinding"], true);
 }
 

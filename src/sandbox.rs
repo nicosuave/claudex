@@ -108,7 +108,12 @@ impl Policy {
         Ok(())
     }
 
-    pub fn apply_native(&self, settings: &mut Value, cwd: &Path) -> Result<()> {
+    pub fn apply_native(
+        &self,
+        settings: &mut Value,
+        cwd: &Path,
+        permission_mode: &str,
+    ) -> Result<()> {
         let Self::WorkspaceWrite {
             writable_roots,
             network_access,
@@ -148,10 +153,13 @@ impl Policy {
             .or_insert(json!([]))
             .as_array_mut()
             .context("permissions.ask must be an array")?;
-        // Native auto can deny an unsandboxed retry without surfacing a host
-        // callback. Route this explicit full-boundary escape to the desktop's
-        // approval flow so a blocked build has an actionable recovery path.
-        if !ask.contains(&json!("Bash(dangerouslyDisableSandbox:true)")) {
+        // Manual review must expose sandbox escapes to the desktop. Auto mode
+        // must instead let Claude's classifier review them: an injected ask rule
+        // forces every escape back to the human, defeating Approve for me.
+        // Preserve any explicit user/managed ask rules loaded above.
+        if permission_mode != "auto"
+            && !ask.contains(&json!("Bash(dangerouslyDisableSandbox:true)"))
+        {
             ask.push(json!("Bash(dangerouslyDisableSandbox:true)"));
         }
         let mut protected = Vec::new();
