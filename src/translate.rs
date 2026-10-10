@@ -20,6 +20,7 @@ pub struct Translator {
     completed: HashSet<String>,
     started_at: HashMap<String, u64>,
     final_messages: HashSet<String>,
+    native_tasks: HashMap<String, String>,
     include_reasoning: bool,
 }
 
@@ -40,6 +41,7 @@ impl Translator {
             completed: HashSet::new(),
             started_at: HashMap::new(),
             final_messages: HashSet::new(),
+            native_tasks: HashMap::new(),
             include_reasoning: true,
         }
     }
@@ -406,6 +408,49 @@ impl Translator {
                     if block["type"] == "tool_result" {
                         self.tool_result(block, &message["tool_use_result"], &mut events);
                     }
+                }
+            }
+            Some("system") if message["subtype"] == "task_started" => {
+                // Agent's tool result acknowledges launch, not completion. Keep
+                // separate native task activity visible while the parent yields.
+                if matches!(
+                    message["task_type"].as_str(),
+                    Some("local_agent" | "local_workflow")
+                ) && let Some(task) = message["task_id"].as_str()
+                {
+                    let id = format!("claude-task-{task}");
+                    self.native_tasks.insert(task.to_owned(), id.clone());
+                    self.start(json!({"type":"dynamicToolCall","id":id,"namespace":"claude",
+                        "tool":if message["task_type"] == "local_workflow" { "Background workflow" } else { "Background agent" },
+                        "arguments":{"description":message["description"],"taskId":task},
+                        "status":"inProgress","contentItems":null,"success":null,"durationMs":null}), &mut events);
+                }
+            }
+            Some("system")
+                if message["subtype"] == "task_notification"
+                    || message["subtype"] == "task_updated" =>
+            {
+                let status = if message["subtype"] == "task_updated" {
+                    &message["patch"]["status"]
+                } else {
+                    &message["status"]
+                };
+                if matches!(
+                    status.as_str(),
+                    Some("completed" | "failed" | "killed" | "stopped")
+                ) && let Some(task) = message["task_id"].as_str()
+                    && let Some(id) = self.native_tasks.remove(task)
+                {
+                    let text = message["summary"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| message["reason"].as_str())
+                        .unwrap_or_else(|| status.as_str().unwrap());
+                    self.tool_result(
+                        &json!({"tool_use_id":id,"content":text,"is_error":status != "completed"}),
+                        &Value::Null,
+                        &mut events,
+                    );
                 }
             }
             Some("system") if message["subtype"] == "permission_denied" => {
