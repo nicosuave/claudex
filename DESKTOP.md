@@ -118,11 +118,13 @@ unsandboxed retry. Codex can permit native TCP directly when
 network access is enabled without a managed proxy. The two runtimes do not have
 identical network enforcement or classifier decisions.
 
-If native auto review denies a tool before creating a permission callback, the
-facade cannot turn that denial into an approval dialog. Select **Ask for approval**
-for that chat in the desktop, then ask Claude to retry the specific action. This
-uses the native manual approval path; do not add a global allow rule to recover
-one denied action. An explicit configured deny rule can still prevent execution.
+If native auto review denies an action, explicit subsequent authorization in chat
+(such as "I allow that" in response to the denial) tells Claude to retry that same
+action once through native review. It does not automatically allow execution or
+change reviewer mode. If the reviewer still denies it, **Ask for approval** in
+that chat provides the native manual review path. A terminal classifier denial
+does not itself create an approval callback. Do not add a global allow rule to
+recover one action; explicit deny rules and managed restrictions still apply.
 
 ## Manage the service
 

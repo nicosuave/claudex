@@ -459,7 +459,7 @@ impl Translator {
                     .as_str()
                     .unwrap_or("Native permission check denied the action");
                 let recovery = if message["decision_reason_type"] == "classifier" {
-                    " To review a retry yourself, select 'Ask for approval' in this chat's permissions menu, then ask to retry. Workspace sandbox restrictions remain in place; no global allow rule is required."
+                    " You can explicitly authorize this specific action in chat for a fresh native review. If it remains denied, select 'Ask for approval' in this chat's permissions menu for manual review. Workspace sandbox restrictions remain in place; no global allow rule is required."
                 } else {
                     " Explicit deny rules and managed restrictions remain in effect."
                 };

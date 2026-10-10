@@ -86,6 +86,10 @@ fn native_denial_warning_preserves_reason_without_claiming_an_approval_is_pendin
         let message = events[0]["params"]["message"].as_str().unwrap();
         assert!(message.contains("Fixture denied") && message.contains("no pending approval"));
         assert_eq!(message.contains("Ask for approval"), kind == "classifier");
+        assert_eq!(
+            message.contains("explicitly authorize this specific action"),
+            kind == "classifier"
+        );
     }
 }
 
