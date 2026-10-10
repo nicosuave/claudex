@@ -80,10 +80,22 @@ fn proxy_refusal_and_missing_auth_fail_without_direct_fallback_or_secret_output(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut bytes = [0; 4096];
-        assert!(stream.read(&mut bytes).unwrap() > 0);
+        let (stream, _) = listener.accept().unwrap();
         stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        // Drain the complete request before closing, avoiding a TCP reset when
+        // the headers arrive in multiple packets.
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        reader
+            .get_mut()
             .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nsecret response body")
             .unwrap();
     });
@@ -92,7 +104,7 @@ fn proxy_refusal_and_missing_auth_fail_without_direct_fallback_or_secret_output(
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     let error = String::from_utf8(result.stderr).unwrap();
-    assert!(error.contains("proxy refused"));
+    assert!(error.contains("proxy refused"), "{error}");
     assert!(!error.contains("secret"));
     let result = helper(port)
         .env_remove("CLOUDSDK_PROXY_PASSWORD")
