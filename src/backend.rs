@@ -25,6 +25,8 @@ use tokio_util::{
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 const STDERR_TAIL: usize = 16 * 1024;
+// Well below the native hook's 60-second fail-open timeout.
+const FILE_CALLBACK_DEADLINE: Duration = Duration::from_secs(5);
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
@@ -38,6 +40,7 @@ pub struct BackendConfig {
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     pub cwd: PathBuf,
+    pub state_dir: PathBuf,
     pub session_id: String,
     pub resume: bool,
     pub fork_from: Option<String>,
@@ -71,9 +74,48 @@ pub struct Backend {
     initialization: Value,
 }
 
+struct PreparedLaunch {
+    command: Command,
+    file_guard: Option<crate::file_guard::FileGuard>,
+    managed_settings: Option<Value>,
+}
+
+#[cfg(test)]
 fn command(config: &BackendConfig, options: &SessionOptions) -> Result<Command> {
+    Ok(prepare_launch(config, options)?.command)
+}
+
+fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<PreparedLaunch> {
+    let profile = if options.sandbox.is_workspace() {
+        Some(crate::native_profile::NativeProfile::prepare(
+            &options.state_dir,
+            &options.cwd,
+            &options.session_id,
+        )?)
+    } else {
+        None
+    };
     let mut cmd = Command::new(&config.executable);
-    let (extra_args, settings) = launch_settings(config, options)?;
+    let (extra_args, settings) = launch_settings(config, options, profile.as_ref())?;
+    let managed_settings = profile
+        .as_ref()
+        .map(|profile| {
+            options.sandbox.managed_settings(
+                settings.as_ref().context("workspace settings missing")?,
+                &options.cwd,
+                &options.permission_mode,
+                profile,
+            )
+        })
+        .transpose()?;
+    let file_guard = crate::file_guard::FileGuard::new(
+        &options.cwd,
+        &options.sandbox,
+        profile
+            .as_ref()
+            .map(|p| p.protected_paths.as_slice())
+            .unwrap_or(&[]),
+    )?;
     cmd.args(extra_args).args([
         "-p",
         "--input-format",
@@ -93,6 +135,12 @@ fn command(config: &BackendConfig, options: &SessionOptions) -> Result<Command> 
     ]);
     if let Some(settings) = settings {
         cmd.arg(format!("--settings={settings}"));
+    }
+    if let Some(managed) = &managed_settings {
+        cmd.arg(format!("--managed-settings={managed}"));
+    }
+    if let Some(profile) = &profile {
+        cmd.envs(&profile.environment);
     }
     if let Some(source) = &options.fork_from {
         cmd.arg(format!("--resume={source}"))
@@ -144,7 +192,11 @@ fn command(config: &BackendConfig, options: &SessionOptions) -> Result<Command> 
     cmd.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     #[cfg(unix)]
     cmd.process_group(0);
-    Ok(cmd)
+    Ok(PreparedLaunch {
+        command: cmd,
+        file_guard,
+        managed_settings,
+    })
 }
 
 /// Preserve caller-provided settings (including permission rules) while adding
@@ -152,6 +204,7 @@ fn command(config: &BackendConfig, options: &SessionOptions) -> Result<Command> 
 fn launch_settings(
     config: &BackendConfig,
     options: &SessionOptions,
+    profile: Option<&crate::native_profile::NativeProfile>,
 ) -> Result<(Vec<String>, Option<Value>)> {
     let mut args = Vec::new();
     let mut settings = json!({});
@@ -179,6 +232,10 @@ fn launch_settings(
                 "--dangerously-skip-permissions",
                 "--allow-dangerously-skip-permissions",
                 "--permission-mode",
+                "--managed-settings",
+                "--project-config-root",
+                "--bare",
+                "--restricted",
             ]
             .iter()
             .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
@@ -241,11 +298,34 @@ fn launch_settings(
         {
             bail!("unsupported Claude setting source");
         }
-        settings = crate::sandbox::load_settings(&options.cwd, &sources)?;
+        // Only permissions/sandbox restrictions need lifting into host policy.
+        // Native sources retain ownership of skills, hooks and other features;
+        // snapshotting project hooks here would execute them a second time.
+        let mut restrictions = crate::sandbox::load_settings(
+            &options.cwd,
+            &sources
+                .iter()
+                .copied()
+                .filter(|s| *s != "user")
+                .collect::<Vec<_>>(),
+        )?;
+        if sources.contains(&"user") {
+            let mut user = profile
+                .context("workspace native profile missing")?
+                .user_settings
+                .clone();
+            crate::sandbox::merge(&mut user, restrictions);
+            restrictions = user;
+        }
+        for key in ["permissions", "sandbox"] {
+            if let Some(value) = restrictions.get(key) {
+                settings[key] = value.clone();
+            }
+        }
         for overlay in overlays {
             crate::sandbox::merge(&mut settings, overlay);
         }
-        args.extend(["--setting-sources".into(), "".into()]);
+        args.extend(["--setting-sources".into(), sources.join(",")]);
     }
     let native = options
         .native_settings
@@ -281,6 +361,20 @@ fn kill_group(id: u32) {
     }
     #[cfg(not(unix))]
     let _ = id;
+}
+
+// A supervisor panic must also kill descendants, not just Child's main process.
+struct ProcessGroupGuard {
+    id: u32,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.alive.load(Ordering::Acquire) {
+            kill_group(self.id);
+        }
+    }
 }
 
 fn parse_frame(line: &str) -> Result<Option<Value>> {
@@ -384,9 +478,16 @@ impl Backend {
         if options.resume && options.fork_from.is_some() {
             bail!("Cannot resume and fork a Claude session simultaneously");
         }
-        let mut child = command(config, options)?
-            .spawn()
-            .context("starting Claude subprocess")?;
+        let PreparedLaunch {
+            mut command,
+            file_guard,
+            managed_settings,
+        } = prepare_launch(config, options)?;
+        let hooks = file_guard
+            .as_ref()
+            .map(|guard| guard.hooks())
+            .unwrap_or(Value::Null);
+        let mut child = command.spawn().context("starting Claude subprocess")?;
         let process_id = child.id().context("Claude subprocess has no process ID")?;
         let stdin = Arc::new(tokio::sync::Mutex::new(Some(
             child.stdin.take().context("missing Claude stdin")?,
@@ -403,6 +504,10 @@ impl Backend {
         let task_stdin = stdin.clone();
         let dynamic_tools = options.dynamic_tools.clone();
         let task = tokio::spawn(async move {
+            let _process_guard = ProcessGroupGuard {
+                id: process_id,
+                alive: task_alive.clone(),
+            };
             let tail = Arc::new(Mutex::new(Vec::<u8>::new()));
             let stderr_tail = tail.clone();
             let mut stderr_task = tokio::spawn(async move {
@@ -434,6 +539,20 @@ impl Backend {
                         line = lines.next() => {
                             let Some(line) = line else { break; };
                             let Some(value) = parse_frame(&line.context("reading Claude stdout")?)? else { continue; };
+                            // Recognize even malformed hook envelopes before generic
+                            // control routing can return a permissive protocol error.
+                            if crate::file_guard::is_callback(&value) {
+                                let guard = file_guard.clone().context("unregistered native hook callback")?;
+                                tokio::select! {
+                                    _ = task_cancel.cancelled() => break,
+                                    result = tokio::time::timeout(FILE_CALLBACK_DEADLINE, async {
+                                        let response = tokio::task::spawn_blocking(move || guard.response(&value))
+                                            .await.context("file callback task failed")??;
+                                        write_frame(&task_stdin, &response).await
+                                    }) => result.context("native file callback deadline exceeded")??,
+                                }
+                                continue;
+                            }
                             if value["type"] == "control_response" {
                                 let response = &value["response"];
                                 if let Some(id) = response["request_id"].as_str()
@@ -448,13 +567,21 @@ impl Backend {
                             if let Some(response) = mcp_control_response(&value, &dynamic_tools) {
                                 tokio::select! {
                                     _ = task_cancel.cancelled() => break,
-                                    result = write_frame(&task_stdin, &response) => result?,
+                                    result = tokio::time::timeout(FILE_CALLBACK_DEADLINE, write_frame(&task_stdin, &response)) => result.context("native control reply deadline exceeded")??,
                                 }
                                 continue;
                             }
-                            tokio::select! {
-                                _ = task_cancel.cancelled() => break,
-                                result = tx.send(BackendEvent::Message(value)) => if result.is_err() { break; },
+                            if file_guard.is_some() {
+                                // A full event queue must not stall stdout and hide a pending
+                                // hook until Claude's fail-open timeout. Stop the process on
+                                // overload instead of silently losing events or decisions.
+                                tx.try_send(BackendEvent::Message(value))
+                                    .context("native event consumer stalled during guarded session")?;
+                            } else {
+                                tokio::select! {
+                                    _ = task_cancel.cancelled() => break,
+                                    result = tx.send(BackendEvent::Message(value)) => if result.is_err() { break; },
+                                }
                             }
                         }
                     }
@@ -517,7 +644,7 @@ impl Backend {
             initialization: Value::Null,
         };
         let initialized = tokio::select! {
-            result = backend.control(json!({"subtype":"initialize", "hooks":null}), config.initialize_timeout) => result,
+            result = backend.control(json!({"subtype":"initialize", "hooks":hooks}), config.initialize_timeout) => result,
             _ = startup_cancel.cancelled() => Err(anyhow!("Claude startup cancelled")),
         };
         match initialized {
@@ -532,7 +659,9 @@ impl Backend {
                 result = async {
                     let settings = backend.control(json!({"subtype":"get_settings"}), config.initialize_timeout).await?;
                     let status = backend.control(json!({"subtype":"get_sandbox_dialog"}), config.initialize_timeout).await?;
-                    options.sandbox.verify_native(&settings, &status, &options.cwd)
+                    let rules = backend.control(json!({"subtype":"list_permission_rules"}), config.initialize_timeout).await?;
+                    options.sandbox.verify_native_with_rules(&settings, &status, &rules,
+                        managed_settings.as_ref().context("workspace managed policy missing")?, &options.cwd)
                 } => result,
                 _ = startup_cancel.cancelled() => Err(anyhow!("Claude startup cancelled")),
             };
@@ -729,6 +858,7 @@ mod tests {
     fn test_options() -> SessionOptions {
         SessionOptions {
             cwd: std::env::temp_dir(),
+            state_dir: std::env::temp_dir().join("claudex-backend-tests"),
             session_id: "test-session".into(),
             resume: false,
             fork_from: None,
@@ -952,5 +1082,159 @@ mod tests {
             matches!(event, BackendEvent::Exited { success: false, message } if message.contains("malformed Claude JSON frame"))
         );
         backend.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    fn guarded_options(dir: &std::path::Path) -> SessionOptions {
+        let cwd = dir.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        SessionOptions {
+            cwd,
+            state_dir: dir.join("state"),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            sandbox: crate::sandbox::Policy::workspace(),
+            ..test_options()
+        }
+    }
+
+    #[cfg(unix)]
+    fn file_request(cwd: &std::path::Path, path: &std::path::Path) -> Value {
+        json!({"type":"control_request","request_id":"file-hook","request":{
+            "subtype":"hook_callback","callback_id":crate::file_guard::CALLBACK_ID,
+            "input":{"hook_event_name":"PreToolUse","cwd":cwd,"tool_name":"Write",
+                "tool_input":{"file_path":path,"content":"fixture"}}
+        }})
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_callback_is_registered_and_serviced_before_init_on_every_mode_and_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = guarded_options(dir.path());
+        for (mode, resume) in [("acceptEdits", false), ("auto", true), ("dontAsk", true)] {
+            options.permission_mode = mode.into();
+            options.resume = resume;
+            let inside = file_request(&options.cwd, &options.cwd.join("new/file"));
+            let outside = file_request(&options.cwd, &dir.path().join("outside"));
+            let script = format!(
+                r#"
+                read -r initialization
+                case "$initialization" in *claudex-workspace-files*) ;; *) exit 11 ;; esac
+                case " $* " in *--permission-mode={mode}*) ;; *) exit 12 ;; esac
+                printf '%s\n' '{inside}'
+                read -r response
+                case "$response" in *'"response":{{}}'*) ;; *) exit 13 ;; esac
+                printf '%s\n' '{outside}'
+                read -r response
+                case "$response" in *'"permissionDecision":"deny"'*) ;; *) exit 14 ;; esac
+                case "$response" in *'"subtype":"success"'*) ;; *) exit 15 ;; esac
+                echo 'verified file callback decisions' >&2
+                exit 37
+            "#
+            );
+            let error = Backend::spawn(&shell_config(&script), &options)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("verified file callback decisions"),
+                "{mode} resume={resume}: {error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrouteable_hook_and_broken_callback_transport_kill_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = guarded_options(dir.path());
+        for failure in ["identity", "subtype", "outer-type", "transport"] {
+            let broken_transport = failure == "transport";
+            let marker = dir.path().join(format!("{failure}-escaped"));
+            let mut request = file_request(&options.cwd, &dir.path().join("outside"));
+            match failure {
+                "identity" => request["request"]["callback_id"] = json!("unregistered"),
+                "subtype" => request["request"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("subtype")
+                    .map(|_| ())
+                    .unwrap(),
+                "outer-type" => request["type"] = json!("invalid"),
+                _ => {}
+            }
+            let script = format!(
+                r#"
+                read -r initialization
+                {}
+                printf '%s\n' '{request}'
+                sleep 1
+                printf 'native continued' > '{}'
+                sleep 10
+            "#,
+                if broken_transport { "exec 0<&-" } else { ":" },
+                marker.display()
+            );
+            let error = Backend::spawn(&shell_config(&script), &options)
+                .await
+                .err()
+                .unwrap();
+            let message = format!("{error:#}");
+            let expected = match failure {
+                "transport" => "writing Claude stdin",
+                "identity" => "unexpected native file callback",
+                _ => "invalid native file callback envelope",
+            };
+            assert!(message.contains(expected), "{message}");
+            assert!(!marker.exists(), "native process survived failed callback");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_callback_delivery_and_event_backpressure_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = guarded_options(dir.path());
+        let callback = file_request(&options.cwd, &dir.path().join("outside"));
+        // Never drain callback replies. Once the pipe fills, the host must
+        // terminate before native's 60-second permissive hook timeout.
+        let script = format!(
+            r#"
+            read -r initialization
+            i=0
+            while [ "$i" -lt 2000 ]; do
+                printf '%s\n' '{callback}'
+                i=$((i + 1))
+            done
+            sleep 60
+        "#
+        );
+        let mut config = shell_config(&script);
+        config.initialize_timeout = Duration::from_secs(15);
+        let started = std::time::Instant::now();
+        let error = Backend::spawn(&config, &options).await.err().unwrap();
+        assert!(
+            format!("{error:#}").contains("native file callback deadline exceeded"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(12));
+
+        let script = r#"
+            read -r initialization
+            i=0
+            while [ "$i" -lt 150 ]; do
+                printf '{"type":"system","subtype":"fixture"}\n'
+                i=$((i + 1))
+            done
+            sleep 60
+        "#;
+        let error = Backend::spawn(&shell_config(script), &options)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("native event consumer stalled"),
+            "{error:#}"
+        );
     }
 }

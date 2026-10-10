@@ -103,6 +103,13 @@ sockets and command exclusions remain restricted. Existing native deny rules are
 preserved. Each new turn reloads native settings; changing them does not require
 a service restart.
 
+Native skills and nested instructions load normally in workspace sessions. Direct
+file tools can edit authorized workspace files automatically, but outside and
+protected destinations are blocked. For those changes, Claude must request an
+explicit Bash escape, which uses the selected reviewer (or is denied by never
+ask). Callback handling failures stop the native process instead of allowing the
+write. See [native loading and permissions](docs/native-skill-settings-boundary.md).
+
 Claude’s network sandbox uses a proxy even with network access enabled; raw SSH
 can still need an unsandboxed retry. The selected automatic reviewer can approve
 that retry without a manual prompt. Codex can permit native TCP directly when

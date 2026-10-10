@@ -1244,6 +1244,7 @@ impl Server {
                 supported_fields(p, &["cursor", "limit", "includeHidden"])?;
                 if self.model_catalog.is_none() {
                     let options = SessionOptions {
+                        state_dir: self.store.root().to_path_buf(),
                         sandbox: Default::default(),
                         cwd: self.config.default_cwd.clone(),
                         session_id: protocol::id(),
@@ -1879,6 +1880,7 @@ impl Server {
         record.touch();
         self.store.save(&record).map_err(RpcError::internal)?;
         let options = SessionOptions {
+            state_dir: self.store.root().to_path_buf(),
             sandbox: record.settings.sandbox.clone(),
             cwd: record.settings.cwd.clone(),
             session_id: record.session_id.clone(),

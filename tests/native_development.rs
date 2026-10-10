@@ -30,6 +30,7 @@ async fn native_workspace_tls_cache_and_local_server() {
         initialize_timeout: Duration::from_secs(30),
     };
     let options = SessionOptions {
+        state_dir: fixture.path().join("state"),
         cwd: workspace,
         session_id: uuid::Uuid::new_v4().to_string(),
         resume: false,
