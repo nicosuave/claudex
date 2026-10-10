@@ -42,6 +42,14 @@ SDK `PreToolUse` callback for `Write`, `Edit` and `NotebookEdit` to close that g
 - Outside destinations, symlink escapes, invalid inputs and protected paths are
   explicitly denied. Existing ancestors are resolved for newly created paths.
 - Direct writes to `.git`, `.codex`, `.agents` and native configuration are denied.
+  Native configuration is protected entry by entry around its `projects`
+  transcript namespace, because a wholesale deny rule would override native's
+  auto-memory exception.
+- The session's auto-memory directory is the one exception outside the roots.
+  The guard learns it from native's `system/init` message and accepts it only in
+  the default `projects/<project>/memory` shape, so a repository-configured
+  `autoMemoryDirectory` cannot open another path. Memory writes then follow the
+  selected native reviewer, like other outside edits.
 - Outside or protected changes must use an explicit Bash escape. Those retain the
   selected native reviewer: manual approval, native auto classification, or
   denial without prompting in `dontAsk` mode. A configured prohibition on escapes
@@ -61,11 +69,18 @@ never through the UI approval queue. Invalid tool inputs and path-resolution
 errors produce a successful protocol reply containing an explicit denial.
 Malformed/unknown callback envelopes, resolver task failures, blocked replies,
 transport errors and event-consumer overload terminate the native process group.
+Callback detection uses envelope fields only, never tool inputs. The stdout reader
+never waits on the event consumer: events behind a slow consumer are buffered
+(up to 128 MiB) so a pending callback is always read and answered, and only a
+backlog beyond that limit is treated as overload.
 The callback deadline is five seconds, below the native hook's sixty seconds.
 Supervisor cancellation, drop and panic also terminate the backend group.
 
 Registration and policy verification repeat on every native process start,
-including resumed turns and reviewer changes.
+including resumed turns and reviewer changes. They depend on `--managed-settings`
+and `list_permission_rules`, so workspace sessions require Claude Code 2.1.294 or
+newer; startup errors say so. Profiles idle for 30 days are removed on the next
+launch and rebuilt on demand.
 
 ## Validation
 

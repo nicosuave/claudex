@@ -12,6 +12,28 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde_json::{Value, json};
 
+// User-tier features that native discovers under its config directory.
+const LINKED_FEATURES: [&str; 7] = [
+    "skills",
+    "commands",
+    "agents",
+    "rules",
+    "output-styles",
+    "workflows",
+    "CLAUDE.md",
+];
+// Protected even before they exist, so a later native write cannot appear unguarded.
+const PROTECTED_CONFIG: [&str; 6] = [
+    "settings.json",
+    "settings.local.json",
+    ".credentials.json",
+    "hooks",
+    "plugins",
+    "keybindings.json",
+];
+// Profiles are rebuilt on every launch, so an idle one is safe to remove.
+const STALE_PROFILE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
 #[derive(Clone, Debug)]
 pub struct NativeProfile {
     pub config_dir: PathBuf,
@@ -19,6 +41,9 @@ pub struct NativeProfile {
     pub user_settings: Value,
     pub protected_paths: Vec<PathBuf>,
     pub readable_paths: Vec<PathBuf>,
+    /// Native transcript namespace. Only the session's auto-memory directory
+    /// inside it is writable through file tools.
+    pub transcripts: PathBuf,
 }
 
 impl NativeProfile {
@@ -119,19 +144,22 @@ impl NativeProfile {
         }
         write_json(&config_dir.join("settings.json"), &user_settings)?;
 
-        let mut protected_paths = vec![
-            namespace.canonicalize()?,
-            original.clone(),
-            metadata.clone(),
-            plugins.clone(),
-        ];
+        // Protect the native configuration except its transcript namespace:
+        // native auto-memory lives there, and a wholesale deny rule would
+        // override native's memory write exception.
+        let mut protected_paths = vec![metadata.clone(), plugins.clone()];
+        for name in PROTECTED_CONFIG {
+            protected_paths.push(original.join(name));
+        }
+        protected_paths.extend(entries_except(&original, "projects")?);
         let mut readable_paths = Vec::new();
-        for name in ["skills", "commands", "agents", "rules", "CLAUDE.md"] {
+        for name in LINKED_FEATURES {
             let target = original.join(name);
             let link = config_dir.join(name);
             ensure_link(&link, &target)?;
             readable_paths.push(link);
             readable_paths.push(target.clone());
+            protected_paths.push(target.clone());
             if let Ok(real) = target.canonicalize() {
                 readable_paths.push(real.clone());
                 protected_paths.push(real);
@@ -142,6 +170,23 @@ impl NativeProfile {
         fs::create_dir_all(original.join("projects"))
             .context("creating native transcript directory")?;
         ensure_link(&config_dir.join("projects"), &original.join("projects"))?;
+        let transcripts = original.join("projects").canonicalize()?;
+        let sessions = config_dir.parent().context("profile has no namespace")?;
+        remove_stale_profiles(sessions, &config_dir);
+        // Native addresses memory through this profile's projects link, so the
+        // profile namespace is protected entry by entry around that link.
+        let namespace = namespace.canonicalize()?;
+        protected_paths.extend(entries_except(&namespace, sessions.file_name().unwrap())?);
+        protected_paths.extend(entries_except(sessions, config_dir.file_name().unwrap())?);
+        protected_paths.extend(entries_except(&config_dir, "projects")?);
+        for name in [
+            "settings.json",
+            ".claude.json",
+            "source.json",
+            "profile.lock",
+        ] {
+            protected_paths.push(config_dir.join(name));
+        }
         // The native plugin root override owns registry/cache lookup; preserve
         // its exact namespace instead of rebuilding the plugin catalog.
         let mut environment = BTreeMap::new();
@@ -193,7 +238,58 @@ impl NativeProfile {
             user_settings,
             protected_paths,
             readable_paths,
+            transcripts,
         })
+    }
+}
+
+/// Rule-expressible entries of `dir` other than `except`. Names that cannot be
+/// written in a permission rule stay covered by the file guard's root check.
+fn entries_except(dir: &Path, except: impl AsRef<std::ffi::OsStr>) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("listing {}", dir.display()));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if name != except.as_ref()
+            && name
+                .to_str()
+                .is_some_and(|n| !n.contains(['\n', '\r', ')']))
+        {
+            paths.push(dir.join(name));
+        }
+    }
+    Ok(paths)
+}
+
+/// Best effort: profiles are recreated on demand, so failures only leave clutter.
+fn remove_stale_profiles(sessions: &Path, current: &Path) {
+    let Ok(entries) = fs::read_dir(sessions) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = fs::metadata(path.join("source.json"))
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > STALE_PROFILE));
+        if path == current || !stale {
+            continue;
+        }
+        // A concurrent launch holds this lock while refreshing the profile.
+        let Ok(lock) = fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("profile.lock"))
+        else {
+            continue;
+        };
+        if lock.try_lock_exclusive().is_ok() {
+            let _ = fs::remove_dir_all(&path);
+        }
     }
 }
 

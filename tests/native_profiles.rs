@@ -254,6 +254,58 @@ fn managed_policy_keeps_reviewer_choice_and_preserves_restrictive_rules() {
     }
 }
 
+#[test]
+fn configuration_is_protected_except_the_transcript_and_memory_namespace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let original = root.join("original");
+    fs::create_dir_all(original.join("output-styles")).unwrap();
+    fs::create_dir_all(original.join("todos")).unwrap();
+    fs::write(original.join("output-styles/terse.md"), "style").unwrap();
+    let profile = profile(&root, &uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        fs::read_to_string(profile.config_dir.join("output-styles/terse.md")).unwrap(),
+        "style"
+    );
+    assert_eq!(profile.transcripts, original.join("projects"));
+    for path in [
+        original.join("settings.json"),
+        original.join("todos"),
+        original.join("skills"),
+        original.join("output-styles"),
+        original.join("workflows"),
+    ] {
+        assert!(
+            profile.protected_paths.contains(&path),
+            "{}",
+            path.display()
+        );
+    }
+    assert!(!profile.protected_paths.contains(&original));
+    assert!(!profile.protected_paths.contains(&original.join("projects")));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_idle_profiles_are_removed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let stale = profile(&root, &uuid::Uuid::new_v4().to_string());
+    let recent = profile(&root, &uuid::Uuid::new_v4().to_string());
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+    fs::File::options()
+        .write(true)
+        .open(stale.config_dir.join("source.json"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    profile(&root, &uuid::Uuid::new_v4().to_string());
+    assert!(!stale.config_dir.exists());
+    assert!(recent.config_dir.exists());
+    // Shared native content behind the removed links is untouched.
+    assert!(root.join("original/projects").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn unexpected_profile_links_fail_closed_without_overwriting_content() {

@@ -32,6 +32,7 @@ fs.writeFileSync(path.join(cwd, 'nested/file.txt'), 'fixture');
 fs.writeFileSync(path.join(cwd, 'CLAUDE.local.md'), 'ROOT_NATIVE_LOCAL_MARKER');
 fs.writeFileSync(path.join(cwd, 'nested/CLAUDE.local.md'), 'NESTED_NATIVE_LOCAL_MARKER');
 fs.writeFileSync(path.join(original, 'settings.json'), JSON.stringify({
+  autoMemoryEnabled: true,
   permissions: { allow: ['Edit', 'Bash'], additionalDirectories: [outside] },
   sandbox: { filesystem: { allowWrite: [outside] } },
 }));
@@ -105,7 +106,8 @@ const server = http.createServer((req, res) => {
       snapshots.push({ label: turn.label, index, root: text.includes('ROOT_NATIVE_LOCAL_MARKER'), nested: text.includes('NESTED_NATIVE_LOCAL_MARKER'),
         personalBody: text.includes('personal body.'), projectBody: text.includes('project-probe body.'), nestedBody: text.includes('nested-probe body.'),
         realProjectPath: text.includes('PROJECT_PATH=' + cwd) });
-      const step = turn.sequence[index++];
+      let step = turn.sequence[index++];
+      if (typeof step === 'function') step = step();
       modelReply(res, request, step ? [{ type: 'tool_use', id: `${turn.label}_tool_${index}`, ...step }] : [{ type: 'text', text: 'Done.' }], step ? 'tool_use' : 'end_turn');
     } catch (error) { terminalError = error; res.destroy(error); wake?.(); }
   });
@@ -124,6 +126,14 @@ async function nextEvent() {
   }
   return events.shift();
 }
+// Native reports auto-memory under its (profile) config directory.
+const memorySlug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+function profileMemory(slug) {
+  const namespace = path.join(root, 'state', 'native-claude');
+  const [hash] = fs.readdirSync(namespace);
+  const [session] = fs.readdirSync(path.join(namespace, hash));
+  return path.join(namespace, hash, session, 'projects', slug, 'memory');
+}
 function sequence(label) {
   return [
     { name: 'Skill', input: { skill: 'personal' } },
@@ -138,6 +148,8 @@ function sequence(label) {
     ...(sshCommand ? [{ name: 'Bash', input: { command: sshCommand, timeout: 20000, description: 'Read Git SSH refs through native proxy' } }] : []),
     { name: 'Bash', input: { command: `printf outside > '${outside}/${label}-bash.txt'`, description: 'Sandbox should deny outside write' } },
     { name: 'Bash', input: { command: `printf approved > '${outside}/${label}-escape.txt'`, dangerouslyDisableSandbox: true, description: 'Explicit reviewed outside escape' } },
+    () => ({ name: 'Write', input: { file_path: path.join(profileMemory(memorySlug), `${label}.md`), content: 'memory' } }),
+    () => ({ name: 'Write', input: { file_path: path.join(profileMemory('-other-project'), `${label}.md`), content: 'other' } }),
   ];
 }
 
@@ -168,6 +180,14 @@ async function main() {
         const request = pending.get(value.id);
         if (request) { pending.delete(value.id); value.error ? request.reject(new Error(JSON.stringify(value.error))) : request.resolve(value.result); }
       } else if (value.id != null && value.method) {
+        // Native reviews memory writes outside auto mode like other outside edits.
+        if (turn.label === 'manual' && value.method === 'item/fileChange/requestApproval'
+          && value.params.reason.includes(`/projects/${memorySlug}/memory/`)) {
+          turn.memoryApprovals++;
+          send({ id: value.id, result: { decision: 'accept' } });
+          wake?.();
+          continue;
+        }
         turn.approvals++;
         if (turn.label !== 'manual' || value.method !== 'item/commandExecution/requestApproval') {
           terminalError = new Error(`unexpected human approval: ${JSON.stringify(value)}`);
@@ -186,7 +206,7 @@ async function main() {
     { label: 'auto-deny', reviewer: 'auto_review', approval: 'on-request', classifierDeny: true, escape: false },
     { label: 'never', reviewer: 'auto_review', approval: 'never', escape: false },
   ]) {
-    turn = { ...config, sequence: sequence(config.label), approvals: 0 };
+    turn = { ...config, sequence: sequence(config.label), approvals: 0, memoryApprovals: 0 };
     index = 0;
     const classifiersBefore = classifierCalls;
     await rpc('turn/start', { threadId, approvalsReviewer: config.reviewer, approvalPolicy: config.approval,
@@ -202,6 +222,13 @@ async function main() {
     assert.equal(index, turn.sequence.length + 1, 'all canned tool steps executed');
     assert.equal(fs.readFileSync(path.join(cwd, `${config.label}.txt`), 'utf8'), 'inside');
     assert.equal(fs.readFileSync(path.join(extra, `${config.label}.txt`), 'utf8'), 'extra');
+    const memory = path.join(original, 'projects', memorySlug, 'memory', `${config.label}.md`);
+    const memoryResult = nativeResults.find(result => result.block.tool_use_id === `${config.label}_tool_12`);
+    // The host guard leaves the session's auto-memory to the selected native reviewer.
+    assert(memoryResult && !JSON.stringify(memoryResult).includes('Host workspace boundary'), 'host guard allows native auto-memory');
+    assert.equal(fs.existsSync(memory), config.escape);
+    assert.equal(turn.memoryApprovals, config.label === 'manual' ? 1 : 0);
+    assert.equal(fs.existsSync(path.join(original, 'projects', '-other-project', 'memory', `${config.label}.md`)), false);
     assert.equal(fs.readFileSync(path.join(cwd, `${config.label}-bash.txt`), 'utf8'), 'inside');
     for (const suffix of ['.txt', '-link.txt', '-bash.txt']) assert.equal(fs.existsSync(path.join(outside, config.label + suffix)), false);
     assert.equal(fs.existsSync(path.join(outside, `${config.label}-escape.txt`)), config.escape);
