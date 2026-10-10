@@ -96,7 +96,13 @@ fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<Pr
         None
     };
     let mut cmd = Command::new(&config.executable);
-    let (extra_args, settings) = launch_settings(config, options, profile.as_ref())?;
+    let (extra_args, mut settings) = launch_settings(config, options, profile.as_ref())?;
+    if cfg!(target_os = "macos") && options.sandbox.is_workspace() {
+        crate::ssh_proxy::add_hook(
+            settings.as_mut().context("workspace settings missing")?,
+            &std::env::current_exe()?,
+        )?;
+    }
     let managed_settings = profile
         .as_ref()
         .map(|profile| {

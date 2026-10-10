@@ -9,6 +9,9 @@ const { once } = require('node:events');
 
 const facade = path.resolve(process.argv[2] || 'target/debug/claude-codex-server');
 const native = process.argv[3] || process.env.CLAUDE_BINARY || 'claude';
+// Optional real-network regression; reads refs only, using normal SSH auth.
+const sshRepository = process.env.NATIVE_SSH_REPOSITORY;
+const sshCommand = sshRepository && `git ls-remote '${sshRepository.replaceAll("'", "'\\''")}' HEAD`;
 const root = fs.mkdtempSync(path.join(process.cwd(), '.native-hooks-'));
 const cwd = path.join(root, 'workspace');
 const original = path.join(root, 'original');
@@ -132,6 +135,7 @@ function sequence(label) {
     { name: 'Write', input: { file_path: path.join(outside, `${label}.txt`), content: 'outside' } },
     { name: 'Write', input: { file_path: path.join(cwd, `outside-link/${label}-link.txt`), content: 'outside' } },
     { name: 'Bash', input: { command: `printf inside > '${cwd}/${label}-bash.txt'`, description: 'Workspace write' } },
+    ...(sshCommand ? [{ name: 'Bash', input: { command: sshCommand, timeout: 20000, description: 'Read Git SSH refs through native proxy' } }] : []),
     { name: 'Bash', input: { command: `printf outside > '${outside}/${label}-bash.txt'`, description: 'Sandbox should deny outside write' } },
     { name: 'Bash', input: { command: `printf approved > '${outside}/${label}-escape.txt'`, dangerouslyDisableSandbox: true, description: 'Explicit reviewed outside escape' } },
   ];
@@ -205,6 +209,7 @@ async function main() {
     assert(JSON.stringify(nativeResults.filter(result => result.label === config.label)).includes('Host workspace boundary'), 'native tools report SDK denial');
     assert(JSON.stringify(nativeResults.filter(result => result.label === config.label)).includes('operation not permitted'), 'native shell sandbox denies outside write');
     if (config.reviewer === 'auto_review' && config.approval !== 'never') assert(classifierCalls > classifiersBefore, 'escape reached native classifier');
+    if (sshCommand) assert(nativeResults.some(result => result.label === config.label && !result.block.is_error && /[a-f0-9]{40}\s+HEAD/.test(result.block.content)), 'Git SSH read succeeds inside sandbox');
     const own = snapshots.filter(snapshot => snapshot.label === config.label);
     assert(own.every(snapshot => snapshot.root), 'root local instructions preserved');
     assert(own.some(snapshot => snapshot.nested), 'nested local instructions discovered');
@@ -214,6 +219,23 @@ async function main() {
     assert.equal(hook.cwd, cwd);
     assert.equal(hook.project, cwd);
     console.log(`PASS ${config.label}: native skills/local instructions, two roots, guarded writes, Bash reviewer, resumed policy`);
+  }
+  if (sshCommand) {
+    turn = { label: 'ssh-network-disabled', approvals: 0, sequence: [{ name: 'Bash', input: { command: sshCommand, timeout: 20000, description: 'Network-disabled Git SSH must fail' } }] };
+    index = 0;
+    await rpc('turn/start', { threadId, approvalsReviewer: 'auto_review', approvalPolicy: 'never',
+      sandboxPolicy: { type: 'workspaceWrite', writableRoots: [extra], networkAccess: false }, input: [{ type: 'text', text: 'Check disabled network policy.' }] });
+    for (;;) {
+      const event = await nextEvent();
+      if (terminalError) throw terminalError;
+      if (event.method === 'turn/completed') {
+        assert.equal(event.params.turn.status, 'completed');
+        break;
+      }
+    }
+    assert.equal(turn.approvals, 0);
+    assert(nativeResults.some(result => result.label === turn.label && result.block.is_error && result.block.content.includes('native sandbox proxy refused SSH connection')), 'network-disabled proxy must deny Git SSH');
+    console.log('PASS Git SSH network-disabled policy');
   }
 }
 

@@ -25,5 +25,6 @@ pub mod plugin_runtime;
 
 pub mod native_profile;
 pub mod sandbox;
+pub mod ssh_proxy;
 
 pub mod plugin_ui;

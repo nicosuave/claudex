@@ -110,9 +110,11 @@ explicit Bash escape, which uses the selected reviewer (or is denied by never
 ask). Callback handling failures stop the native process instead of allowing the
 write. See [native loading and permissions](docs/native-skill-settings-boundary.md).
 
-Claude’s network sandbox uses a proxy even with network access enabled; raw SSH
-can still need an unsandboxed retry. The selected automatic reviewer can approve
-that retry without a manual prompt. Codex can permit native TCP directly when
+On macOS, the facade repairs Claude's Git-over-SSH proxy authentication through a
+native session environment hook. Git SSH traffic stays inside the sandbox and
+uses its authenticated proxy; network-disabled policies still block it. SSH keys
+and host-key checks remain native. Plain `ssh` can still need a reviewed
+unsandboxed retry. Codex can permit native TCP directly when
 network access is enabled without a managed proxy. The two runtimes do not have
 identical network enforcement or classifier decisions.
 

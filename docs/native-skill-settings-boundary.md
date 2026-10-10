@@ -89,6 +89,14 @@ instruction discovery, trusted hooks and real paths, two writable roots, direct
 and symlink outside denials, OS shell denials and reviewed escapes. Canned
 classifier responses verify routing and execution, not live classifier judgment.
 
+Set `NATIVE_SSH_REPOSITORY` to an SSH repository URL to additionally verify real
+Git SSH reads in each reviewer mode and rejection with network access disabled.
+On macOS a native SessionStart environment hook replaces the known broken native
+Git SSH tunnel with the facade's authenticated HTTP CONNECT helper. It uses the
+same native proxy and leaves command review, SSH authentication, host-key checks,
+and filesystem restrictions intact. Custom SSH commands and unsandboxed commands
+are unchanged. The workaround requires native SessionStart hooks to be enabled.
+
 ## Rejected alternatives
 
 Disabling settings sources loses native skills. `projectConfigRoot` also suppresses
