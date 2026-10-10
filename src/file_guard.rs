@@ -2,14 +2,14 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 pub(crate) const CALLBACK_ID: &str = "claudex-workspace-files";
 
+/// Envelope fields only: tool inputs in other control requests are arbitrary.
 pub(crate) fn is_callback(frame: &Value) -> bool {
     [&frame["request"], frame].iter().any(|request| {
-        request["subtype"] == "hook_callback"
-            || request.get("callback_id").is_some()
-            || request["input"].get("hook_event_name").is_some()
+        request["subtype"] == "hook_callback" || request.get("callback_id").is_some()
     })
 }
 
@@ -17,6 +17,10 @@ pub(crate) fn is_callback(frame: &Value) -> bool {
 pub(crate) struct FileGuard {
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    /// Native transcript namespace, protected except for the session's memory.
+    transcripts: Option<PathBuf>,
+    /// Native auto-memory directory, as reported by its init message.
+    memory: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl FileGuard {
@@ -24,6 +28,7 @@ impl FileGuard {
         cwd: &Path,
         policy: &crate::sandbox::Policy,
         protected: &[PathBuf],
+        transcripts: Option<&Path>,
     ) -> Result<Option<Self>> {
         let crate::sandbox::Policy::WorkspaceWrite { writable_roots, .. } = policy else {
             return Ok(None);
@@ -43,10 +48,47 @@ impl FileGuard {
             }
         }
         // Keep both spellings: a protected directory may itself be a symlink.
+        // A dangling one has no physical spelling; writes through it fail
+        // resolution and are denied anyway.
         for path in protected.clone() {
-            protected.push(destination(&path)?);
+            if let Ok(physical) = destination(&path) {
+                protected.push(physical);
+            }
         }
-        Ok(Some(Self { roots, protected }))
+        if let Some(transcripts) = transcripts {
+            protected.push(transcripts.to_owned());
+        }
+        Ok(Some(Self {
+            roots,
+            protected,
+            transcripts: transcripts.map(Path::to_owned),
+            memory: Arc::default(),
+        }))
+    }
+
+    /// Learn the auto-memory directory from native's init message. Only a
+    /// directory of the default `projects/<project>/memory` shape is accepted:
+    /// a repository-configured `autoMemoryDirectory` must not open other paths.
+    pub(crate) fn observe(&self, frame: &Value) {
+        if frame["type"] != "system" || frame["subtype"] != "init" {
+            return;
+        }
+        let Some(transcripts) = &self.transcripts else {
+            return;
+        };
+        let memory = frame["memory_paths"]["auto"]
+            .as_str()
+            .map(|raw| normalize(Path::new(raw)))
+            .filter(|path| path.is_absolute())
+            .and_then(|path| destination(&path).ok())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| name == "memory")
+                    && path
+                        .parent()
+                        .and_then(Path::parent)
+                        .is_some_and(|parent| parent == transcripts)
+            });
+        *self.memory.write().unwrap() = memory;
     }
 
     pub(crate) fn hooks(&self) -> Value {
@@ -100,6 +142,12 @@ impl FileGuard {
         }
         let path = normalize(&cwd.join(raw));
         let physical = destination(&path)?;
+        if let Some(memory) = self.memory.read().unwrap().as_ref()
+            && physical.starts_with(memory)
+            && physical != *memory
+        {
+            return Ok(());
+        }
         if !self.roots.iter().any(|root| physical.starts_with(root))
             || self
                 .protected
@@ -208,7 +256,7 @@ mod tests {
             exclude_slash_tmp: false,
             exclude_tmpdir_env_var: false,
         };
-        let guard = FileGuard::new(&root, &policy, &[]).unwrap().unwrap();
+        let guard = FileGuard::new(&root, &policy, &[], None).unwrap().unwrap();
         for tool in ["Write", "Edit", "NotebookEdit"] {
             for path in [
                 root.join("new/nested/file"),
@@ -245,7 +293,7 @@ mod tests {
         symlink(dir.path(), root.join("escape")).unwrap();
         symlink(dir.path().join("missing"), root.join("dangling")).unwrap();
         symlink(root.join("cycle"), root.join("cycle")).unwrap();
-        let guard = FileGuard::new(&root, &crate::sandbox::Policy::workspace(), &[])
+        let guard = FileGuard::new(&root, &crate::sandbox::Policy::workspace(), &[], None)
             .unwrap()
             .unwrap();
         for path in ["escape/new/file", "dangling/file", "cycle/file"] {
@@ -262,7 +310,7 @@ mod tests {
     #[test]
     fn malformed_inputs_deny_but_unrouteable_callbacks_are_fatal() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = FileGuard::new(dir.path(), &crate::sandbox::Policy::workspace(), &[])
+        let guard = FileGuard::new(dir.path(), &crate::sandbox::Policy::workspace(), &[], None)
             .unwrap()
             .unwrap();
         let valid = request(dir.path(), "Write", &dir.path().join("file"));
@@ -283,11 +331,88 @@ mod tests {
         assert!(guard.response(&frame).is_err());
     }
 
+    #[test]
+    fn tool_inputs_naming_hook_fields_are_not_callbacks() {
+        let permission = json!({"type":"control_request","request_id":"p","request":{
+            "subtype":"can_use_tool","tool_name":"mcp__x__y",
+            "input":{"hook_event_name":"PreToolUse","callback_id":"x"}
+        }});
+        assert!(!is_callback(&permission));
+        assert!(is_callback(
+            &json!({"type":"control_request","request":{"subtype":"hook_callback"}})
+        ));
+        assert!(is_callback(
+            &json!({"type":"invalid","request":{"callback_id":CALLBACK_ID}})
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reported_default_memory_directory_is_writable_in_transcripts() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let root = dir.join("work");
+        let transcripts = dir.join("claude/projects");
+        let profile = dir.join("profile");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(transcripts.join("-work")).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        // Native reports the path through the profile's transcript link.
+        symlink(&transcripts, profile.join("projects")).unwrap();
+        let guard = FileGuard::new(
+            &root,
+            &crate::sandbox::Policy::workspace(),
+            &[],
+            Some(&transcripts),
+        )
+        .unwrap()
+        .unwrap();
+        let decision = |path: PathBuf| {
+            guard.response(&request(&root, "Write", &path)).unwrap()["response"]["response"].clone()
+        };
+        let memory = transcripts.join("-work/memory/note.md");
+        assert_eq!(
+            decision(memory.clone())["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+
+        let init = |path: &Path| {
+            json!({"type":"system","subtype":"init",
+            "memory_paths":{"auto":format!("{}/", path.display())}})
+        };
+        guard.observe(&init(&profile.join("projects/-work/memory")));
+        assert_eq!(decision(memory), json!({}));
+        assert_eq!(decision(root.join("file")), json!({}));
+        for path in [
+            transcripts.join("-work/session.jsonl"),
+            transcripts.join("-other/memory/note.md"),
+            transcripts.join("-work/memory"),
+        ] {
+            assert_eq!(
+                decision(path)["hookSpecificOutput"]["permissionDecision"],
+                "deny"
+            );
+        }
+
+        // A configured directory elsewhere is not exempted.
+        let elsewhere = dir.join("elsewhere/memory");
+        guard.observe(&init(&elsewhere));
+        assert_eq!(
+            decision(elsewhere.join("note.md"))["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+        assert_eq!(
+            decision(transcripts.join("-work/memory/note.md"))["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn absent_protected_directories_cannot_be_created_through_case_aliases() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = FileGuard::new(dir.path(), &crate::sandbox::Policy::workspace(), &[])
+        let guard = FileGuard::new(dir.path(), &crate::sandbox::Policy::workspace(), &[], None)
             .unwrap()
             .unwrap();
         for target in [".AGENTS/rules", ".GIT/config", ".CODEX/settings"] {

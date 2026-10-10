@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -27,6 +27,11 @@ const MAX_FRAME: usize = 32 * 1024 * 1024;
 const STDERR_TAIL: usize = 16 * 1024;
 // Well below the native hook's 60-second fail-open timeout.
 const FILE_CALLBACK_DEADLINE: Duration = Duration::from_secs(5);
+// Workspace sessions need --managed-settings and list_permission_rules.
+const MIN_WORKSPACE_CLAUDE: &str = "2.1.294";
+// Guarded sessions keep reading stdout while the event consumer catches up,
+// so a hook callback is never stuck behind queued events.
+const EVENT_BACKLOG: usize = if cfg!(test) { 64 * 1024 } else { 4 * MAX_FRAME };
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
@@ -121,6 +126,7 @@ fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<Pr
             .as_ref()
             .map(|p| p.protected_paths.as_slice())
             .unwrap_or(&[]),
+        profile.as_ref().map(|p| p.transcripts.as_path()),
     )?;
     cmd.args(extra_args).args([
         "-p",
@@ -530,10 +536,18 @@ impl Backend {
             });
             let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_FRAME));
             let mut status = None;
+            let mut backlog = VecDeque::<(BackendEvent, usize)>::new();
+            let mut backlog_bytes = 0;
             let outcome: Result<()> = async {
                 loop {
                     tokio::select! {
                         _ = task_cancel.cancelled() => break,
+                        permit = tx.reserve(), if !backlog.is_empty() => {
+                            let Ok(permit) = permit else { break; };
+                            let (event, size) = backlog.pop_front().unwrap();
+                            backlog_bytes -= size;
+                            permit.send(event);
+                        }
                         result = child.wait(), if status.is_none() => {
                             status = Some(result.context("waiting for Claude")?);
                             // Reap descendants holding inherited pipes open as well.
@@ -544,7 +558,9 @@ impl Backend {
                         }
                         line = lines.next() => {
                             let Some(line) = line else { break; };
-                            let Some(value) = parse_frame(&line.context("reading Claude stdout")?)? else { continue; };
+                            let line = line.context("reading Claude stdout")?;
+                            let size = line.len();
+                            let Some(value) = parse_frame(&line)? else { continue; };
                             // Recognize even malformed hook envelopes before generic
                             // control routing can return a permissive protocol error.
                             if crate::file_guard::is_callback(&value) {
@@ -577,12 +593,25 @@ impl Backend {
                                 }
                                 continue;
                             }
-                            if file_guard.is_some() {
+                            if let Some(guard) = &file_guard {
+                                guard.observe(&value);
                                 // A full event queue must not stall stdout and hide a pending
-                                // hook until Claude's fail-open timeout. Stop the process on
-                                // overload instead of silently losing events or decisions.
-                                tx.try_send(BackendEvent::Message(value))
-                                    .context("native event consumer stalled during guarded session")?;
+                                // hook until Claude's fail-open timeout. Buffer behind a slow
+                                // consumer; stop the process only if the backlog keeps growing.
+                                let event = BackendEvent::Message(value);
+                                if backlog.is_empty() {
+                                    match tx.try_send(event) {
+                                        Ok(()) => continue,
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                        Err(mpsc::error::TrySendError::Full(event)) => backlog.push_back((event, size)),
+                                    }
+                                } else {
+                                    backlog.push_back((event, size));
+                                }
+                                backlog_bytes += size;
+                                if backlog_bytes > EVENT_BACKLOG {
+                                    bail!("native event consumer stalled during guarded session");
+                                }
                             } else {
                                 tokio::select! {
                                     _ = task_cancel.cancelled() => break,
@@ -637,6 +666,13 @@ impl Backend {
             for (_, sender) in task_pending.lock().unwrap().drain() {
                 let _ = sender.send(Err(message.clone()));
             }
+            // Deliver buffered events ahead of the exit, as an unguarded reader would.
+            while let Some((event, _)) = backlog.pop_front() {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    result = tx.send(event) => if result.is_err() { break; },
+                }
+            }
             tokio::select! { _ = task_cancel.cancelled() => {}, _ = tx.send(BackendEvent::Exited { success, message }) => {} }
         });
         let mut backend = Self {
@@ -657,6 +693,12 @@ impl Backend {
             Ok(value) => backend.initialization = value,
             Err(error) => {
                 backend.terminate().await?;
+                if options.sandbox.is_workspace() && format!("{error:#}").contains("unknown option")
+                {
+                    return Err(error.context(format!(
+                        "workspace sessions require Claude Code {MIN_WORKSPACE_CLAUDE} or newer"
+                    )));
+                }
                 return Err(error);
             }
         }
@@ -673,7 +715,9 @@ impl Backend {
             };
             if let Err(error) = verified {
                 backend.terminate().await?;
-                return Err(error.context("verifying Claude workspace sandbox"));
+                return Err(error.context(format!(
+                    "verifying Claude workspace sandbox (requires Claude Code {MIN_WORKSPACE_CLAUDE} or newer)"
+                )));
             }
         }
         Ok((backend, rx))
@@ -1225,16 +1269,45 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(12));
 
-        let script = r#"
+        // Nothing drains events during startup. A burst beyond the channel
+        // capacity is buffered, and the callback behind it is still answered.
+        let script = format!(
+            r#"
             read -r initialization
             i=0
-            while [ "$i" -lt 150 ]; do
-                printf '{"type":"system","subtype":"fixture"}\n'
+            while [ "$i" -lt 300 ]; do
+                printf '{{"type":"system","subtype":"fixture"}}\n'
+                i=$((i + 1))
+            done
+            printf '%s\n' '{callback}'
+            read -r response
+            case "$response" in *'"permissionDecision":"deny"'*) ;; *) exit 13 ;; esac
+            echo 'callback answered behind backlog' >&2
+            exit 37
+        "#
+        );
+        let error = Backend::spawn(&shell_config(&script), &options)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("callback answered behind backlog"),
+            "{error:#}"
+        );
+
+        let padding = "x".repeat(1024);
+        let script = format!(
+            r#"
+            read -r initialization
+            i=0
+            while [ "$i" -lt 400 ]; do
+                printf '{{"type":"system","subtype":"fixture","padding":"{padding}"}}\n'
                 i=$((i + 1))
             done
             sleep 60
-        "#;
-        let error = Backend::spawn(&shell_config(script), &options)
+        "#
+        );
+        let error = Backend::spawn(&shell_config(&script), &options)
             .await
             .err()
             .unwrap();

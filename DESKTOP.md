@@ -106,9 +106,11 @@ a service restart.
 Native skills and nested instructions load normally in workspace sessions. Direct
 file tools can edit authorized workspace files automatically, but outside and
 protected destinations are blocked. For those changes, Claude must request an
-explicit Bash escape, which uses the selected reviewer (or is denied by never
-ask). Callback handling failures stop the native process instead of allowing the
-write. See [native loading and permissions](docs/native-skill-settings-boundary.md).
+explicit Bash escape, which goes to the selected reviewer, or is denied outright
+in **Never ask** mode. Claude's auto-memory for the current project stays
+writable and is reviewed the same way. Callback handling failures stop the native
+process instead of allowing the write. Workspace sessions require Claude Code
+2.1.294 or newer. See [native loading and permissions](docs/native-skill-settings-boundary.md).
 
 On macOS, the facade repairs Claude's Git-over-SSH proxy authentication through a
 native session environment hook. Git SSH traffic stays inside the sandbox and
