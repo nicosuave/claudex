@@ -347,6 +347,7 @@ async fn native_workspace_boundary_and_file_approval() {
         initialize_timeout: Duration::from_secs(30),
     };
     let options = SessionOptions {
+        state_dir: parent.path().join("state"),
         cwd: workspace.clone(),
         session_id: uuid::Uuid::new_v4().to_string(),
         resume: false,
@@ -373,7 +374,7 @@ async fn native_workspace_boundary_and_file_approval() {
         .send(json!({"type":"user","message":{"role":"user","content":prompt}}))
         .await
         .unwrap();
-    let mut file_approval = false;
+    let mut file_denial = false;
     let mut shell_denial = false;
     let mut completed = false;
     while let Some(event) = tokio::time::timeout(Duration::from_secs(90), events.recv())
@@ -385,13 +386,15 @@ async fn native_workspace_boundary_and_file_approval() {
                 if value["type"] == "control_request" {
                     let request = &value["request"];
                     if request["subtype"] == "can_use_tool" && request["tool_name"] == "Write" {
-                        assert_eq!(request["input"]["file_path"], json!(outside_write));
-                        file_approval = true;
+                        panic!(
+                            "outside direct writes must be denied by the SDK guard before approval"
+                        );
                     }
                     backend.send(json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":{"behavior":"deny","message":"Denied by the test host"}}})).await.unwrap();
                 }
                 if value["type"] == "user" {
                     shell_denial |= value.to_string().contains("operation not permitted");
+                    file_denial |= value.to_string().contains("Host workspace boundary");
                 }
                 if value["type"] == "result" {
                     completed = true;
@@ -406,8 +409,8 @@ async fn native_workspace_boundary_and_file_approval() {
     backend.terminate().await.unwrap();
     assert!(completed);
     assert!(
-        file_approval,
-        "outside native file write must require host approval"
+        file_denial,
+        "outside native file write must be denied by the SDK guard"
     );
     assert!(shell_denial, "outside shell write must be denied by the OS");
     assert!(!outside_shell.exists());

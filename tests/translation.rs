@@ -24,6 +24,59 @@ fn contracts(events: &[Value]) {
 }
 
 #[test]
+fn background_task_outlives_launch_ack_and_tracks_native_completion() {
+    let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
+    let mut events = translator.tool_start(
+        "launch",
+        "Agent",
+        &json!({"description":"Investigate","run_in_background":true}),
+    );
+    events.extend(translator.receive(&json!({"type":"system","subtype":"task_started","task_id":"child","tool_use_id":"launch","task_type":"local_agent","description":"Investigate"})).unwrap());
+    events.extend(translator.receive(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"launch","content":"Agent launched"}]}})).unwrap());
+    let items = translator.snapshot();
+    assert_eq!(
+        items.iter().find(|i| i["id"] == "launch").unwrap()["status"],
+        "completed"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .find(|i| i["id"] == "claude-task-child")
+            .unwrap()["status"],
+        "inProgress"
+    );
+    let notification = json!({"type":"system","subtype":"task_notification","task_id":"child","status":"completed","summary":"Investigation complete"});
+    events.extend(translator.receive(&notification).unwrap());
+    assert!(translator.receive(&notification).unwrap().is_empty());
+    let item = translator
+        .snapshot()
+        .iter()
+        .find(|i| i["id"] == "claude-task-child")
+        .unwrap();
+    assert_eq!(item["status"], "completed");
+    assert_eq!(item["success"], true);
+    assert_eq!(item["contentItems"][0]["text"], "Investigation complete");
+    contracts(&events);
+}
+
+#[test]
+fn background_failure_and_interruption_do_not_report_success() {
+    for status in ["failed", "killed", "stopped"] {
+        let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
+        let mut events = translator.receive(&json!({"type":"system","subtype":"task_started","task_id":"child","task_type":"local_workflow","description":"Workflow"})).unwrap();
+        events.extend(translator.receive(&json!({"type":"system","subtype":"task_updated","task_id":"child","patch":{"status":status}})).unwrap());
+        assert_eq!(translator.snapshot()[0]["status"], "failed");
+        assert_eq!(translator.snapshot()[0]["success"], false);
+        contracts(&events);
+    }
+    let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
+    let mut events = translator.receive(&json!({"type":"system","subtype":"task_started","task_id":"child","task_type":"local_agent","description":"Still working"})).unwrap();
+    events.extend(translator.finish());
+    assert_eq!(translator.snapshot()[0]["status"], "failed");
+    contracts(&events);
+}
+
+#[test]
 fn native_denial_warning_preserves_reason_without_claiming_an_approval_is_pending() {
     for kind in ["classifier", "rule"] {
         let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
@@ -33,6 +86,10 @@ fn native_denial_warning_preserves_reason_without_claiming_an_approval_is_pendin
         let message = events[0]["params"]["message"].as_str().unwrap();
         assert!(message.contains("Fixture denied") && message.contains("no pending approval"));
         assert_eq!(message.contains("Ask for approval"), kind == "classifier");
+        assert_eq!(
+            message.contains("explicitly authorize this specific action"),
+            kind == "classifier"
+        );
     }
 }
 

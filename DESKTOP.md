@@ -103,17 +103,30 @@ sockets and command exclusions remain restricted. Existing native deny rules are
 preserved. Each new turn reloads native settings; changing them does not require
 a service restart.
 
-Claude’s network sandbox uses a proxy even with network access enabled; raw SSH
-can still need an unsandboxed retry. The selected automatic reviewer can approve
-that retry without a manual prompt. Codex can permit native TCP directly when
+Native skills and nested instructions load normally in workspace sessions. Direct
+file tools can edit authorized workspace files automatically, but outside and
+protected destinations are blocked. For those changes, Claude must request an
+explicit Bash escape, which goes to the selected reviewer, or is denied outright
+in **Never ask** mode. Claude's auto-memory for the current project stays
+writable and is reviewed the same way. Callback handling failures stop the native
+process instead of allowing the write. Workspace sessions require Claude Code
+2.1.294 or newer. See [native loading and permissions](docs/native-skill-settings-boundary.md).
+
+On macOS, the facade repairs Claude's Git-over-SSH proxy authentication through a
+native session environment hook. Git SSH traffic stays inside the sandbox and
+uses its authenticated proxy; network-disabled policies still block it. SSH keys
+and host-key checks remain native. Plain `ssh` can still need a reviewed
+unsandboxed retry. Codex can permit native TCP directly when
 network access is enabled without a managed proxy. The two runtimes do not have
 identical network enforcement or classifier decisions.
 
-If native auto review denies a tool before creating a permission callback, the
-facade cannot turn that denial into an approval dialog. Select **Ask for approval**
-for that chat in the desktop, then ask Claude to retry the specific action. This
-uses the native manual approval path; do not add a global allow rule to recover
-one denied action. An explicit configured deny rule can still prevent execution.
+If native auto review denies an action, explicit subsequent authorization in chat
+(such as "I allow that" in response to the denial) tells Claude to retry that same
+action once through native review. It does not automatically allow execution or
+change reviewer mode. If the reviewer still denies it, **Ask for approval** in
+that chat provides the native manual review path. A terminal classifier denial
+does not itself create an approval callback. Do not add a global allow rule to
+recover one action; explicit deny rules and managed restrictions still apply.
 
 ## Manage the service
 

@@ -4,6 +4,7 @@ pub mod backend;
 pub mod commands;
 pub mod desktop;
 pub mod dynamic_tools;
+mod file_guard;
 pub mod filesystem;
 pub mod history_recovery;
 #[cfg(unix)]
@@ -22,6 +23,8 @@ pub mod codex_plugins;
 
 pub mod plugin_runtime;
 
+pub mod native_profile;
 pub mod sandbox;
+pub mod ssh_proxy;
 
 pub mod plugin_ui;

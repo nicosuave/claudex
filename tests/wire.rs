@@ -1491,11 +1491,32 @@ async fn background_agent_continuations_keep_stdin_open_until_idle() {
             .iter()
             .any(|v| v["method"] == "turn/completed")
     );
+    let pending = client
+        .ok(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await;
+    let task = pending["thread"]["turns"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "claude-task-bg")
+        .expect("background work must stay visible");
+    assert_eq!(task["status"], "inProgress");
     client
         .send(json!({"id":approval["id"], "result":{"decision":"accept"}}))
         .await;
     let turn = client.completed(&turn).await;
     assert_eq!(turn["status"], "completed");
+    let task = turn["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "claude-task-bg")
+        .unwrap();
+    assert_eq!(task["status"], "completed");
+    assert_eq!(task["success"], true);
     let messages: Vec<&str> = turn["items"]
         .as_array()
         .unwrap()

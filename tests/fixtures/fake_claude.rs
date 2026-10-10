@@ -180,7 +180,7 @@ fn main() {
                     "background" => {
                         background = true;
                         emit(json!({"type":"system","subtype":"session_state_changed","state":"running"}));
-                        emit(json!({"type":"system","subtype":"task_started","task_id":"bg","task_type":"local_agent"}));
+                        emit(json!({"type":"system","subtype":"task_started","task_id":"bg","task_type":"local_agent","description":"Background fixture"}));
                         finish(session, "Parent waiting", false);
                         emit(json!({"type":"control_request","request_id":"permission_fake","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf fake"},"tool_use_id":"tool_fake"}}));
                     }
@@ -224,7 +224,9 @@ fn main() {
                 );
                 if background {
                     background = false;
-                    emit(json!({"type":"system","subtype":"task_notification","task_id":"bg"}));
+                    emit(
+                        json!({"type":"system","subtype":"task_notification","task_id":"bg","status":"completed","summary":"Background fixture finished"}),
+                    );
                     finish(session, "Background complete", false);
                     emit(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
                 } else {

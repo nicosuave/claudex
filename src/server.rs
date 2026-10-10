@@ -1244,6 +1244,7 @@ impl Server {
                 supported_fields(p, &["cursor", "limit", "includeHidden"])?;
                 if self.model_catalog.is_none() {
                     let options = SessionOptions {
+                        state_dir: self.store.root().to_path_buf(),
                         sandbox: Default::default(),
                         cwd: self.config.default_cwd.clone(),
                         session_id: protocol::id(),
@@ -1879,6 +1880,7 @@ impl Server {
         record.touch();
         self.store.save(&record).map_err(RpcError::internal)?;
         let options = SessionOptions {
+            state_dir: self.store.root().to_path_buf(),
             sandbox: record.settings.sandbox.clone(),
             cwd: record.settings.cwd.clone(),
             session_id: record.session_id.clone(),
@@ -3004,7 +3006,7 @@ async fn run_backend(turn: BackendTurn) {
     // Auto-mode terminal denials never create a can_use_tool callback. Explain
     // the supported per-chat recovery instead of suggesting global allow rules.
     options.append_system_prompt = Some(format!(
-        "{}\nThis session runs in Codex through the Claude facade. If Claude's auto-mode classifier denies an action, report the denial and its reason. There is no pending approval to answer for that denied call. If the user wants to review the action, tell them to select 'Ask for approval' in this chat's permissions menu and request a retry; the next turn uses native user approvals while retaining the workspace sandbox. Do not claim global permissions.allow edits or Full Access are required, do not change permission settings yourself, and do not reroute a denied action to evade the denial. Explicit native deny rules and managed restrictions still apply.\n",
+        "{}\nThis session runs in Codex through the Claude facade. If Claude's auto-mode classifier denies an action, report the denial and its reason. There is no pending approval to answer for that denied call. If the user subsequently gives explicit authorization for that specific denied action (for example, 'I allow that' in direct response to the denial), retry that same action once through the normal tool and native reviewer so the new authorization is considered. Preserve its destination and scope; do not substitute another remote, tool, or encoding to evade review. User authorization is context for a fresh review, not an automatic allow or a permission-mode change. If the fresh review denies it again, report that outcome and offer 'Ask for approval' in this chat's permissions menu as the manual review path. Do not require a permissions-menu change before trying newly authorized work. Do not claim global permissions.allow edits or Full Access are required, and do not change permission settings yourself. Explicit native deny rules and managed restrictions still apply.\n",
         options.append_system_prompt.as_deref().unwrap_or("")
     ));
     // The desktop validates inline visualization paths against this thread's

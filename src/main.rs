@@ -52,6 +52,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    SandboxProxyConnect { host: String, port: u16 },
     /// Run the Codex-compatible app-server (also the default without a command).
     AppServer {
         #[command(subcommand)]
@@ -89,6 +91,9 @@ enum AppServerAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::SandboxProxyConnect { host, port }) = &args.command {
+        return claude_codex_server::ssh_proxy::connect(host, *port);
+    }
     #[cfg(unix)]
     match &args.command {
         Some(Command::Install) => {

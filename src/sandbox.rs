@@ -311,9 +311,165 @@ impl Policy {
         }
         Ok(())
     }
+
+    /// Parent policy is merged by Claude beneath genuine enterprise policy.
+    /// Native project/local loading stays enabled; managed-only rules and an
+    /// admin-required shell sandbox keep repository grants non-authoritative.
+    pub fn managed_settings(
+        &self,
+        settings: &Value,
+        cwd: &Path,
+        permission_mode: &str,
+        profile: &crate::native_profile::NativeProfile,
+    ) -> Result<Value> {
+        if !self.is_workspace() {
+            return Ok(json!({}));
+        }
+        let mut policy = json!({});
+        if let Some(permissions) = settings.get("permissions") {
+            policy["permissions"] = permissions.clone();
+        }
+        if let Some(sandbox) = settings.get("sandbox") {
+            policy["sandbox"] = sandbox.clone();
+        }
+        self.apply_native(&mut policy, cwd, permission_mode)?;
+        policy["allowManagedPermissionRulesOnly"] = json!(true);
+        policy["sandbox"]["network"]["allowManagedDomainsOnly"] = json!(true);
+        let roots = policy["sandbox"]["filesystem"]["allowWrite"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let permissions = policy["permissions"].as_object_mut().unwrap();
+        let allow = permissions
+            .entry("allow")
+            .or_insert(json!([]))
+            .as_array_mut()
+            .context("permissions.allow must be an array")?;
+        for root in roots {
+            let path = Path::new(root.as_str().context("invalid native write root")?);
+            push_unique(
+                allow,
+                json!(format!("Edit(/{}/**)", escape_rule_path(path)?)),
+            );
+        }
+        for path in &profile.readable_paths {
+            let path = escape_rule_path(path)?;
+            push_unique(allow, json!(format!("Read(/{path})")));
+            push_unique(allow, json!(format!("Read(/{path}/**)")));
+        }
+        let deny = permissions
+            .entry("deny")
+            .or_insert(json!([]))
+            .as_array_mut()
+            .context("permissions.deny must be an array")?;
+        for path in &profile.protected_paths {
+            let path = escape_rule_path(path)?;
+            push_unique(deny, json!(format!("Edit(/{path})")));
+            push_unique(deny, json!(format!("Edit(/{path}/**)")));
+        }
+        let denied = policy["sandbox"]["filesystem"]["denyWrite"]
+            .as_array_mut()
+            .unwrap();
+        for path in &profile.protected_paths {
+            push_unique(denied, json!(path));
+        }
+        Ok(policy)
+    }
+
+    /// Unlike merged settings, this endpoint describes permission rules that
+    /// are actually in force. Lower-tier grants remain visible in get_settings
+    /// even when managed-only policy ignores them.
+    pub fn verify_native_with_rules(
+        &self,
+        settings: &Value,
+        status: &Value,
+        rules: &Value,
+        expected_managed: &Value,
+        cwd: &Path,
+    ) -> Result<()> {
+        if !self.is_workspace() {
+            return Ok(());
+        }
+        let rules = &rules["state"];
+        if rules["managedOnly"] != true
+            || status["locked"] != true
+            || status["overrides_locked"] != true
+            || status["restrictions"]["network_managed"] != true
+            || settings["effective"]["sandbox"]["network"]["allowManagedDomainsOnly"] != true
+        {
+            bail!("Native managed workspace policy is not active");
+        }
+        let active: Vec<_> = rules["rules"]
+            .as_array()
+            .context("native runtime did not report active permission rules")?
+            .iter()
+            .filter(|rule| rule["notInEffect"] != true)
+            .collect();
+        let expected_allow = expected_managed["permissions"]["allow"]
+            .as_array()
+            .context("host policy is missing scoped permission rules")?;
+        for rule in &active {
+            let text = rule["rule"]
+                .as_str()
+                .context("invalid native permission rule")?;
+            if rule["behavior"] == "allow"
+                && widens_access(text)
+                && !expected_allow.contains(&json!(text))
+            {
+                bail!("Native active permission rules exceed the workspace policy");
+            }
+        }
+        // Missing restrictive rules must fail closed. Required scoped file
+        // grants also have to survive enterprise merging before we advertise
+        // automatic workspace writes (particularly in dontAsk mode).
+        for behavior in ["allow", "deny", "ask"] {
+            if let Some(expected) = expected_managed["permissions"][behavior].as_array() {
+                for rule in expected {
+                    if !active
+                        .iter()
+                        .any(|actual| actual["behavior"] == behavior && actual["rule"] == *rule)
+                    {
+                        bail!("Native policy did not retain a required {behavior} rule");
+                    }
+                }
+            }
+        }
+        let denied = status["restrictions"]["fs_deny_write"]
+            .as_array()
+            .context("native sandbox did not report protected paths")?;
+        for path in expected_managed["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .context("host policy is missing protected paths")?
+        {
+            if !denied.contains(path) {
+                bail!("Native sandbox did not retain a protected path");
+            }
+        }
+        if expected_managed["sandbox"]["allowUnsandboxedCommands"] == false
+            && status["no_sandbox_allowed"] != false
+        {
+            bail!("Native sandbox did not retain the disabled escape policy");
+        }
+        // Reuse OS/network validation without treating inactive raw grants as
+        // executable authority. FileGuard separately bounds directory fast paths.
+        settings["effective"]["permissions"]
+            .as_object()
+            .context("native runtime did not report effective permission settings")?;
+        let mut runtime = settings.clone();
+        runtime["effective"]["permissions"]["allow"] = json!([]);
+        runtime["effective"]["permissions"]["additionalDirectories"] =
+            status["restrictions"]["fs_allow_write"].clone();
+        self.verify_native(&runtime, status, cwd)
+    }
 }
 
-fn widens_access(rule: &str) -> bool {
+fn push_unique(values: &mut Vec<Value>, value: Value) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+pub(crate) fn widens_access(rule: &str) -> bool {
     [
         "*",
         "Edit",
