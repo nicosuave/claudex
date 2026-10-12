@@ -120,3 +120,27 @@ preserved and surfaced. To request manual review, select **Ask for approval** fo
 that chat and ask Claude to retry the specific action. The facade does not switch
 modes automatically or install global permission allow rules. Explicit configured
 deny rules still apply. This boundary was checked against Claude Code 2.1.294.
+
+## ACP agents
+
+With `--acp-agent`, the same Codex surface is served by an [Agent Client Protocol](https://agentclientprotocol.com) agent instead of Claude. The facade is an ACP **v1** client (protocol version 1 only; the v2 draft is not negotiated). Facade-owned features are unchanged: thread records, list/read/pagination, queue, attachments, `fs/*`, `command/exec`, `process/*`, reconnect and approval replay. The provider id and name reported to Codex come from `--provider-id`/`--provider-name` (default: the executable name), and `modelProvider` must match it.
+
+| Codex behavior | ACP mapping |
+| --- | --- |
+| Turn | One agent process per turn: `initialize`, then `session/new` (first turn), `session/resume`, or `session/load` (history replay suppressed), then `session/prompt`. An agent with neither resume nor load cannot continue a thread past its first turn. |
+| Instructions | ACP has no system prompt. Base/developer instructions, Codex plugin guidance and the desktop visualization directory are sent once, as a text block ahead of the first prompt of a new session. |
+| Streaming | `agent_message_chunk` → `agentMessage` deltas (one item per message id); `agent_thought_chunk` → `reasoning` (hidden with `summary: none`). |
+| Tools | `tool_call`/`tool_call_update`: `execute` → `commandExecution` (command from `rawInput`, output from content/`rawOutput`, streamed deltas, exit code); `edit`/`delete`/`move` → `fileChange` with unified diffs from ACP diff content; other kinds → `dynamicToolCall` under the provider namespace. The item type is fixed by the call's first kind. |
+| Plans, notices | `plan` → `turn/plan/updated`; completed `compaction_update` → `contextCompaction`; `notice` → `warning`. Mode, command, config and session-info updates are ignored. |
+| Approvals | `session/request_permission` → command, file-change or file-read approval by tool kind; other kinds use the generic once/session/deny question. Accept selects the agent's `allow_once` (else `allow_always`) option; decline selects `reject_once`; cancel answers `cancelled` and interrupts. Session grants and `approvalPolicy: never` behave as for Claude. An agent's `$/cancel_request` resolves the pending approval. |
+| Interrupt | `session/cancel`; outstanding permission requests are answered `cancelled`. |
+| Steering | `turn/steer` input is queued and sent as the next `session/prompt` in the same Codex turn, after the current prompt ends. |
+| Models | `model/list` opens a probe session and lists the agent's `model` config option values (or the unstable `models` state). `default` keeps the agent's own selection. A selected model is applied with `session/set_config_option` (or `session/set_model`); an unknown model fails the turn. Effort maps onto a `thought_level` option value of the same name, else the agent default applies. Agents without image prompt support report text-only models and reject image input. |
+| Usage | `usage_update` → context occupancy and window; prompt `usage` (unstable) → billing totals. |
+| Desktop tools | Desktop dynamic tools and Codex plugin tools reach the agent as a stdio MCP server, `codex_desktop` (the facade's hidden `mcp-bridge` subcommand relaying to a private Unix socket). Calls run through the normal `item/tool/call` path; the agent's permission request for them is validated against the tool schema and answered by the facade. |
+| Fork | Requires the agent's (unstable) `session/fork` capability, and only at the latest turn: `session/fork` copies the whole session, so the fork's first turn fails if the source thread has advanced since. |
+| Ephemeral | The session is deleted with `session/delete` when the agent supports it. |
+
+Refused for ACP agents: `thread/rollback`/`thread/revert` (no rewind in ACP v1), workspace-write sandboxing (the agent runs its own tools; threads default to and require `danger-full-access`), `approvalsReviewer: auto_review`, and `outputSchema`. Native Claude plugin catalogs are empty. The facade advertises no client filesystem, terminal or elicitation capabilities, and answers such requests with `-32601`. Authentication is the agent's own: an `auth_required` error fails the turn with the agent's advertised sign-in methods, and `doctor` does not check agent sign-in.
+
+Validation: `tests/acp_wire.rs` drives the facade against `tests/fixtures/fake_acp.rs`, which checks every ACP frame in both directions against the vendored ACP schema (`protocol/acp-v1.unstable.json`, agent-client-protocol 3c229ec, 2026-10-09). `scripts/acp_e2e.py` runs model listing, a plain turn, a resumed turn that depends on the first, and a file-writing tool turn against a real agent.

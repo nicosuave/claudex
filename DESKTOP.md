@@ -128,6 +128,16 @@ that chat provides the native manual review path. A terminal classifier denial
 does not itself create an approval callback. Do not add a global allow rule to
 recover one action; explicit deny rules and managed restrictions still apply.
 
+### Other agents
+
+An [ACP](https://agentclientprotocol.com) agent installs as a separate connection, next to the Claude one. Sign in with the agent's own CLI first:
+
+```sh
+claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+```
+
+This creates `~/Library/Application Support/claude-codex-<provider-id>`, LaunchAgent `com.claude-codex.desktop.<provider-id>` and SSH host `claude-codex-<provider-id>` (here `claude-codex-opencode`), each independent of the Claude installation. Pass the same `--acp-agent` (or `--provider-id`) to `doctor`, `service` and `uninstall` to select that instance. `--provider-id` defaults to the executable name. Use `--initialize-timeout-seconds` for agents that start slowly.
+
 ## Manage the service
 
 Use the installed executable after moving or removing the build checkout:

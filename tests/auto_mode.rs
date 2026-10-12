@@ -345,6 +345,7 @@ async fn native_workspace_boundary_and_file_approval() {
             "Bash,Write,Read".into(),
         ],
         initialize_timeout: Duration::from_secs(30),
+        protocol: Default::default(),
     };
     let options = SessionOptions {
         state_dir: parent.path().join("state"),

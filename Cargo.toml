@@ -33,6 +33,11 @@ name = "fake-claude"
 path = "tests/fixtures/fake_claude.rs"
 required-features = ["test-backend"]
 
+[[bin]]
+name = "fake-acp"
+path = "tests/fixtures/fake_acp.rs"
+required-features = ["test-backend"]
+
 [features]
 test-backend = []
 
@@ -40,3 +45,20 @@ test-backend = []
 name = "approval-claude"
 path = "tests/fixtures/approval_claude.rs"
 required-features = ["test-backend"]
+
+# Schema validation runs at facade startup and on every frame in the fake
+# protocol peers; unoptimized it dominates test time.
+[profile.dev.package.jsonschema]
+opt-level = 3
+[profile.dev.package.referencing]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.ahash]
+opt-level = 3

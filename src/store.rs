@@ -99,11 +99,12 @@ impl Settings {
             self.model = model.to_owned();
         }
         if let Some(provider) = p["modelProvider"].as_str()
-            && provider != "anthropic"
+            && provider != protocol::provider().id
         {
-            return Err(RpcError::invalid(
-                "Only modelProvider=anthropic is supported",
-            ));
+            return Err(RpcError::invalid(format!(
+                "Only modelProvider={} is supported",
+                protocol::provider().id
+            )));
         }
         if let Some(policy) = p.get("approvalPolicy").filter(|p| !p.is_null()) {
             let Some(policy @ ("on-request" | "never")) = policy.as_str() else {
@@ -209,7 +210,7 @@ impl Record {
             "environments": null, "extra": null, "preview": "", "ephemeral": ephemeral,
             "section": null, "sectionEnteredAt": null, "projectId": p["projectId"],
             "historyMode": p["historyMode"].as_str().unwrap_or("legacy"),
-            "modelProvider": "anthropic", "model": settings.model, "reasoningEffort": settings.effort,
+            "modelProvider": protocol::provider().id, "model": settings.model, "reasoningEffort": settings.effort,
             "createdAt": timestamp, "updatedAt": timestamp, "recencyAt": timestamp, "status": {"type": "idle"},
             "path": if ephemeral { None } else { Some(path.join(format!("{thread_id}.json"))) },
             "cwd": settings.cwd, "cliVersion": protocol::VERSION, "originator": originator,
@@ -324,7 +325,7 @@ impl Record {
     }
     pub fn response(&self, include_turns: bool, resume: bool) -> Value {
         let mut response = json!({"thread": self.view(include_turns, true), "model": self.settings.model,
-            "modelProvider": "anthropic", "serviceTier": null, "disabledPluginIds": self.settings.disabled_plugin_ids,
+            "modelProvider": protocol::provider().id, "serviceTier": null, "disabledPluginIds": self.settings.disabled_plugin_ids,
             "cwd": self.settings.cwd, "runtimeWorkspaceRoots": [self.settings.cwd], "instructionSources": [],
             "approvalPolicy": self.settings.approval_policy, "approvalsReviewer": self.settings.approvals_reviewer,
             "sandbox": self.settings.sandbox, "activePermissionProfile": null,

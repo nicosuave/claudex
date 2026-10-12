@@ -235,6 +235,28 @@ impl Schemas {
     }
 }
 
+/// The model provider this process serves. One process serves one backend, so
+/// this is fixed at startup: Claude by default, or a configured ACP agent.
+#[derive(Clone, Debug)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+}
+
+static PROVIDER: OnceLock<Provider> = OnceLock::new();
+
+/// Must be called before the server starts; later calls are ignored.
+pub fn set_provider(provider: Provider) {
+    let _ = PROVIDER.set(provider);
+}
+
+pub fn provider() -> &'static Provider {
+    PROVIDER.get_or_init(|| Provider {
+        id: "anthropic".into(),
+        name: "Claude Code".into(),
+    })
+}
+
 pub fn new_turn(turn_id: &str) -> Value {
     json!({"id": turn_id, "items": [], "itemsView": "full", "status": "inProgress",
         "error": null, "startedAt": now(), "completedAt": null, "durationMs": null})
