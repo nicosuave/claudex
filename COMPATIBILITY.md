@@ -15,7 +15,7 @@ Accepted requests are validated against the pinned schema before execution, with
 | `thread/revert`, `thread/rollback` | Idle loaded thread; retain the prefix before `beforeTurnId` (paginated) or remove `numTurns` (legacy); next native turn forks at the retained UUID |
 | `thread/attachment/{add,list,remove}` | Durable arbitrary attachment type/identity/payload metadata; notification only after save; desktop Git worker owns checkout creation/archive/restore |
 | `thread/read` | `threadId`, `includeTurns` |
-| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `cwd`, `searchTerm`, `useStateDbOnly`, `ancestorThreadId`; all records come from facade state; descendant filter returns no unrelated threads |
+| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `cwd`, `searchTerm`, `useStateDbOnly`, `parentThreadId`, `ancestorThreadId`; all records come from facade state. As in Codex, subagent child threads are excluded by default and selected by `parentThreadId` (direct children), `ancestorThreadId` (all descendants), or `sourceKinds` `subAgent`/`subAgentThreadSpawn`; a relation filter without `sourceKinds` spans all sources |
 | `thread/loaded/list` | `cursor`, `limit` |
 | `thread/turns/list` | `threadId`, `cursor`, `limit`, `sortDirection`, `itemsView` |
 | `thread/items/list` | `threadId`, optional `turnId`, `cursor`, `limit`, `sortDirection` |
@@ -63,12 +63,25 @@ Implemented notifications include `thread/started`, name/archive/unarchive/statu
 | `mcp__server__tool` | `mcpToolCall` |
 | Other native tools | `dynamicToolCall` in namespace `claude` |
 | `TodoWrite` | Tool item plus `turn/plan/updated` |
+| `Agent` (subagent) | `collabAgentToolCall` `spawnAgent` and `wait` items plus a linked child thread; see below |
 | Compaction boundary | `contextCompaction` |
 | Structured output | Final assistant message containing JSON |
 
+### Subagents
+
+Claude subagents map to Codex child threads, following Codex's multi-agent (v1) wire shape. The facade asks Claude to forward subagent text (`forwardSubagentText`).
+
+- An `Agent` call starts a `spawnAgent` collab item on the calling thread. When Claude reports the task (`task_started`), the facade creates a persisted child thread and completes the spawn item with it as receiver. A `wait` item stays open until the agent finishes: the Agent tool result for a foreground agent, or the task notification for a background one. The `wait` item's agent state carries the final report.
+- The child thread has `parentThreadId`, `source.subAgent.thread_spawn` (parent, depth, nickname from the agent `name` or description, role from `subagent_type`), and `threadSource: subagent`. Like Codex, it emits no `thread/started`. Every initialized connection is subscribed when a child turn starts, and receives `turn/started`, item lifecycles, usage, and `turn/completed` on the child thread. Claude sends subagents' messages and tool calls whole, without streaming deltas.
+- Subagent permission requests and questions are shown on the child thread and turn, and mark both the child and the root as waiting. The native callback still belongs to the root turn.
+- A nested agent emits no transcript frames of its own. Its child thread, linked under the calling subagent's thread, shows the prompt and the final report.
+- A message to an existing agent (`SendMessage`) continues it in a new turn on the same child thread, including after a facade restart. The `SendMessage` call itself remains a `dynamicToolCall`.
+- Child threads are read-only: `turn/start`, `thread/fork`, and history recovery reject them, and `canAcceptDirectInput` is false, because Claude cannot resume a subagent transcript as its own session. Interrupting or failing the root turn ends open child turns. Child token usage reports the subagent's latest request and, for foreground agents, the total from the Agent result. The root thread's totals remain Claude's parent-only usage.
+- Workflow agents and agents whose task cannot be linked keep the earlier representation: a `Background agent`/`Background workflow` item on the root turn.
+
 File diffs are previews, not an OS audit; command-mediated file edits do not synthesize file-change items. Tool output arrives when Claude emits its tool result, so command output is not necessarily streamed while the process runs. Structured/multimodal tool results are currently rendered as text, including serialized non-text blocks; native MCP result metadata is not preserved.
 
-`summary: none` suppresses reasoning items; `auto` exposes native text. `concise` and `detailed` expose native text with a warning because the facade cannot impose those summary lengths. The facade forwards only reasoning text Claude actually exposes. Child-agent content is represented by the parent tool result, not independent Codex child threads. Claude's local-agent/local-workflow tasks and session state are tracked to keep stdin open for continuations and permission requests after an intermediate result. Claude versions without session-state events fall back to the result plus observed task state.
+`summary: none` suppresses reasoning items; `auto` exposes native text. `concise` and `detailed` expose native text with a warning because the facade cannot impose those summary lengths. The facade forwards only reasoning text Claude actually exposes. Claude's local-agent/local-workflow tasks and session state are tracked to keep stdin open for continuations and permission requests after an intermediate result. Claude versions without session-state events fall back to the result plus observed task state.
 
 ## Permissions and lifecycle
 

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use claude_codex_server::{
     backend::BackendConfig,
@@ -48,6 +48,10 @@ struct Args {
     initialize_timeout_seconds: u64,
     #[arg(long, default_value_t = 300, global = true)]
     approval_timeout_seconds: u64,
+    /// Replace PATH with the one the user's interactive login shell configures,
+    /// so a LaunchAgent-started server matches the user's terminal.
+    #[arg(long, global = true)]
+    login_shell_path: bool,
 }
 
 #[derive(Subcommand)]
@@ -88,9 +92,26 @@ enum AppServerAction {
     Proxy,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    // Children inherit PATH, so set it before the runtime starts other threads.
+    if args.login_shell_path {
+        match claude_codex_server::shell_env::login_shell()
+            .context("Cannot determine the login shell")
+            .and_then(|shell| claude_codex_server::shell_env::login_path(&shell))
+        {
+            // SAFETY: single-threaded; no runtime or other thread exists yet.
+            Ok(path) => unsafe { std::env::set_var("PATH", path) },
+            Err(error) => eprintln!("Keeping the inherited PATH: {error:#}"),
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
     if let Some(Command::SandboxProxyConnect { host, port }) = &args.command {
         return claude_codex_server::ssh_proxy::connect(host, *port);
     }

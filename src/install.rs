@@ -188,7 +188,7 @@ impl Installation {
         }
         let environment = self.environment(&claude, &codex, &plugin_home)?;
         let launcher = format!(
-            "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec {} --model opus \"$@\"\n",
+            "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec {} --model opus --login-shell-path \"$@\"\n",
             shell_quote(&installed_binary)?
         );
         let session = format!(
@@ -555,6 +555,17 @@ impl Installation {
         let codex = genuine_codex()?;
         check_dependencies(&claude, &codex).await?;
         println!("Claude and Codex executables: OK");
+        // Upgrading the CLI (e.g. brew upgrade) does not replace the running
+        // service; only install does.
+        let installed = installed_version(&read_optional(&self.root.join("installation.json"))?);
+        if installed.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+            bail!(
+                "The service runs claudex {} but this claudex is {}. Run install to upgrade the service.",
+                installed.as_deref().unwrap_or("(unknown)"),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        println!("Service version: OK");
         self.ready()
             .await
             .context("Service is not ready; run install or service start")?;
@@ -610,6 +621,12 @@ impl Installation {
         );
         Ok(())
     }
+}
+
+fn installed_version(metadata: &str) -> Option<String> {
+    serde_json::from_str::<Value>(metadata).ok()?["version"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn resolve_executable(path: &Path) -> Result<PathBuf> {
@@ -922,6 +939,20 @@ mod tests {
         assert_eq!(
             fs::metadata(new).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn installed_version_reads_recorded_metadata() {
+        assert_eq!(
+            installed_version(r#"{"application":"claude-codex-server","version":"0.1.0"}"#)
+                .as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(installed_version(""), None);
+        assert_eq!(
+            installed_version(r#"{"application":"claude-codex-server"}"#),
+            None
         );
     }
 

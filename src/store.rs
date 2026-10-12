@@ -186,6 +186,9 @@ pub struct Record {
     pub attachments: Vec<crate::attachments::Attachment>,
     #[serde(default)]
     pub session_grants: Vec<crate::approvals::SessionGrant>,
+    /// Claude agent id -> child thread id, so a continued agent keeps its thread.
+    #[serde(default)]
+    pub agents: BTreeMap<String, String>,
     pub archived: bool,
     pub turns: Vec<Value>,
     #[serde(default)]
@@ -226,6 +229,7 @@ impl Record {
             tracks_turn_anchors: true,
             attachments: vec![],
             session_grants: vec![],
+            agents: BTreeMap::new(),
             archived: false,
             turns: vec![],
             queued_submissions: vec![],
