@@ -20,6 +20,9 @@ use crate::{
     translate::{self, Translator},
 };
 
+/// How long a new Claude process may wait for MCP servers before its first prompt.
+const MCP_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub backend: BackendConfig,
@@ -3817,8 +3820,15 @@ async fn run_backend(turn: BackendTurn) {
                     .await
                     .map_err(|_| anyhow::anyhow!("Facade event loop closed"))?;
             }
-            let (backend, output) =
+            let (mut backend, output) =
                 Backend::spawn_cancellable(&config, &options, startup_cancel.clone()).await?;
+            tokio::select! {
+                _ = backend.wait_for_mcp(MCP_CONNECT_DEADLINE) => {}
+                _ = startup_cancel.cancelled() => {
+                    backend.terminate().await?;
+                    anyhow::bail!("Claude startup cancelled");
+                }
+            }
             Ok((backend, output, plugin_runtime))
         };
         tokio::pin!(future);

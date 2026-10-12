@@ -2325,3 +2325,19 @@ async fn idle_claude_process_serves_later_turns_until_its_launch_changes() {
     assert_eq!(prompts, 1);
     client.close().await;
 }
+
+#[tokio::test]
+async fn first_prompt_waits_for_connecting_mcp_servers() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--claude-arg=--fake-mcp-pending"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let turn = client.start(&thread, "mcp-info").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(
+        agent_texts(&completed),
+        ["prompted while MCP connecting: false"]
+    );
+    client.close().await;
+}
