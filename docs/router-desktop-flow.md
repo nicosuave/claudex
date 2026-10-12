@@ -54,7 +54,17 @@ router retains learned model/thread ownership, reports a temporary reconnect
 error for Claude requests, and reconnects the private socket while keeping the
 Codex child alive. It restores the handshake/catalog and resumes a thread's
 subscription before its next turn. It never automatically replays a submitted
-message. Codex requests continue to work during the outage.
+message. Codex requests continue to work during the outage. The desktop's own
+connection stays up, so when the facade goes away the router ends the Claude
+turns the desktop saw start (`turn/completed` as interrupted, then an idle
+status) and resolves their outstanding server requests; the restarted facade
+records the same turns as interrupted.
+
+Routing facts are scoped. While the router waits on the facade for one thread
+(its ownership probe, subscription before a turn, or adoption), only that
+thread's later requests wait, in order; other chats and genuine Codex requests
+proceed. Only the Claude catalog and the saved default model, which decide
+where a new thread goes, hold every request.
 
 ## Validation and limits
 

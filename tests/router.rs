@@ -1133,6 +1133,40 @@ async fn claude_server_requests_round_trip_with_namespaced_ids() {
 }
 
 #[tokio::test]
+async fn losing_the_facade_ends_its_running_turns_for_the_desktop() {
+    let mut facade = Facade::start(env!("CARGO_BIN_EXE_approval-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let thread = desktop
+        .thread(json!({"model": "fake-claude", "sandbox": "danger-full-access"}))
+        .await;
+    let reply = desktop.turn(&thread, "fake-claude", "echo routed").await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let request = desktop
+        .until(|v| v["method"] == "item/commandExecution/requestApproval")
+        .await;
+    // The desktop's own connection stays up across a facade crash or restart,
+    // so the router must end what the desktop is showing as running.
+    facade._child.kill().await.unwrap();
+    let resolved = desktop
+        .until(|v| v["method"] == "serverRequest/resolved")
+        .await;
+    assert_eq!(resolved["params"]["requestId"], request["id"]);
+    assert_eq!(resolved["params"]["threadId"], thread);
+    let completed = desktop.completed(&thread).await;
+    let turn = &completed["params"]["turn"];
+    assert_eq!(turn["id"], reply["result"]["turn"]["id"]);
+    assert_eq!(turn["status"], "interrupted");
+    assert!(turn["error"]["message"].is_string(), "{completed}");
+    desktop
+        .until(|v| {
+            v["method"] == "thread/status/changed"
+                && v["params"]["threadId"] == thread
+                && v["params"]["status"]["type"] == "idle"
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn without_the_facade_the_router_is_plain_codex() {
     let missing = tempfile::tempdir().unwrap();
     let mut desktop = Desktop::connect(&missing.path().join("absent.sock"), 2).await;

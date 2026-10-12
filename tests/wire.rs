@@ -1833,7 +1833,7 @@ async fn desktop_reopen_hydrates_snapshot_without_early_history_fetch() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn desktop_active_resume_from_second_client_accepts_only_unchanged_settings() {
+async fn desktop_active_resume_from_second_client_keeps_running_settings() {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     async fn request(
         read: &mut Lines<BufReader<OwnedReadHalf>>,
@@ -1935,21 +1935,23 @@ async fn desktop_active_resume_from_second_client_accepts_only_unchanged_setting
     let resumed = request(&mut br, &mut bw, 2, "thread/resume", echo.clone()).await;
     assert!(resumed.get("error").is_none(), "{resumed}");
     validate("ThreadResumeResponse", &resumed["result"]);
-    for (index, (field, value)) in [
-        ("model", json!("different-model")),
-        ("developerInstructions", json!("Changed")),
-        ("path", json!("/not/the/active/path")),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut changed = echo.clone();
-        changed[field] = value;
-        assert_eq!(
-            request(&mut br, &mut bw, 3 + index as u64, "thread/resume", changed).await["error"]["code"],
-            -32602
-        );
-    }
+    // Like Codex, opening a running chat attaches to it; differing launch
+    // settings (such as the desktop's sandbox preset) are ignored, not refused.
+    let mut changed = echo.clone();
+    changed["model"] = json!("different-model");
+    changed["developerInstructions"] = json!("Changed");
+    changed["sandbox"] = json!("workspace-write");
+    let attached = request(&mut br, &mut bw, 3, "thread/resume", changed).await;
+    assert!(attached.get("error").is_none(), "{attached}");
+    validate("ThreadResumeResponse", &attached["result"]);
+    assert_eq!(attached["result"]["model"], resumed["result"]["model"]);
+    assert_eq!(attached["result"]["sandbox"], resumed["result"]["sandbox"]);
+    let mut stale = echo.clone();
+    stale["path"] = json!("/not/the/active/path");
+    assert_eq!(
+        request(&mut br, &mut bw, 4, "thread/resume", stale).await["error"]["code"],
+        -32602
+    );
     let interrupted = request(
         &mut br,
         &mut bw,
@@ -2338,48 +2340,67 @@ async fn background_subagent_keeps_its_child_turn_open_past_the_launch_ack() {
     client.close().await;
 }
 
+/// The fake backend's process ID and how many prompts that process has seen,
+/// from a completed `process-info` turn.
+fn process_info(completed: &Value) -> (i32, u32) {
+    assert_eq!(completed["status"], "completed");
+    let text = agent_texts(completed).pop().unwrap();
+    let words: Vec<&str> = text.split(' ').collect();
+    (words[1].parse().unwrap(), words[3].parse().unwrap())
+}
+
+async fn probe_process(client: &mut Client, thread: &str, options: Value) -> (i32, u32) {
+    let mut params = json!({"threadId":thread,
+        "input":[{"type":"text","text":"process-info","text_elements":[]}]});
+    params
+        .as_object_mut()
+        .unwrap()
+        .extend(options.as_object().unwrap().clone());
+    let turn = client.ok("turn/start", params).await["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    process_info(&client.completed(&turn).await)
+}
+
+fn running(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+async fn wait_for_exit(pid: i32) {
+    tokio::time::timeout(DEADLINE, async {
+        while running(pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Claude process did not exit");
+}
+
 #[tokio::test]
 async fn idle_claude_process_serves_later_turns_until_its_launch_changes() {
-    // Returns the fake backend's process ID and how many prompts that process has seen.
-    async fn probe(client: &mut Client, thread: &str, options: Value) -> (i32, u32) {
-        let mut params = json!({"threadId":thread,
-            "input":[{"type":"text","text":"process-info","text_elements":[]}]});
-        params
-            .as_object_mut()
-            .unwrap()
-            .extend(options.as_object().unwrap().clone());
-        let turn = client.ok("turn/start", params).await["turn"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let completed = client.completed(&turn).await;
-        assert_eq!(completed["status"], "completed");
-        let text = agent_texts(&completed).pop().unwrap();
-        let words: Vec<&str> = text.split(' ').collect();
-        (words[1].parse().unwrap(), words[3].parse().unwrap())
-    }
-    fn running(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
     let state = tempfile::tempdir().unwrap();
     let mut client = Client::spawn(state.path()).await;
     client.initialize().await;
     let thread = client.thread().await;
-    let (first, prompts) = probe(&mut client, &thread, json!({})).await;
+    let (first, prompts) = probe_process(&mut client, &thread, json!({})).await;
     assert_eq!(prompts, 1);
     // An unchanged launch reuses the process, keeping Claude's request prefix cached.
-    assert_eq!(probe(&mut client, &thread, json!({})).await, (first, 2));
+    assert_eq!(
+        probe_process(&mut client, &thread, json!({})).await,
+        (first, 2)
+    );
     // A changed launch closes the idle process and resumes the session in a new one.
-    let (second, prompts) = probe(&mut client, &thread, json!({"model":"opus"})).await;
+    let (second, prompts) = probe_process(&mut client, &thread, json!({"model":"opus"})).await;
     assert_ne!(second, first);
     assert_eq!(prompts, 1);
     assert!(!running(first));
     assert!(running(second));
+    // Archiving acknowledges at once; the idle process closes in the background.
     client
         .ok("thread/archive", json!({"threadId":thread}))
         .await;
-    assert!(!running(second));
+    wait_for_exit(second).await;
     client.close().await;
 
     let state = tempfile::tempdir().unwrap();
@@ -2387,8 +2408,109 @@ async fn idle_claude_process_serves_later_turns_until_its_launch_changes() {
         Client::spawn_with_args(state.path(), &["--idle-session-timeout-seconds", "0"]).await;
     client.initialize().await;
     let thread = client.thread().await;
-    let (first, _) = probe(&mut client, &thread, json!({})).await;
-    let (second, prompts) = probe(&mut client, &thread, json!({})).await;
+    let (first, _) = probe_process(&mut client, &thread, json!({})).await;
+    let (second, prompts) = probe_process(&mut client, &thread, json!({})).await;
+    assert_ne!(second, first);
+    assert_eq!(prompts, 1);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn closing_a_claude_process_does_not_hold_up_other_threads() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--claude-arg=--fake-slow-exit"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let other = client.thread().await;
+    let (first, _) = probe_process(&mut client, &thread, json!({})).await;
+    // A changed launch closes the idle process, which takes seconds here.
+    let sent = std::time::Instant::now();
+    client
+        .methods
+        .insert(json!("relaunch").to_string(), "turn/start".into());
+    client
+        .send(
+            json!({"id":"relaunch","method":"turn/start","params":{"threadId":thread,
+            "model":"opus","input":[{"type":"text","text":"process-info","text_elements":[]}]}}),
+        )
+        .await;
+    client.ok("thread/read", json!({"threadId":other})).await;
+    assert!(
+        sent.elapsed() < Duration::from_millis(1500),
+        "another thread waited {:?} for the closing process",
+        sent.elapsed()
+    );
+    let reply = client.until(|value| value["id"] == "relaunch").await;
+    let turn = reply["result"]["turn"]["id"].as_str().unwrap().to_owned();
+    let (second, prompts) = process_info(&client.completed(&turn).await);
+    // The new process still resumed the session only after the old one exited.
+    assert_ne!(second, first);
+    assert_eq!(prompts, 1);
+    assert!(!running(first));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn probing_the_model_catalog_does_not_hold_up_other_requests() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--claude-arg=--fake-init-hang"]).await;
+    client.initialize().await;
+    client
+        .methods
+        .insert(json!("catalog").to_string(), "model/list".into());
+    client
+        .send(json!({"id":"catalog","method":"model/list","params":{}}))
+        .await;
+    client.thread().await;
+    assert!(
+        !client.history.iter().any(|value| value["id"] == "catalog"),
+        "thread/start waited for the model catalog probe"
+    );
+    // The probe's initialization times out, and the request reports it.
+    let catalog = client.until(|value| value["id"] == "catalog").await;
+    assert!(catalog["error"]["message"].is_string(), "{catalog}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn equivalent_workspace_policies_keep_one_claude_process() {
+    let state = tempfile::tempdir().unwrap();
+    let project = state.path().join("project");
+    let cache = state.path().join("cache");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client
+        .ok(
+            "thread/start",
+            json!({"cwd":project,"sandbox":"workspace-write"}),
+        )
+        .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let policy = |roots: Value| {
+        json!({"sandboxPolicy":{"type":"workspaceWrite","writableRoots":roots,
+            "networkAccess":true,"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}})
+    };
+    // The desktop's first turn names the temporary directories (which
+    // workspace-write keeps writable anyway) and repeats roots; later turns don't.
+    let (first, prompts) = probe_process(
+        &mut client,
+        &thread,
+        policy(json!([cache, "/tmp", std::env::temp_dir(), cache, project])),
+    )
+    .await;
+    assert_eq!(prompts, 1);
+    assert_eq!(
+        probe_process(&mut client, &thread, policy(json!([cache]))).await,
+        (first, 2)
+    );
+    // A policy that grants something else still needs its own launch.
+    let (second, prompts) = probe_process(&mut client, &thread, policy(json!([]))).await;
     assert_ne!(second, first);
     assert_eq!(prompts, 1);
     client.close().await;

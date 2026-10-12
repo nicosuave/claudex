@@ -152,11 +152,18 @@ impl Settings {
         Ok(())
     }
 
-    /// Never suppress native classifier decisions with bypassPermissions. With
-    /// approvalPolicy=never, native dontAsk retains the existing deny-on-prompt contract.
+    /// Codex's Full access (danger-full-access with approvalPolicy=never) runs
+    /// every action without asking, which is Claude's bypassPermissions. Inside
+    /// the workspace sandbox, never keeps native dontAsk: actions the sandbox
+    /// and scoped permissions allow run, and anything that would prompt is
+    /// denied, as Codex reports a sandbox failure instead of asking.
     pub fn native_permission_mode(&self) -> &'static str {
         if self.approval_policy == "never" {
-            "dontAsk"
+            if self.sandbox.is_workspace() {
+                "dontAsk"
+            } else {
+                "bypassPermissions"
+            }
         } else if self.approvals_reviewer == "auto_review" {
             "auto"
         } else if self.sandbox.is_workspace() {
@@ -455,7 +462,29 @@ impl Record {
 /// A process-exclusive state directory. Each thread is replaced atomically, with private permissions.
 pub struct Store {
     root: PathBuf,
+    writer: Option<Writer>,
+    write_failures: Option<tokio::sync::mpsc::UnboundedReceiver<WriteFailure>>,
     _lock: File,
+}
+
+/// Thread records are written in order by one background thread. The facade
+/// serves every thread from one event loop, which must not wait on the disk
+/// (each write ends with full flushes) unless the caller needs the outcome.
+struct Writer {
+    jobs: std::sync::mpsc::Sender<WriteJob>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+struct WriteJob {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    done: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+}
+
+/// A deferred thread record write that failed.
+pub struct WriteFailure {
+    pub thread_id: String,
+    pub error: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -480,7 +509,23 @@ impl Store {
         lock.try_lock_exclusive()
             .context("Another facade process is using this state directory")?;
         fs::create_dir_all(root.join("threads"))?;
-        Ok(Self { root, _lock: lock })
+        let (jobs, queue) = std::sync::mpsc::channel();
+        let (failures, write_failures) = tokio::sync::mpsc::unbounded_channel();
+        let thread = std::thread::Builder::new()
+            .name("thread-record-writer".into())
+            .spawn(move || write_records(queue, failures))?;
+        Ok(Self {
+            root,
+            writer: Some(Writer { jobs, thread }),
+            write_failures: Some(write_failures),
+            _lock: lock,
+        })
+    }
+    /// Failures of deferred writes, for the one owner that reports them.
+    pub fn take_write_failures(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<WriteFailure>> {
+        self.write_failures.take()
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -506,31 +551,53 @@ impl Store {
     pub fn save_defaults(&self, defaults: &ModelDefaults) -> Result<()> {
         self.write_json(&self.defaults_path(), defaults)
     }
+    /// Write a record and wait until it is durable.
     pub fn save(&self, record: &Record) -> Result<()> {
-        if record.ephemeral() {
+        let Some(mut job) = self.record_job(record)? else {
             return Ok(());
+        };
+        let (done, outcome) = std::sync::mpsc::channel();
+        job.done = Some(done);
+        self.queue(job)?;
+        outcome
+            .recv()
+            .context("The thread record writer stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+    /// Queue a record write without waiting for it. Writes stay in order with
+    /// `save`, and a failure arrives through `take_write_failures`.
+    pub fn save_deferred(&self, record: &Record) -> Result<()> {
+        match self.record_job(record)? {
+            Some(job) => self.queue(job),
+            None => Ok(()),
+        }
+    }
+    fn record_job(&self, record: &Record) -> Result<Option<WriteJob>> {
+        if record.ephemeral() {
+            return Ok(None);
         }
         let id = record.id();
         uuid::Uuid::parse_str(id).context("Invalid persisted thread id")?;
-        self.write_json(&self.threads_dir().join(format!("{id}.json")), record)
+        let mut bytes = serde_json::to_vec(record)?;
+        bytes.push(b'\n');
+        Ok(Some(WriteJob {
+            path: self.threads_dir().join(format!("{id}.json")),
+            bytes,
+            done: None,
+        }))
+    }
+    fn queue(&self, job: WriteJob) -> Result<()> {
+        self.writer
+            .as_ref()
+            .context("The thread record writer stopped")?
+            .jobs
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("The thread record writer stopped"))
     }
     fn write_json(&self, path: &Path, value: &impl Serialize) -> Result<()> {
-        let dir = path.parent().context("State file needs a parent")?;
-        let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = private_open(&temp, true)?;
-            serde_json::to_writer(&mut file, value)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temp, path)?;
-            #[cfg(unix)]
-            File::open(dir)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        write_atomic(path, &bytes)
     }
     pub fn load(&self) -> Result<BTreeMap<String, Record>> {
         let mut records = BTreeMap::new();
@@ -576,6 +643,77 @@ impl Store {
         }
         Ok(records)
     }
+}
+
+impl Drop for Store {
+    /// Finish queued writes before the state directory lock is released.
+    fn drop(&mut self) {
+        if let Some(Writer { jobs, thread }) = self.writer.take() {
+            drop(jobs);
+            let _ = thread.join();
+        }
+    }
+}
+
+fn write_records(
+    queue: std::sync::mpsc::Receiver<WriteJob>,
+    failures: tokio::sync::mpsc::UnboundedSender<WriteFailure>,
+) {
+    while let Ok(first) = queue.recv() {
+        // Only the newest queued content of each record needs to be written.
+        let mut batch: Vec<WriteJob> = Vec::new();
+        let mut waiting: Vec<Vec<std::sync::mpsc::Sender<Result<(), String>>>> = Vec::new();
+        for job in std::iter::once(first).chain(queue.try_iter()) {
+            match batch.iter().position(|queued| queued.path == job.path) {
+                Some(index) => {
+                    batch[index].bytes = job.bytes;
+                    waiting[index].extend(job.done);
+                }
+                None => {
+                    waiting.push(job.done.into_iter().collect());
+                    batch.push(WriteJob { done: None, ..job });
+                }
+            }
+        }
+        for (job, waiting) in batch.into_iter().zip(waiting) {
+            let outcome = write_atomic(&job.path, &job.bytes).map_err(|error| format!("{error:#}"));
+            if let Err(error) = &outcome
+                && waiting.is_empty()
+            {
+                let thread_id = job
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                eprintln!("Cannot save thread {thread_id}: {error}");
+                let _ = failures.send(WriteFailure {
+                    thread_id,
+                    error: error.clone(),
+                });
+            }
+            for done in waiting {
+                let _ = done.send(outcome.clone());
+            }
+        }
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("State file needs a parent")?;
+    let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = private_open(&temp, true)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn private_open(path: &Path, exclusive: bool) -> Result<File> {

@@ -36,7 +36,7 @@ fn explicit_auto_reviewer_round_trips_without_claiming_a_sandbox() {
 }
 
 #[test]
-fn auto_is_opt_in_and_never_still_denies_permission_prompts() {
+fn auto_is_opt_in_and_never_bypasses_only_with_full_access() {
     let mut settings = Settings::new(std::env::temp_dir(), "opus".into());
     assert_eq!(settings.native_permission_mode(), "manual");
     let mut legacy = serde_json::to_value(&settings).unwrap();
@@ -46,10 +46,21 @@ fn auto_is_opt_in_and_never_still_denies_permission_prompts() {
     settings
         .apply(&json!({"approvalsReviewer":"auto_review"}))
         .unwrap();
-    settings.apply(&json!({"approvalPolicy":"never"})).unwrap();
+    // The desktop's Full access preset.
+    settings
+        .apply(&json!({"approvalPolicy":"never", "sandbox":"danger-full-access"}))
+        .unwrap();
+    assert_eq!(settings.native_permission_mode(), "bypassPermissions");
+    // Inside the workspace sandbox, never denies whatever would prompt.
+    settings
+        .apply(&json!({"sandbox":"workspace-write"}))
+        .unwrap();
     assert_eq!(settings.native_permission_mode(), "dontAsk");
     settings
-        .apply(&json!({"approvalPolicy":"on-request", "approvalsReviewer":"user"}))
+        .apply(
+            &json!({"approvalPolicy":"on-request", "approvalsReviewer":"user",
+            "sandbox":"danger-full-access"}),
+        )
         .unwrap();
     assert_eq!(settings.native_permission_mode(), "manual");
 }

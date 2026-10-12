@@ -463,4 +463,8 @@ fn main() {
             _ => {}
         }
     }
+    // A process that takes a while to persist its transcript after EOF.
+    if args.iter().any(|arg| arg == "--fake-slow-exit") {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
 }
