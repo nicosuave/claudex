@@ -38,6 +38,7 @@ fn main() {
     let mut unsubscribed: Vec<String> = vec![];
     let mut requests: Vec<String> = vec![];
     let mut serial = 0u64;
+    let mut default_model = "gpt-fake".to_owned();
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let Some(method) = message["method"].as_str() else {
@@ -57,6 +58,17 @@ fn main() {
                 {"id": "gpt-fake", "model": "gpt-fake", "displayName": "GPT Fake", "isDefault": true},
                 {"id": "gpt-fake-mini", "model": "gpt-fake-mini", "displayName": "GPT Fake Mini", "isDefault": false}
             ], "nextCursor": null})),
+            "config/read" => Ok(json!({"config":{"model":default_model}})),
+            "config/batchWrite" => {
+                for edit in p["edits"].as_array().into_iter().flatten() {
+                    if edit["keyPath"] == "model" {
+                        default_model = edit["value"].as_str().unwrap().to_owned();
+                    }
+                }
+                Ok(
+                    json!({"status":"ok","version":"fake-config-version","filePath":"/fake/config.toml","overriddenMetadata":null}),
+                )
+            }
             "thread/start" => {
                 serial += 1;
                 let id = format!("0199{serial:04}-0000-7000-8000-000000000000");
@@ -93,6 +105,28 @@ fn main() {
                 .find(|t| t["id"] == p["threadId"])
                 .map(|t| json!({"thread": t}))
                 .ok_or("thread not found"),
+            "thread/metadata/update" => match threads.iter_mut().find(|t| t["id"] == p["threadId"])
+            {
+                Some(thread) => {
+                    for field in ["projectId", "gitInfo", "daybreakEnabled"] {
+                        if let Some(value) = p.get(field) {
+                            thread[field] = value.clone();
+                        }
+                    }
+                    Ok(json!({"thread":thread}))
+                }
+                None => Err("thread not found"),
+            },
+            "thread/settings/update" => match threads.iter_mut().find(|t| t["id"] == p["threadId"])
+            {
+                Some(thread) => {
+                    if let Some(model) = p.get("model") {
+                        thread["model"] = model.clone();
+                    }
+                    Ok(json!({}))
+                }
+                None => Err("thread not found"),
+            },
             "thread/unsubscribe" => {
                 unsubscribed.push(p["threadId"].as_str().unwrap_or("").to_owned());
                 Ok(json!({"status": "unsubscribed"}))
@@ -107,7 +141,6 @@ fn main() {
                 };
                 let mut listed: Vec<Value> = threads
                     .iter()
-                    .filter(|t| t["fakeTurns"].as_u64() > Some(0))
                     .filter(|t| {
                         p["searchTerm"]
                             .as_str()

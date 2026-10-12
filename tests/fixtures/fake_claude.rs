@@ -42,6 +42,13 @@ fn main() {
         .find_map(|arg| arg.strip_prefix("--session-id="))
         .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--resume=")))
         .unwrap_or("fake-session");
+    // Model the native control responses for the explicit managed policy
+    // supplied by the test client. This fixture does not enforce an OS sandbox;
+    // real native enforcement is verified separately by integration probes.
+    let managed: Option<Value> = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--managed-settings="))
+        .map(|raw| serde_json::from_str(raw).unwrap());
     let mut hanging = false;
     let mut background = false;
     let mut prompts = 0;
@@ -100,6 +107,42 @@ fn main() {
                         };
                         emit(
                             json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"mcpServers":[{"name":"slow","status":status}]}}}),
+                        );
+                    }
+                    Some(
+                        subtype @ ("get_settings" | "get_sandbox_dialog" | "list_permission_rules"),
+                    ) if managed.is_some() => {
+                        let policy = managed.as_ref().unwrap();
+                        let response = match subtype {
+                            "get_settings" => json!({"effective":policy}),
+                            "get_sandbox_dialog" => json!({
+                                "supported":true,"enabled":true,"enabled_in_settings":true,
+                                "locked":true,"overrides_locked":true,
+                                "excluded_commands":[],
+                                "no_sandbox_allowed":policy["sandbox"]["allowUnsandboxedCommands"],
+                                "restrictions":{
+                                    "network_managed":true,"allow_all_unix_sockets":false,"unix_sockets":[],
+                                    "fs_allow_write":policy["sandbox"]["filesystem"]["allowWrite"],
+                                    "fs_deny_write":policy["sandbox"]["filesystem"]["denyWrite"],
+                                    "network_allowed_domains":policy["sandbox"]["network"]["allowedDomains"]
+                                }
+                            }),
+                            _ => {
+                                let mut rules = Vec::new();
+                                for behavior in ["allow", "deny", "ask"] {
+                                    for rule in policy["permissions"][behavior]
+                                        .as_array()
+                                        .into_iter()
+                                        .flatten()
+                                    {
+                                        rules.push(json!({"rule":rule,"behavior":behavior,"notInEffect":false}));
+                                    }
+                                }
+                                json!({"state":{"managedOnly":true,"rules":rules}})
+                            }
+                        };
+                        emit(
+                            json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}}),
                         );
                     }
                     Some("interrupt") => {

@@ -682,7 +682,7 @@ impl Server {
         rpc_id: &Value,
         p: &Value,
     ) -> RpcResult<Option<Value>> {
-        supported_fields(p, &["threadId", "params"])?;
+        supported_fields(p, &["threadId", "params", "metadata"])?;
         let thread_id = required_str(p, "threadId")?;
         if uuid::Uuid::parse_str(thread_id).is_err() {
             return Err(RpcError::invalid("threadId must be a UUID"));
@@ -693,8 +693,26 @@ impl Server {
         let params = p.get("params").cloned().unwrap_or_else(|| json!({}));
         let start = json!({"id": rpc_id, "method": "thread/start", "params": params});
         Schemas::get().validate("thread/start", &start)?;
-        self.request(client, rpc_id, "thread/start", &params, Some(thread_id))
-            .await
+        let metadata = p
+            .get("metadata")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        supported_fields(&metadata, &["projectId", "gitInfo", "daybreakEnabled"])?;
+        let mut metadata_params = metadata.clone();
+        metadata_params["threadId"] = json!(thread_id);
+        Schemas::get().validate(
+            "thread/metadata/update",
+            &json!({"id":rpc_id,"method":"thread/metadata/update","params":metadata_params}),
+        )?;
+        self.request(
+            client,
+            rpc_id,
+            "thread/start",
+            &params,
+            Some((thread_id, &metadata)),
+        )
+        .await
     }
 
     async fn request(
@@ -703,7 +721,7 @@ impl Server {
         rpc_id: &Value,
         method: &str,
         p: &Value,
-        adopted_id: Option<&str>,
+        adopted_id: Option<(&str, &Value)>,
     ) -> RpcResult<Option<Value>> {
         let (mut params, warnings) = crate::desktop::normalize(method, p)?;
         // Named workspace presets use the host defaults. Never override an
@@ -918,8 +936,8 @@ impl Server {
                 settings.apply(p)?;
                 self.check_backend_settings(&settings)?;
                 let originator = &self.connections[&client].originator;
-                let record = match adopted_id {
-                    Some(id) => Record::with_id(
+                let mut record = match adopted_id {
+                    Some((id, _)) => Record::with_id(
                         id.to_owned(),
                         settings,
                         self.store.threads_dir(),
@@ -928,6 +946,9 @@ impl Server {
                     ),
                     None => Record::new(settings, self.store.threads_dir(), p, originator),
                 };
+                if let Some((_, metadata)) = adopted_id {
+                    record.patch_metadata(metadata)?;
+                }
                 self.store.save(&record).map_err(RpcError::internal)?;
                 let thread_id = record.id().to_owned();
                 let result = record.response(false, false);
@@ -1249,6 +1270,69 @@ impl Server {
                     &format!("items:{id}:{}", p["turnId"]),
                 )
                 .map(Some)
+            }
+            "thread/metadata/update" => {
+                supported_fields(p, &["threadId", "projectId", "gitInfo", "daybreakEnabled"])?;
+                let id = required_str(p, "threadId")?;
+                let mut record = self.record(id)?.clone();
+                if record.ephemeral() {
+                    return Err(RpcError::invalid(
+                        "Metadata updates require a persistent thread",
+                    ));
+                }
+                let previous_project = record.thread["projectId"].clone();
+                record.patch_metadata(p)?;
+                record.touch();
+                let result = json!({"thread": record.view(false, self.loaded.contains(id))});
+                self.store.save(&record).map_err(RpcError::internal)?;
+                let project = record.thread["projectId"].clone();
+                self.records.insert(id.to_owned(), record);
+                self.send(client, response(rpc_id.clone(), result));
+                if previous_project != project {
+                    self.emit(
+                        id,
+                        notification(
+                            "thread/project/updated",
+                            json!({"threadId":id,"projectId":project}),
+                        ),
+                    );
+                }
+                Ok(None)
+            }
+            "thread/settings/update" => {
+                supported_fields(
+                    p,
+                    &[
+                        "threadId",
+                        "model",
+                        "effort",
+                        "summary",
+                        "cwd",
+                        "approvalPolicy",
+                        "approvalsReviewer",
+                        "sandboxPolicy",
+                        "disabledPluginIds",
+                        "developerInstructions",
+                    ],
+                )?;
+                let id = required_str(p, "threadId")?;
+                self.idle(id)?;
+                let mut record = self.record(id)?.clone();
+                record.settings.apply(p)?;
+                self.check_backend_settings(&record.settings)?;
+                record.touch();
+                let settings = record.thread_settings();
+                self.store.save(&record).map_err(RpcError::internal)?;
+                self.records.insert(id.to_owned(), record);
+                self.send(client, response(rpc_id.clone(), json!({})));
+                self.emit(
+                    id,
+                    notification(
+                        "thread/settings/updated",
+                        json!({"threadId":id,"threadSettings":settings}),
+                    ),
+                );
+                Ok(None)
             }
             "thread/name/set" => {
                 supported_fields(p, &["threadId", "name"])?;

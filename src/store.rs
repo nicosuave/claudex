@@ -343,6 +343,59 @@ impl Record {
         self.thread["reasoningEffort"] = json!(self.settings.effort);
         self.thread["cwd"] = json!(self.settings.cwd);
     }
+
+    /// Patch desktop-owned metadata without changing execution settings.
+    pub fn patch_metadata(&mut self, params: &Value) -> RpcResult<()> {
+        // Validate before mutating any field, including project placement.
+        if let Some(git) = params["gitInfo"].as_object() {
+            for (key, value) in git {
+                if !["sha", "branch", "originUrl"].contains(&key.as_str())
+                    || !(value.is_null() || value.as_str().is_some_and(|s| !s.trim().is_empty()))
+                {
+                    return Err(RpcError::invalid(
+                        "Git metadata fields must be null or nonempty strings",
+                    ));
+                }
+            }
+        }
+        if let Some(project) = params["projectId"].as_str() {
+            self.thread["projectId"] = if project.is_empty() {
+                Value::Null
+            } else {
+                json!(project)
+            };
+        }
+        if let Some(enabled) = params["daybreakEnabled"].as_bool() {
+            self.thread["daybreakEnabled"] = json!(enabled);
+        }
+        if let Some(git) = params["gitInfo"].as_object()
+            && !git.is_empty()
+        {
+            if !self.thread["gitInfo"].is_object() {
+                self.thread["gitInfo"] = json!({"sha":null,"branch":null,"originUrl":null});
+            }
+            for (key, value) in git {
+                self.thread["gitInfo"][key] = value.clone();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn thread_settings(&self) -> Value {
+        json!({
+            "model":self.settings.model, "modelProvider":protocol::provider().id,
+            "cwd":self.settings.cwd, "approvalPolicy":self.settings.approval_policy,
+            "approvalsReviewer":self.settings.approvals_reviewer,
+            "sandboxPolicy":self.settings.sandbox, "activePermissionProfile":null,
+            "disabledPluginIds":self.settings.disabled_plugin_ids, "effort":self.settings.effort,
+            "summary":self.settings.reasoning_summary, "serviceTier":null, "personality":null,
+            "multiAgentMode":"explicitRequestOnly",
+            "collaborationMode":{"mode":"default","settings":{
+                "model":self.settings.model,"reasoning_effort":self.settings.effort,
+                "developer_instructions":self.settings.developer_instructions
+            }}
+        })
+    }
     pub fn response(&self, include_turns: bool, resume: bool) -> Value {
         let mut response = json!({"thread": self.view(include_turns, true), "model": self.settings.model,
             "modelProvider": protocol::provider().id, "serviceTier": null, "disabledPluginIds": self.settings.disabled_plugin_ids,

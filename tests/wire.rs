@@ -53,6 +53,8 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
             "ThreadTurnsListResponse",
             "ThreadItemsListResponse",
             "ThreadSetNameResponse",
+            "ThreadMetadataUpdateResponse",
+            "ThreadSettingsUpdateResponse",
             "ThreadArchiveResponse",
             "ThreadUnarchiveResponse",
             "TurnStartResponse",
@@ -129,6 +131,8 @@ fn response_schema(method: &str) -> &'static str {
         "thread/turns/list" => "ThreadTurnsListResponse",
         "thread/items/list" => "ThreadItemsListResponse",
         "thread/name/set" => "ThreadSetNameResponse",
+        "thread/metadata/update" => "ThreadMetadataUpdateResponse",
+        "thread/settings/update" => "ThreadSettingsUpdateResponse",
         "thread/archive" => "ThreadArchiveResponse",
         "thread/unarchive" => "ThreadUnarchiveResponse",
         "turn/start" => "TurnStartResponse",
@@ -757,18 +761,81 @@ async fn installed_desktop_turn_builder_payload_submits_first_and_followup_turns
     let mut client = Client::spawn(state.path()).await;
     client.initialize().await;
     let thread = client.thread().await;
+    client
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":""}),
+        )
+        .await;
     let fixture: Value = serde_json::from_str(include_str!("fixtures/desktop-turn.json")).unwrap();
     for summary in ["detailed", "none", "auto", "concise"] {
         let mut request = fixture["request"].clone();
         request["threadId"] = json!(thread);
         request["cwd"] = json!(state.path());
         request["runtimeWorkspaceRoots"] = json!([state.path()]);
+        if request["sandboxPolicy"]["type"] == "workspaceWrite" {
+            request["sandboxPolicy"]["writableRoots"] = json!([state.path()]);
+        }
         request["summary"] = json!(summary);
         let turn = client.ok("turn/start", request).await;
         let id = turn["turn"]["id"].as_str().unwrap();
         assert_eq!(client.completed(id).await["status"], "completed");
         assert_echo_lifecycle(&client, id, "Echo: desktop payload");
     }
+    client.close().await;
+}
+
+#[tokio::test]
+async fn desktop_metadata_and_next_turn_settings_persist_with_schema_checked_notifications() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let updated = client
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,
+        "projectId":"desktop-project", "daybreakEnabled":false,
+        "gitInfo":{"sha":"abc","branch":"main","originUrl":"https://example.test/repo"}}),
+        )
+        .await;
+    assert_eq!(updated["thread"]["projectId"], "desktop-project");
+    client
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"opus","effort":"high",
+        "approvalsReviewer":"auto_review","permissions":":workspace","disabledPluginIds":[]}),
+        )
+        .await;
+    let invalid = client
+        .request(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":"different","gitInfo":{"branch":""}}),
+        )
+        .await;
+    assert_eq!(invalid["error"]["code"], -32602);
+    client.close().await;
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let resumed = client.ok("thread/resume", json!({"threadId":thread})).await;
+    assert_eq!(resumed["thread"]["projectId"], "desktop-project");
+    assert_eq!(resumed["thread"]["gitInfo"]["sha"], "abc");
+    assert_eq!(resumed["model"], "opus");
+    assert_eq!(resumed["reasoningEffort"], "high");
+    assert_eq!(resumed["approvalsReviewer"], "auto_review");
+    assert_eq!(resumed["sandbox"]["type"], "workspaceWrite");
+    client
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":"","gitInfo":{"sha":null,"branch":"feature"}}),
+        )
+        .await;
+    let read = client.ok("thread/read", json!({"threadId":thread})).await;
+    assert!(read["thread"]["projectId"].is_null());
+    assert_eq!(
+        read["thread"]["gitInfo"],
+        json!({"sha":null,"branch":"feature","originUrl":"https://example.test/repo"})
+    );
     client.close().await;
 }
 

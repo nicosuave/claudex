@@ -54,6 +54,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/items/list",
     "thread/timeline/list",
     "thread/name/set",
+    "thread/metadata/update",
+    "thread/settings/update",
     "thread/archive",
     "thread/unarchive",
     "thread/unsubscribe",

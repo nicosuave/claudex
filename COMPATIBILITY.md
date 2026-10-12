@@ -21,6 +21,8 @@ Accepted requests are validated against the pinned schema before execution, with
 | `thread/items/list` | `threadId`, optional `turnId`, `cursor`, `limit`, `sortDirection` |
 | `thread/timeline/list` | `threadId`, `cursor`, `limit`; newest bounded page in chronological order, earlier pages via cursor |
 | `thread/name/set` | `threadId`, `name` |
+| `thread/metadata/update` | `threadId`, `projectId` (empty clears), partial `gitInfo` (null fields clear), `daybreakEnabled`; persistent metadata saved atomically; project updates notify subscribers |
+| `thread/settings/update` | Idle thread; model, effort, summary, cwd, reviewer, approval policy, sandbox policy, disabled plugins and default collaboration settings; saved for subsequent turns with a settings notification |
 | `thread/archive`, `thread/unarchive` | `threadId`; requires no active turn |
 | `thread/unsubscribe` | `threadId`; active-turn owners must interrupt first |
 | `turn/start` | `threadId`, `input`, `clientUserMessageId`, `cwd`, `model`, `approvalPolicy`, `sandboxPolicy`, `effort`, `summary`, `outputSchema` |

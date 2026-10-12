@@ -1,6 +1,7 @@
 {
-  "source": "app-shared-6c00c2afcf84.js",
-  "expressionSha256": "18fb2b26281d167904e27ec86f245663fdcedc4650675b28415b17836cf0fa22",
+  "source": "src-BJv5Mk7n.js",
+  "sourceSha256": "72e2b366d574206f76fc079c79b64c31ce378970a797475ded8709908d338f08",
+  "expressionSha256": "e5364a68cc9206f9845ba0f64bf228382967a23f103e164ba416c85c12997dea",
   "request": {
     "threadId": "$THREAD_ID",
     "disabledPluginIds": [],
@@ -18,30 +19,36 @@
     "environments": null,
     "cwd": "$CWD",
     "approvalPolicy": "on-request",
-    "approvalsReviewer": "user",
+    "approvalsReviewer": "auto_review",
     "sandboxPolicy": {
-      "type": "dangerFullAccess"
+      "type": "workspaceWrite",
+      "writableRoots": [
+        "$CWD"
+      ],
+      "networkAccess": true,
+      "excludeTmpdirEnvVar": false,
+      "excludeSlashTmp": false
     },
     "permissions": null,
     "runtimeWorkspaceRoots": [
       "$CWD"
     ],
-    "model": "fable",
+    "model": "opus",
     "cyberAccessProgram": null,
     "serviceTier": null,
-    "effort": "max",
+    "effort": "medium",
     "multiAgentMode": "explicitRequestOnly",
-    "summary": "detailed",
+    "summary": "none",
     "personality": "pragmatic",
     "responsesapiClientMetadata": {
-      "workspace_kind": "project"
+      "workspace_kind": "projectless"
     },
     "outputSchema": null,
     "collaborationMode": {
       "mode": "default",
       "settings": {
-        "model": "fable",
-        "reasoning_effort": "max",
+        "model": "opus",
+        "reasoning_effort": "medium",
         "developer_instructions": null
       }
     }

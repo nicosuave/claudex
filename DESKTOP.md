@@ -80,9 +80,14 @@ launch gets a router (`claudex route`) which:
 
 A chat stays on the backend it started with. Choosing a GPT model in a Claude
 chat, or a Claude model in a Codex chat that already has messages, is refused
-with a message asking you to start a new chat. If the Claude service is not
-running, the window behaves as plain Codex. Set `CLAUDE_CODEX_ROUTER_CODEX` to
-use a different genuine Codex executable.
+with a message asking you to start a new chat. If the Claude service restarts,
+the router reconnects while keeping Codex running. Claude requests receive a
+temporary reconnect error until it is ready; they are never sent to Codex or
+automatically replayed. Existing threads with unknown ownership also wait for
+the service so the router can identify their backend. New and already-known
+Codex chats continue to work. Set `CLAUDE_CODEX_ROUTER_CODEX` to use a different
+genuine Codex executable. See [the desktop router contract](docs/router-desktop-flow.md)
+for creation, metadata, model-selection and reconnection behavior.
 
 Use **Workspace write** and **Approve for me** for native Claude auto review.
 Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit

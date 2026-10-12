@@ -37,6 +37,15 @@ impl Facade {
     async fn start(claude: &str) -> Self {
         let state = tempfile::tempdir().unwrap();
         let socket = state.path().join("f.sock");
+        let child = Self::launch(&state, &socket, claude).await;
+        Self {
+            _child: child,
+            socket,
+            _state: state,
+        }
+    }
+
+    async fn launch(state: &tempfile::TempDir, socket: &Path, claude: &str) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
@@ -61,11 +70,7 @@ impl Facade {
         })
         .await
         .expect("facade socket");
-        Self {
-            _child: child,
-            socket,
-            _state: state,
-        }
+        child
     }
 }
 
@@ -403,12 +408,257 @@ async fn without_the_facade_the_router_is_plain_codex() {
     let mut desktop = Desktop::connect(&missing.path().join("absent.sock"), 2).await;
     let models = desktop.ok("model/list", json!({})).await;
     assert_eq!(models["data"].as_array().unwrap().len(), 2);
-    let thread = desktop.thread(json!({"model": "opus"})).await;
+    let rejected = desktop.call("thread/start", json!({"model":"opus"})).await;
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reconnecting")
+    );
+    let thread = desktop.thread(json!({"model": "gpt-fake"})).await;
     let read = desktop.ok("thread/read", json!({"threadId": thread})).await;
     assert_eq!(read["thread"]["modelProvider"], "openai");
     let listed = desktop.ok("thread/list", json!({"limit": 1})).await;
     assert_eq!(listed["nextCursor"], "fake:1");
     assert_eq!(listed["backwardsCursor"], "fake-backwards");
+}
+
+#[tokio::test]
+async fn desktop_creation_metadata_settings_and_collaboration_mode_reach_claude() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    // The desktop may prewarm on Codex, assign a project, then pick Claude
+    // through settings before submitting a collaboration-mode turn.
+    let thread = desktop
+        .thread(json!({"cwd":"/tmp","sandbox":"danger-full-access"}))
+        .await;
+    desktop.ok("thread/metadata/update", json!({"threadId":thread,
+        "projectId":"desktop-project", "gitInfo":{"branch":"main","sha":"abc","originUrl":"https://example.test/repo"},
+        "daybreakEnabled":false})).await;
+    desktop.ok("thread/settings/update", json!({"threadId":thread,
+        "collaborationMode":{"mode":"default","settings":{"model":"opus","reasoning_effort":"medium","developer_instructions":null}}})).await;
+    let read = desktop.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["thread"]["modelProvider"], "anthropic");
+    assert_eq!(read["thread"]["projectId"], "desktop-project");
+    assert_eq!(read["thread"]["gitInfo"]["branch"], "main");
+    let turn = desktop.call("turn/start",json!({"threadId":thread,
+        "model":null, "input":[{"type":"text","text":"desktop first message","text_elements":[]}],
+        "collaborationMode":{"mode":"default","settings":{"model":"opus","reasoning_effort":"medium","developer_instructions":null}}})).await;
+    assert!(turn.get("error").is_none(), "{turn}");
+    desktop.completed(&thread).await;
+    // Metadata patches and subsequent settings persist without erasing omitted fields.
+    desktop
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"gitInfo":{"branch":"feature","sha":null}}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"sonnet","effort":"high"}),
+        )
+        .await;
+    let mut resumed = Desktop::connect(&facade.socket, 0).await;
+    let read = resumed
+        .ok("thread/resume", json!({"threadId":thread}))
+        .await;
+    assert_eq!(read["thread"]["projectId"], "desktop-project");
+    assert_eq!(
+        read["thread"]["gitInfo"],
+        json!({"branch":"feature","sha":null,"originUrl":"https://example.test/repo"})
+    );
+    assert_eq!(read["model"], "sonnet");
+    assert_eq!(read["reasoningEffort"], "high");
+    let listed = desktop.ok("thread/list", json!({"limit":100})).await;
+    let copies: Vec<_> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["id"] == thread)
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "Both prewarm copies appeared in the desktop list: {listed}"
+    );
+    assert_eq!(copies[0]["modelProvider"], "anthropic");
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start")),
+        "Claude turn reached Codex: {state}"
+    );
+}
+
+#[tokio::test]
+async fn current_desktop_projectless_task_submits_first_and_followup_messages() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let cwd = tempfile::tempdir().unwrap();
+    let thread=desktop.thread(json!({"cwd":cwd.path(),"model":"opus",
+        "permissions":":workspace", "approvalPolicy":"on-request","approvalsReviewer":"auto_review",
+        "historyMode":"paginated","threadSource":"user","dynamicTools":[],"runtimeWorkspaceRoots":[cwd.path()],
+        "config":{"mcp_servers.node_repl":{"command":"node","args":["desktop-repl.js"]},
+            "memories.version":"v2","memories.dual_write":true,"features.request_permissions_tool":true}})).await;
+    // main's project-assignment write must complete before the desktop sends
+    // the first message, including projectless tasks (empty projectId).
+    desktop
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":""}),
+        )
+        .await;
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/desktop-turn.json")).unwrap();
+    for _ in 0..2 {
+        let mut request = fixture["request"].clone();
+        request["threadId"] = json!(thread);
+        request["cwd"] = json!(cwd.path());
+        request["runtimeWorkspaceRoots"] = json!([cwd.path()]);
+        request["sandboxPolicy"]["writableRoots"] = json!([cwd.path()]);
+        let reply = desktop.call("turn/start", request).await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let completed = desktop.completed(&thread).await;
+        assert_eq!(
+            completed["params"]["turn"]["status"], "completed",
+            "{completed}"
+        );
+    }
+    let read = desktop
+        .ok(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await;
+    assert_eq!(read["thread"]["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(read["thread"]["modelProvider"], "anthropic");
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start")),
+        "{state}"
+    );
+}
+
+#[tokio::test]
+async fn model_less_prewarm_uses_the_effective_saved_claude_default() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop
+        .ok(
+            "config/batchWrite",
+            json!({"edits":[{"keyPath":"model","value":"opus","mergeStrategy":"upsert"}]}),
+        )
+        .await;
+    let thread = desktop
+        .thread(json!({"cwd":"/tmp","sandbox":"danger-full-access"}))
+        .await;
+    desktop
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":""}),
+        )
+        .await;
+    let reply = desktop
+        .call(
+            "turn/start",
+            json!({"threadId":thread,
+        "input":[{"type":"text","text":"inherit saved model","text_elements":[]}]}),
+        )
+        .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    desktop.completed(&thread).await;
+    let read = desktop.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["thread"]["modelProvider"], "anthropic");
+    assert_eq!(read["thread"]["model"], "opus");
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("thread/start")),
+        "Claude default reached Codex: {state}"
+    );
+}
+
+#[tokio::test]
+async fn service_restart_reconnects_without_sending_claude_requests_to_codex() {
+    let mut facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop.ok("model/list", json!({})).await;
+    let thread = desktop
+        .thread(json!({"model":"opus","sandbox":"danger-full-access"}))
+        .await;
+    desktop.turn(&thread, "opus", "first").await;
+    desktop.completed(&thread).await;
+    facade._child.kill().await.unwrap();
+    // Observe the disconnect through the merged catalog, rather than racing
+    // the operating system's close notification with a fixed sleep.
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let models = desktop.ok("model/list", json!({})).await;
+            if models["data"].as_array().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let failed = desktop.call("thread/start", json!({"model":"opus"})).await;
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reconnecting"),
+        "{failed}"
+    );
+    let failed = desktop.turn(&thread, "opus", "while disconnected").await;
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reconnecting"),
+        "{failed}"
+    );
+    facade._child = Facade::launch(
+        &facade._state,
+        &facade.socket,
+        env!("CARGO_BIN_EXE_fake-claude"),
+    )
+    .await;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let models = desktop.ok("model/list", json!({})).await;
+            if models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "opus")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The router restores the thread subscription on the new facade connection.
+    let reply = desktop.turn(&thread, "opus", "after reconnect").await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    desktop.completed(&thread).await;
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start")),
+        "Claude turn reached Codex: {state}"
+    );
 }
 
 #[tokio::test]

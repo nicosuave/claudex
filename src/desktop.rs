@@ -6,7 +6,7 @@ use crate::protocol::{RpcError, RpcResult};
 pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)> {
     if !matches!(
         method,
-        "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
+        "thread/start" | "thread/resume" | "thread/fork" | "thread/settings/update" | "turn/start"
     ) {
         return Ok((params.clone(), vec![]));
     }
@@ -37,7 +37,7 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
                 "Select either permissions or a sandbox policy, not both",
             ));
         }
-        if method == "turn/start" {
+        if method == "turn/start" || method == "thread/settings/update" {
             object.insert("sandboxPolicy".into(), json!({"type": if sandbox == "workspace-write" { "workspaceWrite" } else { "dangerFullAccess" }}));
         } else {
             object.insert("sandbox".into(), json!(sandbox));
