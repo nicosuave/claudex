@@ -45,6 +45,21 @@ struct Call {
     queued_count: usize,
 }
 
+/// A call that arrived before its parent's turn/started notification. The
+/// native MCP endpoint and the backend's notification stream are separate
+/// channels, so the call can win the race.
+struct EarlyCall {
+    side: Side,
+    parent: String,
+    name: String,
+    arguments: Value,
+    reply: Reply,
+    deadline: Instant,
+}
+
+/// How long an early call waits for its parent turn to be announced.
+const EARLY_CALL_GRACE: Duration = Duration::from_secs(10);
+
 pub(super) enum Step {
     Models {
         call: String,
@@ -90,6 +105,7 @@ pub(super) struct State {
     bridges: HashMap<String, Bridge>,
     active: HashMap<String, String>,
     pending: HashMap<String, Call>,
+    early: Vec<EarlyCall>,
     owned: HashSet<String>,
     shutting_down: HashSet<String>,
     dynamic_replies: VecDeque<(Side, Value, Value)>,
@@ -304,9 +320,6 @@ impl Router {
             {
                 anyhow::bail!("Delegation caller belongs to another harness");
             }
-            if !self.agents.active.contains_key(&parent) {
-                anyhow::bail!("Delegation calls require an active parent turn");
-            }
             if side == Side::Claude && !self.claude_available() {
                 anyhow::bail!("The Claude service is reconnecting");
             }
@@ -314,6 +327,17 @@ impl Router {
         });
         if let Err(error) = validation {
             self.agent_reply(reply, Err(error.to_string()));
+            return;
+        }
+        if !self.agents.active.contains_key(&parent) {
+            self.agents.early.push(EarlyCall {
+                side,
+                parent,
+                name,
+                arguments,
+                reply,
+                deadline: Instant::now() + EARLY_CALL_GRACE,
+            });
             return;
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -852,6 +876,19 @@ impl Router {
             Some("turn/started") => {
                 if let Some(turn) = p["turn"]["id"].as_str() {
                     self.agents.active.insert(thread.into(), turn.into());
+                    let (ready, waiting) = std::mem::take(&mut self.agents.early)
+                        .into_iter()
+                        .partition(|call| call.parent == thread);
+                    self.agents.early = waiting;
+                    for call in ready {
+                        self.agent_call(
+                            call.side,
+                            call.parent,
+                            call.name,
+                            call.arguments,
+                            call.reply,
+                        );
+                    }
                     if let Some(agent) = self.agents.registry.agents.get_mut(thread) {
                         agent.turn_id = Some(turn.into());
                         agent.status = "running".into();
@@ -1116,6 +1153,17 @@ impl Router {
     }
 
     pub(super) fn agent_tick(&mut self) {
+        let now = Instant::now();
+        let (expired, waiting) = std::mem::take(&mut self.agents.early)
+            .into_iter()
+            .partition(|call| call.deadline <= now);
+        self.agents.early = waiting;
+        for call in expired {
+            self.agent_reply(
+                call.reply,
+                Err("Delegation calls require an active parent turn".into()),
+            );
+        }
         let expired: Vec<String> = self
             .agents
             .pending
