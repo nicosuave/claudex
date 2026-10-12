@@ -28,6 +28,10 @@ Install Codex desktop and Claude Code, run `claude auth login`, and enable
 
 3. Select `claude-codex-local` in Codex **Settings > Connections**.
 
+To use Claude models beside Codex in the desktop's ordinary local window instead,
+without SSH, see
+[One local window without SSH](DESKTOP.md#one-local-window-without-ssh).
+
 If you need to diagnose a connection problem, run `claudex doctor`. It checks
 the setup; it does not install or upgrade anything.
 

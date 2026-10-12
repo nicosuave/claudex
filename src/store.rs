@@ -201,7 +201,15 @@ pub struct Record {
 
 impl Record {
     pub fn new(settings: Settings, path: PathBuf, p: &Value, originator: &str) -> Self {
-        let thread_id = protocol::id();
+        Self::with_id(protocol::id(), settings, path, p, originator)
+    }
+    pub fn with_id(
+        thread_id: String,
+        settings: Settings,
+        path: PathBuf,
+        p: &Value,
+        originator: &str,
+    ) -> Self {
         let ephemeral = p["ephemeral"].as_bool().unwrap_or(false);
         let timestamp = now();
         let thread = json!({

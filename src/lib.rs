@@ -11,6 +11,8 @@ pub mod history_recovery;
 pub mod install;
 pub mod plugins;
 pub mod protocol;
+#[cfg(unix)]
+pub mod router;
 pub mod server;
 pub mod shell_env;
 pub mod store;
