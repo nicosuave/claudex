@@ -2,6 +2,7 @@
 //! The local router between genuine Codex (a deterministic stand-in here) and
 //! the Claude facade, exercised end to end through its stdio transport.
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
 use tokio::{
@@ -821,6 +822,116 @@ async fn nested_delegation_keeps_one_tree_across_both_harnesses() {
         .ok("thread/list", json!({"parentThreadId":parent}))
         .await;
     assert_eq!(direct["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ssh_proxy_lists_both_backends_and_runs_claude_over_websocket() {
+    use tokio_tungstenite::tungstenite::Message;
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+    for name in DEPLOYMENT_ENV {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .arg("--sock")
+        .arg(&facade.socket)
+        .args([
+            "route",
+            "--codex",
+            env!("CARGO_BIN_EXE_fake-codex"),
+            "--",
+            "app-server",
+            "proxy",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stream = tokio::io::join(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    let (mut socket, _) = tokio::time::timeout(
+        DEADLINE,
+        tokio_tungstenite::client_async("ws://codex-app-server/rpc", stream),
+    )
+    .await
+    .unwrap()
+    .expect("desktop SSH WebSocket handshake");
+    async fn rpc<S>(
+        socket: &mut tokio_tungstenite::WebSocketStream<S>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        socket
+            .send(Message::Text(
+                json!({"id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(DEADLINE, socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["id"] == id {
+                assert!(value.get("error").is_none(), "{value}");
+                return value["result"].clone();
+            }
+        }
+    }
+    rpc(&mut socket, 1, "initialize", json!({"clientInfo":{"name":"codex_desktop","version":"1"},"capabilities":{"experimentalApi":true}})).await;
+    socket
+        .send(Message::Text(
+            json!({"method":"initialized"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let models = rpc(
+        &mut socket,
+        2,
+        "model/list",
+        json!({"includeHidden":true,"limit":100}),
+    )
+    .await;
+    let models = models["data"].as_array().unwrap();
+    assert!(models.iter().any(|model| model["id"] == "gpt-fake"));
+    assert!(models.iter().any(|model| model["id"] == "opus"));
+    let thread = rpc(
+        &mut socket,
+        3,
+        "thread/start",
+        json!({"model":"opus","sandbox":"workspace-write","approvalPolicy":"on-request"}),
+    )
+    .await;
+    let id = &thread["thread"]["id"];
+    rpc(&mut socket, 4, "turn/start", json!({"threadId":id,"input":[{"type":"text","text":"hello through SSH","text_elements":[]}]})).await;
+    loop {
+        let message = tokio::time::timeout(DEADLINE, socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["method"] == "turn/completed" {
+            assert_eq!(value["params"]["turn"]["status"], "completed", "{value}");
+            break;
+        }
+    }
+    socket.close(None).await.unwrap();
 }
 
 #[tokio::test]

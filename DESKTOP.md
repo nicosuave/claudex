@@ -89,6 +89,23 @@ Codex chats continue to work. Set `CLAUDE_CODEX_ROUTER_CODEX` to use a different
 genuine Codex executable. See [the desktop router contract](docs/router-desktop-flow.md)
 for creation, metadata, model-selection and reconnection behavior.
 
+### Connect from another computer
+
+On the remote Mac, run `claudex install`, then reconnect that Mac's
+existing SSH connection in the client desktop. This enables the combined
+Codex/Claude model picker over ordinary desktop SSH, using your existing SSH
+authentication and normal Codex home. Local desktop routing alone does not
+configure incoming SSH connections.
+
+The installer adds a managed block to the remote user's zsh environment or bash
+login profile. It selects the router only when the desktop launches its SSH
+login-shell payload, preserves an existing `CODEX_INSTALL_DIR` override, and
+skips the ordinary Codex daemon bootstrap. `codex app-server proxy` then opens
+a stdio router connection to genuine Codex and the running Claude service.
+Ordinary SSH shells and CLI commands keep their existing behavior. Remote routing
+is included by default; `claudex uninstall` removes the managed shell block.
+Remote installation currently supports zsh and bash login shells.
+
 Use **Workspace write** and **Approve for me** for native Claude auto review.
 Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit
 sandbox escapes use the selected automatic or manual reviewer. MCP integrations
