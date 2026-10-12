@@ -37,6 +37,11 @@ fn emit(value: Value) {
 }
 
 fn finish(session: &str, text: &str, error: bool) {
+    finish_with(session, text, error, json!({}));
+}
+
+/// `result` fields are merged into the result message.
+fn finish_with(session: &str, text: &str, error: bool, result: Value) {
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let assistant_id = uuid::Uuid::new_v4().to_string();
     emit(
@@ -54,9 +59,12 @@ fn finish(session: &str, text: &str, error: bool) {
     emit(
         json!({"type":"assistant","session_id":session,"uuid":assistant_id,"parent_tool_use_id":null,"message":{"id":message_id,"type":"message","role":"assistant","model":"fake-claude","content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":3}}}),
     );
-    emit(
-        json!({"type":"result","subtype":if error {"error_during_execution"} else {"success"},"is_error":error,"result":text,"errors":if error {vec![text]} else {vec![]},"session_id":session,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{"input_tokens":if text == "Echo: usage-probe" {40} else {4},"output_tokens":if text == "Echo: usage-probe" {30} else {3}},"modelUsage":{"fake-claude":{"contextWindow":200000},"auxiliary-model":{"contextWindow":1000000}},"permission_denials":[]}),
-    );
+    let mut message = json!({"type":"result","subtype":if error {"error_during_execution"} else {"success"},"is_error":error,"result":text,"errors":if error {vec![text]} else {vec![]},"session_id":session,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{"input_tokens":if text == "Echo: usage-probe" {40} else {4},"output_tokens":if text == "Echo: usage-probe" {30} else {3}},"modelUsage":{"fake-claude":{"contextWindow":200000},"auxiliary-model":{"contextWindow":1000000}},"permission_denials":[]});
+    message
+        .as_object_mut()
+        .unwrap()
+        .extend(result.as_object().unwrap().clone());
+    emit(message);
 }
 
 fn main() {
@@ -119,8 +127,12 @@ fn main() {
                             ("sonnet", "Sonnet test"),
                             ("haiku", "Haiku test"),
                         ] {
-                            models.push(json!({"value":value,"displayName":display,"description":"Fixture model",
-                                "supportedEffortLevels":["low","medium","high","xhigh","max"]}));
+                            let mut model = json!({"value":value,"displayName":display,"description":"Fixture model",
+                                "supportedEffortLevels":["low","medium","high","xhigh","max"]});
+                            if value == "opus" {
+                                model["supportsFastMode"] = json!(true);
+                            }
+                            models.push(model);
                         }
                         emit(
                             json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"commands":[],"models":models}}}),
@@ -269,6 +281,19 @@ fn main() {
                     }
                     "process-info" => finish(session, &format!("process {} prompt {prompts}", std::process::id()), false),
                     "mcp-info" => finish(session, &format!("prompted while MCP connecting: {prompted_while_connecting}"), false),
+                    "fast-info" => {
+                        // Claude reads fast mode for SDK sessions only from flag settings.
+                        let requested = args
+                            .iter()
+                            .filter_map(|a| a.strip_prefix("--settings="))
+                            .any(|raw| serde_json::from_str::<Value>(raw).unwrap()["fastMode"] == true);
+                        let state = if requested {
+                            json!({"fast_mode_state":"off","fast_mode_disabled_reason":"extra_usage_disabled"})
+                        } else {
+                            json!({"fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required"})
+                        };
+                        finish_with(session, &format!("fast mode {requested}"), false, state);
+                    }
                     "resume-info" => finish(session, if args.iter().any(|a| a.starts_with("--resume=")) { "resumed" } else { "new" }, false),
                     "fork-info" => finish(session, &json!({
                         "resume":args.iter().find_map(|a| a.strip_prefix("--resume=")),
