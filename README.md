@@ -25,6 +25,8 @@ Install Codex desktop and Claude Code, run `claude auth login`, and enable
 
    This copies the binary to a stable per-user location, creates its LaunchAgent
    and SSH connection, and checks service readiness.
+   It also enables mixed GPT/Claude models for desktop SSH connections from
+   another computer. Reconnect an existing remote connection after installation.
 
 3. Select `claude-codex-local` in Codex **Settings > Connections**.
 

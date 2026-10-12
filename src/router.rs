@@ -71,10 +71,19 @@ mod agents;
 /// Whether `args` (everything after the codex executable) is the desktop's
 /// stdio app-server launch. Anything else runs genuine Codex unchanged.
 pub fn is_app_server_launch(args: &[String]) -> bool {
+    if is_desktop_proxy(args) {
+        return true;
+    }
     let Some(position) = args.iter().position(|arg| arg == "app-server") else {
         return false;
     };
     config_flags_only(&args[..position], false) && config_flags_only(&args[position + 1..], true)
+}
+
+/// Desktop SSH carries a WebSocket over the proxy's stdin/stdout, rather than
+/// the JSON lines used by a local desktop launch.
+fn is_desktop_proxy(args: &[String]) -> bool {
+    args == ["app-server", "proxy"]
 }
 
 fn config_flags_only(args: &[String], app_server: bool) -> bool {
@@ -193,6 +202,17 @@ pub async fn run(
     claude_socket: Option<PathBuf>,
     log: Option<PathBuf>,
 ) -> Result<()> {
+    let websocket = is_desktop_proxy(args);
+    let proxy_args = [
+        "-c".to_owned(),
+        "features.code_mode_host=true".to_owned(),
+        "app-server".to_owned(),
+    ];
+    let args = if is_desktop_proxy(args) {
+        &proxy_args[..]
+    } else {
+        args
+    };
     if let Some(path) = log {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -205,22 +225,69 @@ pub async fn run(
     let (events, mut receiver) = mpsc::channel::<Input>(512);
 
     let (client, mut client_output) = mpsc::channel::<Value>(512);
-    let client_writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(message) = client_output.recv().await {
-            let mut line = message.to_string();
-            line.push('\n');
-            if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
-                break;
+    let client_writer = if websocket {
+        let events = events.clone();
+        tokio::spawn(async move {
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_FRAME))
+                .max_frame_size(Some(MAX_FRAME));
+            let stream = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+            match tokio_tungstenite::accept_async_with_config(stream, Some(config)).await {
+                Ok(mut socket) => loop {
+                    tokio::select! {
+                        message = client_output.recv() => {
+                            let Some(message) = message else {
+                                break;
+                            };
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        message = socket.next() => match message {
+                            Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                                Ok(message) => {
+                                    if events.send(Input::Client(message)).await.is_err() {
+                                        break;
+                                    }
+                                },
+                                Err(error) => {
+                                    note!("invalid SSH WebSocket RPC: {error}");
+                                    break;
+                                }
+                            },
+                            Some(Ok(Message::Ping(bytes))) => {
+                                if socket.send(Message::Pong(bytes)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(Message::Pong(_))) => {},
+                            _ => break,
+                        }
+                    }
+                },
+                Err(error) => note!("SSH WebSocket handshake failed: {error}"),
             }
-        }
-    });
-    spawn_lines(
-        tokio::io::stdin(),
-        events.clone(),
-        Input::Client,
-        Input::ClientClosed,
-    );
+            let _ = events.send(Input::ClientClosed).await;
+        })
+    } else {
+        spawn_lines(
+            tokio::io::stdin(),
+            events.clone(),
+            Input::Client,
+            Input::ClientClosed,
+        );
+        tokio::spawn(async move {
+            let mut stdout = tokio::io::stdout();
+            while let Some(message) = client_output.recv().await {
+                let mut line = message.to_string();
+                line.push('\n');
+                if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
 
     let mut child = Command::new(codex)
         .args(args)
@@ -1498,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_the_desktop_stdio_launch() {
+    fn recognizes_desktop_stdio_and_default_ssh_proxy_launches() {
         assert!(is_app_server_launch(&strings(&[
             "-c",
             "features.code_mode_host=true",
@@ -1508,10 +1575,11 @@ mod tests {
             "chatgpt_base_url=\"x\"",
         ])));
         assert!(is_app_server_launch(&strings(&["app-server"])));
+        assert!(is_app_server_launch(&strings(&["app-server", "proxy"])));
         for other in [
             vec!["--version"],
             vec!["exec", "hi"],
-            vec!["app-server", "proxy"],
+            vec!["app-server", "proxy", "--sock", "/custom.sock"],
             vec!["app-server", "--listen", "ws://127.0.0.1:1"],
             vec!["app-server", "generate-json-schema", "--out", "x"],
             vec!["-c"],

@@ -112,6 +112,20 @@ impl Installation {
     /// `ssh: false` installs only the service and the local desktop router;
     /// it needs no Remote Login, key, or SSH configuration.
     pub async fn install(&self, claude: &Path, ssh: bool) -> Result<()> {
+        // The default Claude installation serves both local and incoming
+        // desktop SSH connections. ACP instances keep their dedicated hosts.
+        let remote = self.acp.is_none();
+        let remote_profile = if remote {
+            Some(self.remote_profile()?)
+        } else {
+            None
+        };
+        let remote_contents = remote_profile
+            .as_ref()
+            .map(|profile| {
+                replace_remote_block(&read_optional(profile)?, Some(&self.remote_environment()?))
+            })
+            .transpose()?;
         let binary = std::env::current_exe()?.canonicalize()?;
         // An ACP installation runs its agent instead of Claude, and uses Claude,
         // when installed, only to review the agent's permission requests.
@@ -166,6 +180,11 @@ impl Installation {
         ] {
             private_directory(&self.root.join(directory))?;
         }
+        if remote {
+            // The desktop's proxy command updates the forwarded SSH-agent
+            // socket here even though we skip the plain daemon bootstrap.
+            private_directory(&plugin_home.join("app-server-control"))?;
+        }
         let ssh_setup = if ssh {
             Some(self.prepare_ssh().await?)
         } else {
@@ -174,7 +193,7 @@ impl Installation {
         // Record ownership before copying the executable so an interrupted
         // first install can be retried safely. Ownership checks ran above.
         let metadata = json!({"application":"claude-codex-server","version":env!("CARGO_PKG_VERSION"),
-            "claude":claude,"codex":codex,"desktopCodex":desktop_codex,"ssh":ssh,
+            "claude":claude,"codex":codex,"desktopCodex":desktop_codex,"ssh":ssh,"remote":remote,"remoteProfile":remote_profile,
             "acp":self.acp.as_ref().map(|acp| json!({"agent":agent,"args":acp.args,
                 "providerId":acp.provider_id,"providerName":acp.provider_name}))});
         atomic_write(
@@ -193,6 +212,9 @@ impl Installation {
         // keeps the desktop's own environment (CODEX_HOME included) for Codex.
         let router = self.router_launcher(&installed_binary, &desktop_codex)?;
         atomic_write(&self.router_codex(), router.as_bytes(), 0o700)?;
+        if let (Some(profile), Some(updated)) = (remote_profile, remote_contents) {
+            write_user_file(&profile, updated.as_bytes())?;
+        }
         if let Some(setup) = &ssh_setup {
             let session = format!(
                 "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec /bin/sh -c \"${{SSH_ORIGINAL_COMMAND:?SSH command required}}\"\n"
@@ -219,7 +241,7 @@ impl Installation {
         if ssh {
             self.check_ssh().await?;
             println!(
-                "Installed. In Codex Settings > Connections, select SSH host {}.\nChoose the identity file: {}\nYour normal Codex connection is unchanged.",
+                "Installed. For the dedicated Claude connection in Codex Settings > Connections, select SSH host {}.\nChoose the identity file: {}",
                 self.host,
                 self.root.join("id_ed25519").display()
             );
@@ -230,7 +252,37 @@ impl Installation {
             "To show Claude models beside Codex in one local desktop window, quit the desktop app and launch it with:\n  open -a ChatGPT --env CODEX_CLI_PATH={}",
             shell_quote(&self.router_codex())?
         );
+        if remote {
+            println!(
+                "Desktop SSH routing enabled. Reconnect this host in the client desktop to load the combined model catalog."
+            );
+        }
         Ok(())
+    }
+
+    fn remote_profile(&self) -> Result<PathBuf> {
+        let shell = crate::shell_env::login_shell().context("Cannot determine the login shell")?;
+        match shell.file_name().and_then(OsStr::to_str) {
+            Some("zsh") => Ok(self.home.join(".zshenv")),
+            Some("bash") => {
+                // Bash reads only the first existing login profile.
+                for name in [".bash_profile", ".bash_login", ".profile"] {
+                    let path = self.home.join(name);
+                    if path.exists() {
+                        return Ok(path);
+                    }
+                }
+                Ok(self.home.join(".bash_profile"))
+            }
+            _ => bail!("Remote desktop routing currently requires a zsh or bash login shell"),
+        }
+    }
+
+    fn remote_environment(&self) -> Result<String> {
+        Ok(format!(
+            "# BEGIN claudex remote desktop\n# Scope routing to the desktop's SSH login-shell payload.\nif [ -n \"${{SSH_CONNECTION:-}}\" ] && [ -n \"${{CODEX_REMOTE_PAYLOAD:-}}\" ] && [ -z \"${{CODEX_INSTALL_DIR:-}}\" ]; then\n    export CODEX_INSTALL_DIR={}\n    export CODEX_SSH_SKIP_APP_SERVER_BOOT=true\nfi\n# END claudex remote desktop\n",
+            shell_quote(&self.root.join("router"))?
+        ))
     }
 
     fn router_codex(&self) -> PathBuf {
@@ -764,6 +816,24 @@ impl Installation {
 
     pub async fn uninstall(&self, force: bool) -> Result<()> {
         self.check_owned_files()?;
+        let mut metadata: Value =
+            serde_json::from_str(&read_optional(&self.root.join("installation.json"))?)
+                .unwrap_or(Value::Null);
+        let remote = metadata["remoteProfile"]
+            .as_str()
+            .map(PathBuf::from)
+            .map(|path| {
+                if ![".zshenv", ".bash_profile", ".bash_login", ".profile"]
+                    .iter()
+                    .any(|name| path == self.home.join(name))
+                {
+                    bail!("Invalid recorded remote shell profile");
+                }
+                let original = read_optional(&path)?;
+                let updated = replace_remote_block(&original, None)?;
+                Ok((path, original, updated))
+            })
+            .transpose()?;
         let config_path = self.home.join(".ssh/config");
         let original_config = read_optional(&config_path)?;
         let config = replace_ssh_block(&original_config, None, self)?;
@@ -776,6 +846,20 @@ impl Installation {
             .collect::<Vec<_>>()
             .join("\n");
         self.service(ServiceAction::Uninstall, force).await?;
+        if let Some((path, original, updated)) = remote
+            && original != updated
+        {
+            write_user_file(&path, updated.as_bytes())?;
+        }
+        if metadata["remote"] == true {
+            metadata["remote"] = json!(false);
+            metadata["remoteProfile"] = Value::Null;
+            atomic_write(
+                &self.root.join("installation.json"),
+                &serde_json::to_vec_pretty(&metadata)?,
+                0o600,
+            )?;
+        }
         if config != original_config {
             write_user_file(&config_path, config.as_bytes())?;
         }
@@ -792,6 +876,42 @@ impl Installation {
         );
         Ok(())
     }
+}
+
+/// Replace only the installer-owned shell block; malformed markers fail closed.
+fn replace_remote_block(original: &str, block: Option<&str>) -> Result<String> {
+    let mut retained = String::new();
+    let mut inside = false;
+    let mut seen = false;
+    for line in original.split_inclusive('\n') {
+        match line.trim_end_matches(['\n', '\r']) {
+            "# BEGIN claudex remote desktop" => {
+                if inside || seen {
+                    bail!("Duplicate managed remote desktop block");
+                }
+                inside = true;
+                seen = true;
+            }
+            "# END claudex remote desktop" => {
+                if !inside {
+                    bail!("Unmatched remote desktop block terminator");
+                }
+                inside = false;
+            }
+            _ if !inside => retained.push_str(line),
+            _ => {}
+        }
+    }
+    if inside {
+        bail!("Unclosed managed remote desktop block");
+    }
+    if let Some(block) = block {
+        if !retained.is_empty() && !retained.ends_with('\n') {
+            retained.push('\n');
+        }
+        retained.push_str(block);
+    }
+    Ok(retained)
 }
 
 /// Installations that predate the SSH-free mode always configured SSH.
@@ -1074,6 +1194,81 @@ fn add_authorized_key(original: &str, line: &str, public: &str) -> Result<String
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn remote_shell_block_preserves_user_content_and_uninstalls_cleanly() {
+        let install = Installation::at_home(PathBuf::from("/Users/example"), None);
+        let original = "# Personal environment\nexport EXAMPLE=1\n";
+        let block = install.remote_environment().unwrap();
+        let updated = replace_remote_block(original, Some(&block)).unwrap();
+        assert_eq!(
+            replace_remote_block(&updated, Some(&block)).unwrap(),
+            updated
+        );
+        assert_eq!(replace_remote_block(&updated, None).unwrap(), original);
+        assert!(replace_remote_block("# BEGIN claudex remote desktop\n", Some(&block)).is_err());
+        assert!(replace_remote_block("# END claudex remote desktop\n", None).is_err());
+        assert!(replace_remote_block(&format!("{block}{block}"), Some(&block)).is_err());
+    }
+
+    #[test]
+    fn remote_environment_routes_only_desktop_ssh_without_overriding_custom_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = Installation::at_home(temp.path().join("space 'quoted'"), None);
+        let script = format!(
+            "{}printf '%s\\n' \"${{CODEX_INSTALL_DIR:-}}\" \"${{CODEX_SSH_SKIP_APP_SERVER_BOOT:-}}\" \"$CODEX_HOME\"",
+            install.remote_environment().unwrap()
+        );
+        for (ssh, payload, custom, expected) in [
+            (false, false, None, "".to_owned()),
+            (true, false, None, "".to_owned()),
+            (false, true, None, "".to_owned()),
+            (
+                true,
+                true,
+                None,
+                install.root.join("router").to_str().unwrap().to_owned(),
+            ),
+            (
+                true,
+                true,
+                Some("/existing/connection"),
+                "/existing/connection".to_owned(),
+            ),
+        ] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", &script])
+                .env_remove("SSH_CONNECTION")
+                .env_remove("CODEX_REMOTE_PAYLOAD")
+                .env_remove("CODEX_INSTALL_DIR")
+                .env_remove("CODEX_SSH_SKIP_APP_SERVER_BOOT")
+                .env("CODEX_HOME", "/existing/codex-home");
+            if ssh {
+                command.env("SSH_CONNECTION", "client 123 host 22");
+            }
+            if payload {
+                command.env("CODEX_REMOTE_PAYLOAD", "exec codex app-server proxy");
+            }
+            if let Some(custom) = custom {
+                command.env("CODEX_INSTALL_DIR", custom);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            let output = String::from_utf8(output.stdout).unwrap();
+            let lines: Vec<_> = output.lines().collect();
+            assert_eq!(lines[0], expected);
+            assert_eq!(
+                lines[1],
+                if ssh && payload && custom.is_none() {
+                    "true"
+                } else {
+                    ""
+                }
+            );
+            assert_eq!(lines[2], "/existing/codex-home");
+        }
+    }
 
     #[test]
     fn ssh_install_is_idempotent_and_uninstall_preserves_other_hosts() {
