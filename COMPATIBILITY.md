@@ -50,6 +50,8 @@ Desktop submission options are translated before dispatch: `approvalsReviewer: u
 
 `baseInstructions` maps to `--system-prompt`; `developerInstructions` maps to `--append-system-prompt`. An idle resumed thread can refresh both instruction fields, model, cwd, or approval policy. The facade disables native system-prompt snapshots so refreshed instructions take effect while native conversation history is preserved. Active turns reject reconfiguration.
 
+After a turn finishes cleanly, the thread keeps its Claude process (and Codex plugin runtime) idle. The next turn reuses it when its launch is unchanged: same model, effort, permission mode, cwd, sandbox, instructions, dynamic tools, plugin and environment overrides, and no output schema, rewind, or fork. A fresh launch renders Claude's request prefix again, and any difference (MCP servers that connect in a different order, a rebuilt plugin catalog) invalidates the prompt cache for the whole conversation. Otherwise the idle process closes and the turn resumes the session in a new one. Idle processes also close after `--idle-session-timeout-seconds` (default one hour, Claude's longest cache lifetime), when more than `--max-idle-sessions` are idle, on archive, and if Claude starts work while no turn is open. Plugin installations made while a process is idle reach the thread on its next new launch.
+
 ## Notifications and tool translation
 
 Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, and `error`.

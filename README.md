@@ -85,6 +85,8 @@ Useful options:
 | `--claude-arg=--safe-mode` | Forward an administrator-selected argument; repeat as needed |
 | `--initialize-timeout-seconds 60` | Claude control handshake deadline |
 | `--approval-timeout-seconds 300` | Deny unanswered permission requests after this much connected time |
+| `--idle-session-timeout-seconds 3600` | Keep a thread's Claude process between turns so its prompt cache stays valid; `0` starts a process per turn |
+| `--max-idle-sessions 8` | Idle Claude processes kept across threads; the oldest closes first |
 
 State defaults to `~/.local/state/claude-codex-server`, independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
 

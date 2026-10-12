@@ -19,6 +19,7 @@ pub mod timeline;
 pub mod translate;
 pub mod transport;
 pub mod usage;
+pub mod warm;
 pub mod workspaces;
 
 pub mod codex_plugins;

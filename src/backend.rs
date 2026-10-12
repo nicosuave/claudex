@@ -742,6 +742,10 @@ impl Backend {
         &self.initialization
     }
 
+    pub fn is_running(&self) -> bool {
+        !self.cancel.is_cancelled() && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
     pub async fn send(&self, message: Value) -> Result<()> {
         if self.cancel.is_cancelled() || self.task.as_ref().is_none_or(|task| task.is_finished()) {
             bail!("Claude backend is closed");

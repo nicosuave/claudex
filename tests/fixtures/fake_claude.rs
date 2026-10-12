@@ -44,6 +44,7 @@ fn main() {
         .unwrap_or("fake-session");
     let mut hanging = false;
     let mut background = false;
+    let mut prompts = 0;
     let mut steering_inputs: Option<Vec<String>> = None;
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {
@@ -102,6 +103,7 @@ fn main() {
                 }
             }
             Some("user") => {
+                prompts += 1;
                 let content = &value["message"]["content"];
                 let text = content.as_str().map(str::to_owned).unwrap_or_else(|| {
                     content
@@ -170,6 +172,7 @@ fn main() {
                         emit(json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}));
                         emit(json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Working"}}}));
                     }
+                    "process-info" => finish(session, &format!("process {} prompt {prompts}", std::process::id()), false),
                     "resume-info" => finish(session, if args.iter().any(|a| a.starts_with("--resume=")) { "resumed" } else { "new" }, false),
                     "fork-info" => finish(session, &json!({
                         "resume":args.iter().find_map(|a| a.strip_prefix("--resume=")),
