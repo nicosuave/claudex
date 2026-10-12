@@ -4,7 +4,20 @@
 //! connect, and the Codex plugin catalog is rebuilt. Any difference invalidates
 //! the prompt cache for the whole conversation, so a thread keeps its process
 //! while idle and the next turn reuses it when nothing it was launched with changed.
-use std::time::Duration;
+//!
+//! An idle Claude process can also start work by itself: a background command
+//! or agent that outlived its turn finishes, and Claude answers the
+//! notification. The process is then handed back to the server as a new turn.
+//! While such work is running, the process is not an idle cache: it is neither
+//! expired nor evicted, since closing it would kill the work.
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
@@ -16,6 +29,42 @@ pub struct WarmSession {
     pub backend: Backend,
     pub output: mpsc::Receiver<BackendEvent>,
     pub plugins: Option<crate::plugin_runtime::Runtime>,
+    /// Background tasks still running in the process.
+    pub background: HashSet<String>,
+    /// Frames read while idle that the next turn must still process.
+    pub replay: Vec<Value>,
+}
+
+/// After a background task finishes, Claude may take a moment to answer it.
+const ANSWER_GRACE: Duration = Duration::from_secs(60);
+/// Idle status frames kept for replay; older ones carry nothing a turn needs.
+const MAX_REPLAY: usize = 256;
+
+/// Track Claude's background tasks (commands, monitors, agents, workflows).
+pub fn track_background(background: &mut HashSet<String>, frame: &Value) {
+    if frame["type"] != "system" || !frame["parent_tool_use_id"].is_null() {
+        return;
+    }
+    let Some(id) = frame["task_id"].as_str() else {
+        return;
+    };
+    match frame["subtype"].as_str() {
+        Some("task_started") => {
+            background.insert(id.to_owned());
+        }
+        Some("task_notification") => {
+            background.remove(id);
+        }
+        Some("task_updated")
+            if matches!(
+                frame["patch"]["status"].as_str(),
+                Some("completed" | "failed" | "killed" | "stopped")
+            ) =>
+        {
+            background.remove(id);
+        }
+        _ => {}
+    }
 }
 
 impl WarmSession {
@@ -33,23 +82,59 @@ pub struct Parked {
     pub key: Value,
     pub session_id: String,
     pub parked_at: Instant,
+    running: Arc<AtomicUsize>,
+    woke: Arc<AtomicBool>,
     reclaim: CancellationToken,
     watcher: JoinHandle<Option<WarmSession>>,
 }
 
+/// Where an idle session goes when Claude starts work by itself.
+pub struct Wake {
+    pub thread_id: String,
+    pub events: mpsc::Sender<crate::server::Event>,
+}
+
 impl Parked {
-    pub fn new(key: Value, session_id: String, session: WarmSession, timeout: Duration) -> Self {
+    pub fn new(
+        key: Value,
+        session_id: String,
+        session: WarmSession,
+        timeout: Duration,
+        wake: Wake,
+    ) -> Self {
         let reclaim = CancellationToken::new();
+        let running = Arc::new(AtomicUsize::new(session.background.len()));
+        let woke = Arc::new(AtomicBool::new(false));
         Self {
+            watcher: tokio::spawn(watch(
+                session,
+                reclaim.clone(),
+                timeout,
+                key.clone(),
+                wake,
+                running.clone(),
+                woke.clone(),
+            )),
+            running,
+            woke,
             key,
             session_id,
             parked_at: Instant::now(),
-            watcher: tokio::spawn(watch(session, reclaim.clone(), timeout)),
             reclaim,
         }
     }
 
-    /// False once the watcher closed the session itself.
+    /// Background tasks that closing this session would stop.
+    pub fn running_background(&self) -> usize {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Claude started work by itself; the session is on its way to a new turn.
+    pub fn woke(&self) -> bool {
+        self.woke.load(Ordering::Relaxed)
+    }
+
+    /// False once the watcher closed the session or handed it back as a wake.
     pub fn is_open(&self) -> bool {
         !self.watcher.is_finished()
     }
@@ -70,25 +155,70 @@ async fn watch(
     mut session: WarmSession,
     reclaim: CancellationToken,
     timeout: Duration,
+    key: Value,
+    wake: Wake,
+    running: Arc<AtomicUsize>,
+    woke: Arc<AtomicBool>,
 ) -> Option<WarmSession> {
-    let expired = tokio::time::sleep(timeout);
-    tokio::pin!(expired);
+    // Running background work suspends expiry; it resumes once the work ends.
+    let mut deadline = session
+        .background
+        .is_empty()
+        .then(|| Instant::now() + timeout);
     loop {
         tokio::select! {
             _ = reclaim.cancelled() => {
-                // Frames queued before the reclaim still belong to the idle period.
-                let mut busy = false;
+                // Frames queued before the reclaim belong to the next turn,
+                // including the start of work Claude began by itself.
                 while let Ok(event) = session.output.try_recv() {
-                    busy |= !quiet(&event);
+                    match event {
+                        BackendEvent::Message(frame) => {
+                            track_background(&mut session.background, &frame);
+                            session.replay.push(frame);
+                        }
+                        BackendEvent::Exited { .. } => break,
+                    }
                 }
-                if !busy && session.backend.is_running() {
+                if session.backend.is_running() {
                     return Some(session);
                 }
                 break;
             }
-            _ = &mut expired => break,
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
             event = session.output.recv() => match event {
-                Some(event) if quiet(&event) => {}
+                Some(BackendEvent::Message(frame)) => {
+                    let was_running = !session.background.is_empty();
+                    track_background(&mut session.background, &frame);
+                    running.store(session.background.len(), Ordering::Relaxed);
+                    let busy = !quiet(&BackendEvent::Message(frame.clone()));
+                    session.replay.push(frame);
+                    if busy {
+                        woke.store(true, Ordering::Relaxed);
+                        let woke = crate::server::Event::Woke {
+                            thread_id: wake.thread_id,
+                            key,
+                            session,
+                        };
+                        // A closed event loop drops the session, which kills the process.
+                        let _ = wake.events.send(woke).await;
+                        return None;
+                    }
+                    if session.replay.len() > MAX_REPLAY {
+                        session.replay.drain(..MAX_REPLAY / 2);
+                    }
+                    if session.background.is_empty() {
+                        if was_running {
+                            deadline = Some(Instant::now() + timeout.max(ANSWER_GRACE));
+                        }
+                    } else {
+                        deadline = None;
+                    }
+                }
                 _ => break,
             },
         }
@@ -97,8 +227,8 @@ async fn watch(
     None
 }
 
-/// Idle Claude only reports status. Anything else means it started work that no
-/// turn can observe or approve, so the session is closed instead of reused.
+/// Idle Claude only reports status. Anything else means it started work, which
+/// needs a turn to observe and approve it.
 fn quiet(event: &BackendEvent) -> bool {
     match event {
         BackendEvent::Message(frame) => match frame["type"].as_str() {
@@ -144,6 +274,9 @@ pub fn launch_key(options: &SessionOptions) -> Option<Value> {
 
 /// Why a parked session cannot serve this launch, or None when it can.
 pub fn mismatch(parked: &Parked, options: &SessionOptions, key: Option<&Value>) -> Option<String> {
+    if parked.key.is_null() {
+        return Some("it was kept only for background work".into());
+    }
     if !options.resume || options.fork_from.is_some() || options.resume_at.is_some() {
         return Some("history was rewound or forked".into());
     }

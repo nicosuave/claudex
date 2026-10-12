@@ -301,6 +301,23 @@ fn main() {
                         "fork":args.iter().any(|a| a=="--fork-session"),
                         "session":session
                     }).to_string(), false),
+                    text if text.starts_with("background-bash") => {
+                        // An optional suffix sets how long the command runs, in milliseconds.
+                        let delay = text
+                            .strip_prefix("background-bash ")
+                            .map_or(300, |ms| ms.parse().unwrap());
+                        // Claude Code 2.1.296: a background command outlives its turn,
+                        // and Claude answers its notification without a new prompt.
+                        emit(json!({"type":"system","subtype":"task_started","task_id":"bash-1","task_type":"local_bash","description":"Sleep then echo"}));
+                        finish(session, "Started", false);
+                        let session = session.to_owned();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                            emit(json!({"type":"system","subtype":"task_notification","task_id":"bash-1","status":"completed","summary":"Background command completed (exit code 0)"}));
+                            emit(json!({"type":"system","subtype":"init","session_id":session,"model":"fake-claude"}));
+                            finish(&session, "Background output: BGDONE", false);
+                        });
+                    }
                     "background" => {
                         background = true;
                         emit(json!({"type":"system","subtype":"session_state_changed","state":"running"}));

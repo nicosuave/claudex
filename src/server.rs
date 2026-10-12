@@ -45,6 +45,12 @@ pub enum Event {
         turn_id: String,
         session: crate::warm::WarmSession,
     },
+    /// An idle Claude process started work by itself.
+    Woke {
+        thread_id: String,
+        key: Value,
+        session: crate::warm::WarmSession,
+    },
     PluginsReady {
         thread_id: String,
         turn_id: String,
@@ -274,20 +280,28 @@ impl Server {
                     turn_id,
                     session,
                 } => {
-                    let key = self
-                        .active
-                        .get_mut(&thread_id)
-                        .filter(|active| active.id == turn_id)
-                        .and_then(|active| {
-                            // The parked session owns the plugin runtime from now on.
-                            active.plugins = None;
-                            active.launch_key.clone()
-                        });
+                    let key =
+                        self.active
+                            .get_mut(&thread_id)
+                            .filter(|active| active.id == turn_id)
+                            .and_then(|active| {
+                                // The parked session owns the plugin runtime from now on.
+                                active.plugins = None;
+                                // A null key never serves another turn.
+                                active.launch_key.clone().or_else(|| {
+                                    (!session.background.is_empty()).then_some(Value::Null)
+                                })
+                            });
                     match key {
                         Some(key) => self.park(thread_id, key, session).await,
                         None => session.close().await,
                     }
                 }
+                Event::Woke {
+                    thread_id,
+                    key,
+                    session,
+                } => self.wake(thread_id, key, session).await,
                 Event::PluginToolFinished {
                     thread_id,
                     turn_id,
@@ -514,14 +528,30 @@ impl Server {
         if self.active.contains_key(id) {
             return Err(RpcError::invalid("Thread already has an active turn"));
         }
+        // Its turn starts as soon as the server handles the wake.
+        if self
+            .idle_sessions
+            .get(id)
+            .is_some_and(|parked| parked.woke())
+        {
+            return Err(RpcError::invalid(
+                "Claude is starting a turn for finished background work",
+            ));
+        }
         Ok(())
     }
     async fn park(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
         self.idle_sessions.retain(|_, parked| parked.is_open());
-        while self.idle_sessions.len() >= self.config.max_idle_sessions {
+        // Processes running background work are not idle caches; evicting one
+        // would kill that work.
+        let idle = |parked: &crate::warm::Parked| parked.running_background() == 0;
+        while self.idle_sessions.values().filter(|p| idle(p)).count()
+            >= self.config.max_idle_sessions
+        {
             let Some(oldest) = self
                 .idle_sessions
                 .iter()
+                .filter(|(_, parked)| idle(parked))
                 .min_by_key(|(_, parked)| parked.parked_at)
                 .map(|(id, _)| id.clone())
             else {
@@ -530,8 +560,17 @@ impl Server {
             self.idle_sessions.remove(&oldest).unwrap().close().await;
         }
         let session_id = self.records[&id].session_id.clone();
-        let parked =
-            crate::warm::Parked::new(key, session_id, session, self.config.idle_session_timeout);
+        let wake = crate::warm::Wake {
+            thread_id: id.clone(),
+            events: self.events.clone(),
+        };
+        let parked = crate::warm::Parked::new(
+            key,
+            session_id,
+            session,
+            self.config.idle_session_timeout,
+            wake,
+        );
         self.idle_sessions.insert(id, parked);
     }
 
@@ -548,15 +587,197 @@ impl Server {
             None => parked.take().await,
             Some(reason) => {
                 eprintln!("Restarting Claude for thread {id}: {reason}");
+                self.warn_stopped_background(id, &parked, "This turn needs a new Claude process");
                 parked.close().await;
                 None
             }
         }
     }
 
+    fn session_options(
+        &self,
+        record: &Record,
+        output_schema: Option<Value>,
+        fast_mode: bool,
+    ) -> RpcResult<SessionOptions> {
+        Ok(SessionOptions {
+            state_dir: self.store.root().to_path_buf(),
+            sandbox: record.settings.sandbox.clone(),
+            cwd: record.settings.cwd.clone(),
+            session_id: record.session_id.clone(),
+            resume: record.has_session,
+            fork_from: if record.has_session {
+                None
+            } else {
+                record.fork_from.clone()
+            },
+            resume_at: if record.has_session || record.fork_from.is_none() {
+                None
+            } else {
+                record.backend_message_id.clone()
+            },
+            model: record.settings.model.clone(),
+            permission_mode: record.settings.native_permission_mode().into(),
+            system_prompt: record.settings.base_instructions.clone(),
+            append_system_prompt: record.settings.developer_instructions.clone(),
+            effort: record.settings.effort.clone(),
+            output_schema,
+            ephemeral: record.ephemeral(),
+            native_settings: {
+                let mut settings =
+                    crate::plugins::disabled_settings(&record.settings.disabled_plugin_ids)?;
+                settings["env"] = json!(record.settings.environment_overrides);
+                // Claude honors fast mode from SDK clients only as a flag setting.
+                if fast_mode {
+                    settings["fastMode"] = json!(true);
+                }
+                settings
+            },
+            dynamic_tools: record
+                .settings
+                .dynamic_tools
+                .iter()
+                .map(|t| t.mcp_spec())
+                .collect(),
+        })
+    }
+
+    /// Start the backend worker for a turn already recorded on the thread.
+    fn spawn_turn(&mut self, record: &Record, turn: LaunchedTurn) {
+        let id = record.id().to_owned();
+        let (control, commands) = mpsc::channel(32);
+        let input_admission = Arc::new(Mutex::new(InputAdmission::default()));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_backend(BackendTurn {
+            config: self.config.backend.clone(),
+            plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
+                (
+                    config,
+                    record.settings.disabled_plugin_ids.clone(),
+                    record.settings.dynamic_tools.clone(),
+                )
+            }),
+            options: turn.options,
+            warm: turn.warm,
+            park: turn.launch_key.is_some(),
+            thread_id: id.clone(),
+            turn_id: turn.turn_id.clone(),
+            input: turn.input,
+            commands,
+            input_admission: input_admission.clone(),
+            events: self.events.clone(),
+            cancel: cancel.clone(),
+        }));
+        self.active.insert(
+            id.clone(),
+            ActiveTurn {
+                launch_key: turn.launch_key,
+                usage: crate::usage::Tracker::default(),
+                plugins: None,
+                plugin_calls: HashMap::new(),
+                id: turn.turn_id.clone(),
+                owner: turn.owner,
+                started_ms: now_ms(),
+                control,
+                input_admission,
+                translator: Translator::new(&id, &turn.turn_id, &record.settings.cwd)
+                    .with_reasoning(record.settings.reasoning_summary.as_deref() != Some("none")),
+                agents: Default::default(),
+                breaker: Default::default(),
+                interrupting: false,
+                fast_mode: turn.fast_mode,
+                worker,
+                cancel,
+            },
+        );
+    }
+
+    /// Claude started work in an idle process, for example to answer a
+    /// background task that finished after its turn. Codex has no equivalent,
+    /// so the work becomes a new turn on the thread instead of being discarded.
+    async fn wake(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
+        self.idle_sessions.retain(|_, parked| parked.is_open());
+        let available = self
+            .records
+            .get(&id)
+            .is_some_and(|record| !record.archived && !self.active.contains_key(&id));
+        if !available {
+            session.close().await;
+            return;
+        }
+        let mut record = self.records[&id].clone();
+        // The process keeps its own launch settings, including fast mode.
+        let fast_mode = key["nativeSettings"]["fastMode"] == true;
+        let options = match self.session_options(&record, None, fast_mode) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("Cannot resume Claude's background work for thread {id}: {error}");
+                session.close().await;
+                return;
+            }
+        };
+        let turn_id = protocol::id();
+        let turn = protocol::new_turn(&turn_id);
+        record.turns.push(turn.clone());
+        record.thread["status"] = json!({"type": "active", "activeFlags": []});
+        record.touch();
+        if let Err(error) = self.store.save(&record) {
+            eprintln!("Cannot record Claude's background work for thread {id}: {error}");
+            session.close().await;
+            return;
+        }
+        // Approvals go to a client showing the thread; otherwise the turn is
+        // detached until a client resumes it.
+        let owner = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.ready && connection.subscriptions.contains(&id))
+            .map(|(client, _)| *client)
+            .min();
+        self.spawn_turn(
+            &record,
+            LaunchedTurn {
+                turn_id,
+                options,
+                warm: Some(session),
+                launch_key: Some(key),
+                input: vec![],
+                owner,
+                fast_mode,
+            },
+        );
+        self.records.insert(id.clone(), record);
+        self.emit(
+            &id,
+            notification(
+                "thread/status/changed",
+                json!({"threadId": id, "status": {"type": "active", "activeFlags": []}}),
+            ),
+        );
+        self.emit(
+            &id,
+            notification("turn/started", json!({"threadId": id, "turn": turn})),
+        );
+    }
+
     async fn close_idle_session(&mut self, id: &str) {
         if let Some(parked) = self.idle_sessions.remove(id) {
+            self.warn_stopped_background(id, &parked, "Closing this chat's Claude process");
             parked.close().await;
+        }
+    }
+
+    /// Closing a process kills its background work, and with it any later answer.
+    fn warn_stopped_background(&self, id: &str, parked: &crate::warm::Parked, cause: &str) {
+        let running = parked.running_background();
+        if running > 0 {
+            let message = format!(
+                "{cause} stopped {running} background task(s) that were still running; their results will not be delivered."
+            );
+            self.emit(
+                id,
+                notification("warning", json!({"threadId": id, "message": message})),
+            );
         }
     }
 
@@ -2400,93 +2621,25 @@ impl Server {
         }
         record.touch();
         self.store.save(&record).map_err(RpcError::internal)?;
-        let options = SessionOptions {
-            state_dir: self.store.root().to_path_buf(),
-            sandbox: record.settings.sandbox.clone(),
-            cwd: record.settings.cwd.clone(),
-            session_id: record.session_id.clone(),
-            resume: record.has_session,
-            fork_from: if record.has_session {
-                None
-            } else {
-                record.fork_from.clone()
-            },
-            resume_at: if record.has_session || record.fork_from.is_none() {
-                None
-            } else {
-                record.backend_message_id.clone()
-            },
-            model: record.settings.model.clone(),
-            permission_mode: record.settings.native_permission_mode().into(),
-            system_prompt: record.settings.base_instructions.clone(),
-            append_system_prompt: record.settings.developer_instructions.clone(),
-            effort: record.settings.effort.clone(),
-            output_schema: p.get("outputSchema").filter(|v| !v.is_null()).cloned(),
-            ephemeral: record.ephemeral(),
-            native_settings: {
-                let mut settings =
-                    crate::plugins::disabled_settings(&record.settings.disabled_plugin_ids)?;
-                settings["env"] = json!(record.settings.environment_overrides);
-                // Claude honors fast mode from SDK clients only as a flag setting.
-                if fast_mode {
-                    settings["fastMode"] = json!(true);
-                }
-                settings
-            },
-            dynamic_tools: record
-                .settings
-                .dynamic_tools
-                .iter()
-                .map(|t| t.mcp_spec())
-                .collect(),
-        };
+        let options = self.session_options(
+            &record,
+            p.get("outputSchema").filter(|v| !v.is_null()).cloned(),
+            fast_mode,
+        )?;
         let launch_key = crate::warm::launch_key(&options).filter(|_| {
             self.config.max_idle_sessions > 0 && !self.config.idle_session_timeout.is_zero()
         });
         let warm = self.reclaim(id, &options, launch_key.as_ref()).await;
-        let (control, commands) = mpsc::channel(32);
-        let input_admission = Arc::new(Mutex::new(InputAdmission::default()));
-        let cancel = CancellationToken::new();
-        let worker = tokio::spawn(run_backend(BackendTurn {
-            config: self.config.backend.clone(),
-            plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
-                (
-                    config,
-                    record.settings.disabled_plugin_ids.clone(),
-                    record.settings.dynamic_tools.clone(),
-                )
-            }),
-            options,
-            warm,
-            park: launch_key.is_some(),
-            thread_id: id.to_owned(),
-            turn_id: turn_id.clone(),
-            input: claude_input,
-            commands,
-            input_admission: input_admission.clone(),
-            events: self.events.clone(),
-            cancel: cancel.clone(),
-        }));
-        self.active.insert(
-            id.to_owned(),
-            ActiveTurn {
+        self.spawn_turn(
+            &record,
+            LaunchedTurn {
+                turn_id: turn_id.clone(),
+                options,
+                warm,
                 launch_key,
-                usage: crate::usage::Tracker::default(),
-                plugins: None,
-                plugin_calls: HashMap::new(),
-                id: turn_id.clone(),
+                input: claude_input,
                 owner: Some(client),
-                started_ms: now_ms(),
-                control,
-                input_admission,
-                translator: Translator::new(id, &turn_id, &record.settings.cwd)
-                    .with_reasoning(record.settings.reasoning_summary.as_deref() != Some("none")),
-                agents: Default::default(),
-                breaker: Default::default(),
-                interrupting: false,
                 fast_mode,
-                worker,
-                cancel,
             },
         );
         self.records.insert(id.to_owned(), record);
@@ -4345,6 +4498,16 @@ fn append_additional_context(input: &mut Vec<Value>, context: &Value) {
     }
 }
 
+struct LaunchedTurn {
+    turn_id: String,
+    options: SessionOptions,
+    warm: Option<crate::warm::WarmSession>,
+    launch_key: Option<Value>,
+    input: Vec<Value>,
+    owner: Option<u64>,
+    fast_mode: bool,
+}
+
 struct BackendTurn {
     config: BackendConfig,
     plugins: Option<(
@@ -4359,6 +4522,7 @@ struct BackendTurn {
     park: bool,
     thread_id: String,
     turn_id: String,
+    /// Empty when a woken idle process is already working without a prompt.
     input: Vec<Value>,
     commands: mpsc::Receiver<Control>,
     input_admission: Arc<Mutex<InputAdmission>>,
@@ -4425,7 +4589,13 @@ async fn run_backend(turn: BackendTurn) {
                         .await
                         .map_err(|_| anyhow::anyhow!("Facade event loop closed"))?;
                 }
-                return Ok((warm.backend, warm.output, warm.plugins));
+                return Ok((
+                    warm.backend,
+                    warm.output,
+                    warm.plugins,
+                    warm.background,
+                    warm.replay,
+                ));
             }
             let mut plugin_runtime = None;
             if let Some((plugin_config, disabled, desktop)) = plugins {
@@ -4482,7 +4652,7 @@ async fn run_backend(turn: BackendTurn) {
                     anyhow::bail!("Claude startup cancelled");
                 }
             }
-            Ok((backend, output, plugin_runtime))
+            Ok((backend, output, plugin_runtime, HashSet::new(), vec![]))
         };
         tokio::pin!(future);
         loop {
@@ -4508,7 +4678,7 @@ async fn run_backend(turn: BackendTurn) {
             }
         }
     };
-    let (mut backend, mut output, plugin_runtime) = match spawned {
+    let (mut backend, mut output, plugin_runtime, background, replay) = match spawned {
         Ok(spawned) => spawned,
         Err(error) => {
             input_admission.lock().unwrap().closed = true;
@@ -4520,13 +4690,18 @@ async fn run_backend(turn: BackendTurn) {
             return;
         }
     };
-    let prompt = json!({"type": "user", "uuid":protocol::id(), "session_id": options.session_id, "message": {"role": "user", "content": input}, "parent_tool_use_id": null});
-    let mut run = RunState::default();
+    // A woken process is already working; it continues from its replayed frames.
+    let prompt = (!input.is_empty()).then(|| json!({"type": "user", "uuid":protocol::id(), "session_id": options.session_id, "message": {"role": "user", "content": input}, "parent_tool_use_id": null}));
+    let mut replay = std::collections::VecDeque::from(replay);
+    let mut run = RunState {
+        background,
+        ..RunState::default()
+    };
     let mut interrupt_deadline = None;
     // Only a turn that ran to Claude's idle state leaves a process fit for reuse.
     let mut idle = false;
     let run_future = async {
-        for message in std::iter::once(prompt).chain(queued_input) {
+        for message in prompt.into_iter().chain(queued_input) {
             run.submitted(&message);
             if let Err(error) = backend.send(message).await {
                 return Some(BackendEvent::Exited {
@@ -4577,7 +4752,12 @@ async fn run_backend(turn: BackendTurn) {
                 _ = async {
                     match run.idle_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await }
                 } => return Some(BackendEvent::Exited { success: false, message: "Claude did not become idle after its result".into() }),
-                event = output.recv() => {
+                event = async {
+                    match replay.pop_front() {
+                        Some(frame) => Some(BackendEvent::Message(frame)),
+                        None => output.recv().await,
+                    }
+                } => {
                     let Some(event) = event else {
                         return Some(BackendEvent::Exited { success: false, message: "Claude event stream closed".into() });
                     };
@@ -4606,11 +4786,15 @@ async fn run_backend(turn: BackendTurn) {
     };
     let terminal = tokio::select! { _ = cancel.cancelled() => None, result = run_future => result };
     input_admission.lock().unwrap().closed = true;
-    if park && idle && !cancel.is_cancelled() {
+    // Background work outlives the turn, so its process is kept even when it
+    // cannot serve later turns.
+    if (park || !run.background.is_empty()) && idle && !cancel.is_cancelled() {
         let session = crate::warm::WarmSession {
             backend,
             output,
             plugins: plugin_runtime,
+            background: std::mem::take(&mut run.background),
+            replay: vec![],
         };
         // Reserve first so a cancelled delivery still closes the session gracefully.
         let permit = tokio::select! { _ = cancel.cancelled() => None, permit = events.reserve() => permit.ok() };
@@ -4654,6 +4838,8 @@ async fn run_backend(turn: BackendTurn) {
 struct RunState {
     state: Option<String>,
     tasks: HashSet<String>,
+    /// Every running background task, including ones that do not hold the turn open.
+    background: HashSet<String>,
     result: Option<Value>,
     idle_deadline: Option<tokio::time::Instant>,
     pending_input: HashSet<String>,
@@ -4667,6 +4853,7 @@ impl RunState {
     }
 
     fn observe(&mut self, message: &Value) {
+        crate::warm::track_background(&mut self.background, message);
         if !message["parent_tool_use_id"].is_null() {
             return;
         }

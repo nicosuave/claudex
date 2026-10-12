@@ -2490,6 +2490,124 @@ async fn fast_service_tier_selects_claude_fast_mode() {
     client.close().await;
 }
 
+/// Waits for the turn Claude starts by itself after `after`, and returns its text.
+async fn woken_turn(client: &mut Client, thread: &str, after: &str) -> Vec<String> {
+    let started = client
+        .until(|v| {
+            v["method"] == "turn/started"
+                && v["params"]["threadId"] == thread
+                && v["params"]["turn"]["id"] != after
+        })
+        .await;
+    let woke = started["params"]["turn"]["id"].as_str().unwrap().to_owned();
+    let completed = client.completed(&woke).await;
+    assert_eq!(completed["status"], "completed");
+    agent_texts(&completed)
+}
+
+#[tokio::test]
+async fn idle_claude_work_after_a_turn_arrives_as_a_new_turn() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let first = client.start(&thread, "background-bash").await;
+    assert_eq!(agent_texts(&client.completed(&first).await), ["Started"]);
+    // Claude answers the background command's notification on its own.
+    assert_eq!(
+        woken_turn(&mut client, &thread, &first).await,
+        ["Background output: BGDONE"]
+    );
+    let turns = client
+        .ok(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await["thread"]["turns"]
+        .clone();
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    // The woken process is parked again and serves the next turn.
+    let next = client.start(&thread, "process-info").await;
+    let text = agent_texts(&client.completed(&next).await).pop().unwrap();
+    assert!(text.ends_with("prompt 2"), "{text}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn background_work_survives_idle_expiry_eviction_and_disabled_reuse() {
+    // Running work outlives an idle timeout shorter than the work itself.
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--idle-session-timeout-seconds", "1"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let first = client.start(&thread, "background-bash 1600").await;
+    client.completed(&first).await;
+    assert_eq!(
+        woken_turn(&mut client, &thread, &first).await,
+        ["Background output: BGDONE"]
+    );
+    client.close().await;
+
+    // With process reuse disabled, the process stays only for its background work.
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--idle-session-timeout-seconds", "0"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let first = client.start(&thread, "background-bash").await;
+    client.completed(&first).await;
+    assert_eq!(
+        woken_turn(&mut client, &thread, &first).await,
+        ["Background output: BGDONE"]
+    );
+    let next = client.start(&thread, "process-info").await;
+    let text = agent_texts(&client.completed(&next).await).pop().unwrap();
+    assert!(
+        text.ends_with("prompt 1"),
+        "a kept process never serves a new turn: {text}"
+    );
+    client.close().await;
+
+    // Another thread's idle process does not evict one running background work.
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn_with_args(state.path(), &["--max-idle-sessions", "1"]).await;
+    client.initialize().await;
+    let working = client.thread().await;
+    let first = client.start(&working, "background-bash 800").await;
+    client.completed(&first).await;
+    let other = client.thread().await;
+    let turn = client.start(&other, "hello").await;
+    client.completed(&turn).await;
+    assert_eq!(
+        woken_turn(&mut client, &working, &first).await,
+        ["Background output: BGDONE"]
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn archiving_a_chat_with_running_background_work_warns() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let first = client.start(&thread, "background-bash 5000").await;
+    client.completed(&first).await;
+    client
+        .ok("thread/archive", json!({"threadId":thread}))
+        .await;
+    let warning = client.until(|v| v["method"] == "warning").await;
+    assert!(
+        warning["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 background task(s)"),
+        "{warning}"
+    );
+    client.close().await;
+}
+
 #[tokio::test]
 async fn first_prompt_waits_for_connecting_mcp_servers() {
     let state = tempfile::tempdir().unwrap();
