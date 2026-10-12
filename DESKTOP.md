@@ -192,7 +192,15 @@ security principal.
 Genuine Codex supplies plugin services from its existing registry and auth;
 facade conversations use separate storage. The ordinary Codex connection and
 shell profiles remain unchanged. `CODEX_SSH_SKIP_APP_SERVER_BOOT=true` makes SSH
-use the already-running login-session service via `app-server proxy`.
+use the already-running login-session service via `app-server proxy`. These
+variables configure the service only; Claude sessions do not inherit them.
+
+The launcher passes `--login-shell-path`: at startup the service replaces the
+LaunchAgent's minimal PATH with the one your interactive login shell configures
+(`$SHELL -l -i`), so Claude sessions, desktop commands and plugin servers find the
+same tools as your terminal. Only PATH is imported. Restart the service after
+changing PATH in your shell profile. If the shell does not report PATH within 10
+seconds, the service logs a warning and keeps the minimal PATH.
 
 ## Verification and limitations
 

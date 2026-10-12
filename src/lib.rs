@@ -12,6 +12,7 @@ pub mod install;
 pub mod plugins;
 pub mod protocol;
 pub mod server;
+pub mod shell_env;
 pub mod store;
 pub mod timeline;
 pub mod translate;

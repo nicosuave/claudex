@@ -188,7 +188,7 @@ impl Installation {
         }
         let environment = self.environment(&claude, &codex, &plugin_home)?;
         let launcher = format!(
-            "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec {} --model opus \"$@\"\n",
+            "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec {} --model opus --login-shell-path \"$@\"\n",
             shell_quote(&installed_binary)?
         );
         let session = format!(

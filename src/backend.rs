@@ -32,6 +32,18 @@ const MIN_WORKSPACE_CLAUDE: &str = "2.1.294";
 // Guarded sessions keep reading stdout while the event consumer catches up,
 // so a hook callback is never stuck behind queued events.
 const EVENT_BACKLOG: usize = if cfg!(test) { 64 * 1024 } else { 4 * MAX_FRAME };
+// Deployment settings for the facade process itself. Claude sessions must not
+// inherit them: a codex or facade run inside a session would otherwise use the
+// facade's private homes and sockets instead of the user's.
+const FACADE_ENVIRONMENT: &[&str] = &[
+    "CODEX_HOME",
+    "CODEX_INSTALL_DIR",
+    "CODEX_SSH_SKIP_APP_SERVER_BOOT",
+    "CLAUDE_CODEX_HOME",
+    "CLAUDE_CODEX_SOCKET_DIR",
+    "CLAUDE_CODEX_PLUGIN_HOME",
+    "CLAUDE_CODEX_PLUGIN_EXECUTABLE",
+];
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
@@ -101,6 +113,9 @@ fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<Pr
         None
     };
     let mut cmd = Command::new(&config.executable);
+    for key in FACADE_ENVIRONMENT {
+        cmd.env_remove(key);
+    }
     let (extra_args, mut settings) = launch_settings(config, options, profile.as_ref())?;
     if cfg!(target_os = "macos") && options.sandbox.is_workspace() {
         crate::ssh_proxy::add_hook(
@@ -981,6 +996,21 @@ mod tests {
             json!({"keep@market":true,"disabled@market":false})
         );
         assert!(!stdout.lines().any(|line| line == "--settings"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessions_do_not_inherit_facade_deployment_environment() {
+        let command = command(&shell_config(":"), &test_options()).unwrap();
+        let removed: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in FACADE_ENVIRONMENT {
+            assert!(removed.iter().any(|k| k == key), "{key} is inherited");
+        }
     }
 
     #[cfg(unix)]
