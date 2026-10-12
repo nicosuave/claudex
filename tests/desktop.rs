@@ -47,3 +47,37 @@ fn incompatible_shell_restrictions_are_not_silently_discarded() {
         assert!(error.message.contains("shell_environment_policy"));
     }
 }
+
+#[test]
+fn codex_desktop_runtime_overrides_do_not_block_claude_requests() {
+    for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
+        let (params, warnings) = normalize(
+            method,
+            &json!({
+                "approvalPolicy":"on-request", "sandbox":"workspace-write",
+                "config":{
+                    "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+                    "memories.dual_write":true, "memories.version":"v2",
+                    "model_reasoning_effort":"high"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(params.get("config").is_none());
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Node REPL overrides are not applied"))
+        );
+    }
+    // Keep rejecting unrelated settings instead of dropping arbitrary MCP or
+    // memory configuration merely because the desktop supplies some of it.
+    for key in ["mcp_servers.other", "memories.unknown"] {
+        let error =
+            normalize("thread/start", &json!({"config":{key:{"enabled":true}}})).unwrap_err();
+        assert!(error.message.contains(key));
+    }
+}

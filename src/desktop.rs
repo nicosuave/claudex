@@ -126,6 +126,12 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
                 // They are not Claude settings. Warn instead of pretending to
                 // enable Codex-only execution features on the native backend.
                 key if key.starts_with("features.") => native_features = true,
+                // The local desktop also injects its Codex memory storage and
+                // Node REPL setup. Claude keeps its own native memory and MCP
+                // configuration; these do not configure the Claude backend.
+                "memories.dual_write" | "memories.version" | "mcp_servers.node_repl" => {
+                    native_features = true;
+                }
                 "apps.connector_openai_pages.tools"
                     if value.as_object().is_some_and(|tools| {
                         tools.values().all(|tool| tool["enabled"] == false)
@@ -148,7 +154,7 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
             )));
         }
         if native_features {
-            warnings.push("Claude uses its native runtime and tools; Codex runtime feature overrides are not applied.".into());
+            warnings.push("Claude uses its native runtime, memory and tools; Codex runtime feature, memory and Node REPL overrides are not applied.".into());
         }
     }
     if let Some(mode) = object.remove("collaborationMode").filter(|v| !v.is_null()) {

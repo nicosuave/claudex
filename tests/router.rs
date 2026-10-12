@@ -229,7 +229,12 @@ async fn one_picker_and_one_sidebar_span_codex_and_claude() {
     assert!(reply.get("error").is_none(), "{reply}");
     desktop.completed(&codex).await;
 
-    let claude = desktop.thread(json!({"model": "opus"})).await;
+    let claude = desktop
+        .thread(json!({"model": "opus", "config": {
+            "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+            "memories.dual_write":true, "memories.version":"v2"
+        }}))
+        .await;
     assert_ne!(claude, codex);
     let reply = desktop.turn(&claude, "opus", "hello claude").await;
     assert!(reply.get("error").is_none(), "{reply}");
@@ -279,7 +284,12 @@ async fn a_prewarmed_codex_thread_moves_to_claude_on_its_first_claude_turn() {
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
     // The desktop prewarms without a model, then submits with the picked one.
     let thread = desktop
-        .thread(json!({"cwd": "/tmp", "sandbox": "danger-full-access"}))
+        .thread(
+            json!({"cwd": "/tmp", "sandbox": "danger-full-access", "config": {
+                "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+                "memories.dual_write":true, "memories.version":"v2"
+            }}),
+        )
         .await;
     let reply = desktop.turn(&thread, "sonnet", "first message").await;
     assert!(reply.get("error").is_none(), "{reply}");
