@@ -4,6 +4,8 @@ pub mod attachments;
 pub mod auto_review;
 pub mod backend;
 pub mod commands;
+#[cfg(unix)]
+pub mod delegation;
 pub mod desktop;
 pub mod dynamic_tools;
 mod file_guard;

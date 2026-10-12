@@ -44,6 +44,8 @@ const CLAUDE_LIST_FILTERS: &[&str] = &[
     "sourceKinds",
     "sortKey",
     "sortDirection",
+    "parentThreadId",
+    "ancestorThreadId",
 ];
 
 static LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
@@ -62,6 +64,9 @@ macro_rules! note {
         }
     }};
 }
+
+#[path = "router_delegation.rs"]
+mod agents;
 
 /// Whether `args` (everything after the codex executable) is the desktop's
 /// stdio app-server launch. Anything else runs genuine Codex unchanged.
@@ -113,6 +118,7 @@ enum Continuation {
     Resume { thread_id: String, request: Value },
     StartDefault { request: Value },
     Merge { merge: u64, side: Side },
+    Delegation { side: Side, step: agents::Step },
 }
 
 enum MergeKind {
@@ -128,6 +134,7 @@ struct Merge {
     /// Codex cursor and the sort boundary of the previous merged page.
     boundary: Option<i64>,
     codex: Option<Result<Value, Value>>,
+    codex_pages: Vec<Value>,
     claude: Vec<Value>,
     claude_done: bool,
 }
@@ -135,6 +142,7 @@ struct Merge {
 struct Forwarded {
     method: String,
     params: Value,
+    delegation_scope: Option<String>,
 }
 
 #[derive(Clone)]
@@ -166,6 +174,7 @@ pub struct Router {
     queue: VecDeque<Value>,
     /// Client requests wait (in order) while one routing fact is outstanding.
     blocked: Option<Block>,
+    agents: agents::State,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,7 +259,19 @@ pub async fn run(
         reconnecting = true;
     }
     let mut router = Router::new(client, codex_sender, claude, claude_socket.is_some());
-    while let Some(input) = receiver.recv().await {
+    let (calls, mut agent_calls) = mpsc::channel(64);
+    router.agents.calls = Some(calls);
+    if let Some(socket) = &claude_socket {
+        router.agents.registry =
+            crate::delegation::Registry::open(socket.with_extension("agents"))?;
+    }
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        let input = tokio::select! {
+            input = receiver.recv() => match input { Some(input) => input, None => break },
+            Some(call) = agent_calls.recv() => { router.agent_mcp_call(call); continue; },
+            _ = tick.tick() => { router.agent_tick(); continue; },
+        };
         match input {
             Input::Client(message) => router.client_message(message),
             Input::Backend(side, message) => router.backend_message(side, message),
@@ -266,6 +287,18 @@ pub async fn run(
                 router.claude_connected(sender);
             }
             Input::ClientClosed | Input::BackendClosed(Side::Codex) => break,
+        }
+    }
+    router.stop_agents();
+    // Native Claude sessions live in the separate service. Wait for interruption
+    // acknowledgements before closing its transport; never leave delegated work
+    // running merely because the desktop disconnected.
+    let shutdown = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while router.agents.has_shutdown_work() && tokio::time::Instant::now() < shutdown {
+        match tokio::time::timeout_at(shutdown, receiver.recv()).await {
+            Ok(Some(Input::Backend(side, message))) => router.backend_message(side, message),
+            Ok(Some(Input::BackendClosed(side))) => router.agent_backend_failed(side),
+            _ => break,
         }
     }
     // Closing Codex's stdin lets it finish its own shutdown.
@@ -510,6 +543,7 @@ impl Router {
             next_merge: 1,
             queue: VecDeque::new(),
             blocked: None,
+            agents: agents::State::default(),
         }
     }
 
@@ -521,14 +555,20 @@ impl Router {
         }
     }
 
-    fn send_backend(&mut self, side: Side, message: Value) {
+    fn send_backend_checked(&self, side: Side, message: Value) -> bool {
         let sender = match side {
             Side::Codex => Some(&self.codex),
             Side::Claude => self.claude.as_ref(),
         };
         if sender.is_none_or(|sender| sender.try_send(message).is_err()) {
             note!("{side:?} input queue is full or closed");
+            return false;
         }
+        true
+    }
+
+    fn send_backend(&mut self, side: Side, message: Value) {
+        self.send_backend_checked(side, message);
     }
 
     fn internal_request(
@@ -541,10 +581,16 @@ impl Router {
         let id = format!("{INTERNAL_ID}{}", self.next_internal);
         self.next_internal += 1;
         self.internal.insert(id.clone(), continuation);
-        self.send_backend(side, json!({"id": id, "method": method, "params": params}));
+        if !self.send_backend_checked(side, json!({"id": id, "method": method, "params": params})) {
+            let continuation = self.internal.remove(&id).unwrap();
+            self.continue_with(
+                continuation,
+                Err(json!({"code":-32000,"message":"Native backend input queue is unavailable"})),
+            );
+        }
     }
 
-    fn forward(&mut self, side: Side, message: Value) {
+    fn forward(&mut self, side: Side, mut message: Value) {
         if side == Side::Claude && !self.claude_available() {
             if let Some(id) = message.get("id") {
                 self.send_client(error(
@@ -575,12 +621,26 @@ impl Router {
             self.blocked = Some(Block::Resume);
             return;
         }
+        let delegation_scope = match self.prepare_agent_tools(side, &mut message) {
+            Ok(scope) => scope,
+            Err(failure) => {
+                self.send_client(error(message["id"].clone(), failure.to_string()));
+                return;
+            }
+        };
+        self.invalidate_agent_snapshot(&message);
+        if message["method"] == "turn/interrupt"
+            && let Some(thread) = message["params"]["threadId"].as_str()
+        {
+            self.interrupt_descendants(thread);
+        }
         if let Some(id) = message.get("id") {
             self.forwarded.insert(
                 (side, id_key(id)),
                 Forwarded {
                     method: message["method"].as_str().unwrap_or("").to_owned(),
                     params: message["params"].clone(),
+                    delegation_scope,
                 },
             );
         }
@@ -681,6 +741,9 @@ impl Router {
                 self.send_backend(Side::Claude, message.clone());
             }
             self.send_backend(Side::Codex, message);
+            if method == "initialized" {
+                self.recover_agents();
+            }
             return;
         };
         let params = message["params"].clone();
@@ -706,8 +769,13 @@ impl Router {
                     .or_else(|| params["ancestorThreadId"].as_str())
                     .map(str::to_owned);
                 match related {
-                    // Relations never cross backends.
-                    Some(thread) => self.route_by_thread(&thread, message),
+                    Some(_) => self.start_merge(
+                        id,
+                        MergeKind::Threads {
+                            search: method == "thread/search",
+                        },
+                        params,
+                    ),
                     None => self.start_merge(
                         id,
                         MergeKind::Threads {
@@ -827,6 +895,18 @@ impl Router {
             .expect("fresh thread checked before adoption")
             .clone();
         let mut params = fresh.params;
+        if let Some(config) = params["config"].as_object_mut() {
+            config.remove("mcp_servers.claudex_agents");
+        }
+        if let Some(tools) = params["dynamicTools"].as_array_mut() {
+            tools.retain(|tool| *tool != crate::delegation::dynamic_spec());
+        }
+        let mut start = json!({"method":"thread/start","params":params});
+        if let Err(failure) = self.prepare_agent_tools(Side::Claude, &mut start) {
+            self.send_client(error(turn["id"].clone(), failure.to_string()));
+            return;
+        }
+        let mut params = start["params"].clone();
         params["model"] = json!(selected_model(&turn["params"]));
         if let Some(effort) = turn["params"].get("effort").filter(|v| !v.is_null()) {
             params["effort"] = effort.clone();
@@ -861,6 +941,11 @@ impl Router {
             MergeKind::Threads { search: true } => "thread/search",
             MergeKind::Threads { search: false } => "thread/list",
         };
+        if matches!(kind, MergeKind::Threads { search: false }) && agents::shared_listing(&params) {
+            codex_params.as_object_mut().unwrap().remove("cursor");
+            codex_params["limit"] = json!(1000);
+            boundary = None;
+        }
         self.internal_request(
             Side::Codex,
             codex_method,
@@ -908,6 +993,7 @@ impl Router {
                 params,
                 boundary,
                 codex: None,
+                codex_pages: vec![],
                 claude: vec![],
                 claude_done,
             },
@@ -920,6 +1006,23 @@ impl Router {
         };
         let mut next_page = None;
         match (side, result) {
+            (Side::Codex, Ok(mut page))
+                if matches!(state.kind, MergeKind::Threads { search: false })
+                    && agents::shared_listing(&state.params) =>
+            {
+                state
+                    .codex_pages
+                    .extend(page["data"].as_array().cloned().unwrap_or_default());
+                if let Some(cursor) = page["nextCursor"].as_str() {
+                    let mut query = state.params.clone();
+                    query["limit"] = json!(1000);
+                    query["cursor"] = json!(cursor);
+                    next_page = Some(("thread/list", query));
+                } else {
+                    page["data"] = json!(std::mem::take(&mut state.codex_pages));
+                    state.codex = Some(Ok(page));
+                }
+            }
             (Side::Codex, result) => state.codex = Some(result),
             (Side::Claude, Ok(page)) => {
                 state
@@ -949,12 +1052,7 @@ impl Router {
             }
         }
         if let Some((method, query)) = next_page {
-            self.internal_request(
-                Side::Claude,
-                method,
-                query,
-                Continuation::Merge { merge, side },
-            );
+            self.internal_request(side, method, query, Continuation::Merge { merge, side });
         }
         self.finish_merges();
     }
@@ -1071,6 +1169,13 @@ impl Router {
                     if descending { -value } else { value }
                 });
                 result["data"] = json!(merged);
+                self.decorate_agent_listing(&state.params, &mut result);
+                if matches!(state.kind, MergeKind::Threads { search: false })
+                    && agents::shared_listing(&state.params)
+                    && let Err(failure) = agents::paginate_listing(&state.params, &mut result)
+                {
+                    return error(state.client_id, failure.to_string());
+                }
                 if !last_page {
                     let boundary = end.or(state.boundary);
                     result["nextCursor"] = json!(encode_cursor(&result["nextCursor"], boundary));
@@ -1090,6 +1195,9 @@ impl Router {
             (None, Some(id)) => self.backend_response(side, id, message),
             (Some(_), Some(id)) => {
                 self.learn(side, &message);
+                if self.agent_dynamic_call(side, &message) {
+                    return;
+                }
                 if side == Side::Claude {
                     message["id"] = json!(format!("{CLAUDE_REQUEST_ID}{id}"));
                 }
@@ -1109,6 +1217,8 @@ impl Router {
                     return;
                 }
                 self.learn(side, &message);
+                self.agent_notification(side, &message);
+                self.decorate_agent_message(&mut message);
                 if side == Side::Codex && method == "turn/started" {
                     for id in &ids {
                         self.fresh.remove(id);
@@ -1132,16 +1242,38 @@ impl Router {
         }
     }
 
-    fn backend_response(&mut self, side: Side, id: Value, message: Value) {
+    fn backend_response(&mut self, side: Side, id: Value, mut message: Value) {
         let result = match message.get("error") {
             Some(error) => Err(error.clone()),
             None => Ok(message["result"].clone()),
         };
+        if let Ok(result) = &result {
+            self.remember_agent_snapshot(result);
+        }
         if let Some(continuation) = id.as_str().and_then(|id| self.internal.remove(id)) {
             self.continue_with(continuation, result);
             return;
         }
         let forwarded = self.forwarded.remove(&(side, id_key(&id)));
+        if let Some(forwarded) = &forwarded {
+            if result.is_ok()
+                && matches!(
+                    forwarded.method.as_str(),
+                    "thread/unsubscribe" | "thread/archive"
+                )
+                && let Some(thread) = forwarded.params["threadId"].as_str()
+            {
+                self.agent_thread_unloaded(thread);
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|result| result["turn"]["status"] == "inProgress")
+                && forwarded.method == "turn/start"
+            {
+                self.agent_notification(side,&json!({"method":"turn/started","params":{"threadId":forwarded.params["threadId"],"turn":message["result"]["turn"]}}));
+            }
+            self.decorate_agent_pages(&forwarded.method, &forwarded.params, &mut message);
+        }
         if side == Side::Claude
             && let (Some(forwarded), Err(error)) = (&forwarded, &result)
         {
@@ -1151,6 +1283,18 @@ impl Router {
             && let Ok(result) = &result
             && let Some(thread) = result["thread"]["id"].as_str()
         {
+            if let Some(scope) = &forwarded.delegation_scope {
+                self.agents.scopes.insert(scope.clone(), thread.to_owned());
+                self.agents.attached.insert(thread.to_owned());
+            }
+            if side == Side::Claude && forwarded.method == "thread/resume" {
+                self.internal_request(
+                    Side::Claude,
+                    "claudex/delegation/attach",
+                    json!({"threadId":thread}),
+                    Continuation::Ignore,
+                );
+            }
             self.threads.insert(thread.to_owned(), side);
             if side == Side::Claude
                 && matches!(forwarded.method.as_str(), "thread/start" | "thread/resume")
@@ -1172,6 +1316,7 @@ impl Router {
                 fresh.metadata = result["thread"].clone();
             }
         }
+        self.decorate_agent_message(&mut message);
         self.send_client(message);
     }
 
@@ -1268,6 +1413,7 @@ impl Router {
                 self.unblock(Block::DefaultModel);
             }
             Continuation::Merge { merge, side } => self.merge_part(merge, side, result),
+            Continuation::Delegation { side, step } => self.agent_continue(side, step, result),
         }
     }
 
@@ -1277,6 +1423,7 @@ impl Router {
             return;
         }
         note!("lost the Claude facade connection");
+        self.agent_backend_failed(Side::Claude);
         self.claude_initialized = false;
         self.claude_loaded.clear();
         let failed: Vec<(Side, String)> = self
@@ -1302,6 +1449,9 @@ impl Router {
                 | Some(Continuation::ClaudeModels)
                 | Some(Continuation::Resume { .. })
                 | Some(Continuation::Adopt { .. }) => self.internal.remove(&id).unwrap(),
+                Some(Continuation::Delegation {
+                    side: Side::Claude, ..
+                }) => self.internal.remove(&id).unwrap(),
                 _ => continue,
             };
             self.continue_with(continuation, Err(failure.clone()));

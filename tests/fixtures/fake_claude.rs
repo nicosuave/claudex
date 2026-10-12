@@ -1,6 +1,34 @@
 //! Deterministic CLI stand-in. No credentials, network, or Claude calls.
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
+
+fn substitute_agent(value: &mut Value, agent: &str) {
+    match value {
+        Value::String(text) if text == "$agent" => *text = agent.into(),
+        Value::Array(values) => {
+            for value in values {
+                substitute_agent(value, agent);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                substitute_agent(value, agent);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn delegation_action(action: &Value, agent: &str) {
+    let mut arguments = action["arguments"].clone();
+    substitute_agent(&mut arguments, agent);
+    emit(
+        json!({"type":"control_request","request_id":"delegation_call","request":{
+        "subtype":"mcp_message","server_name":"codex_desktop","message":{"jsonrpc":"2.0","id":99,
+            "method":"tools/call","params":{"name":format!("claudex_agents__{}",action["tool"].as_str().unwrap()),"arguments":arguments}}}}),
+    );
+}
 
 fn emit(value: Value) {
     let mut out = io::stdout().lock();
@@ -56,6 +84,9 @@ fn main() {
     let mut mcp_polls = 0;
     let mut prompted_while_connecting = false;
     let mut steering_inputs: Option<Vec<String>> = None;
+    let mut delegation_actions: VecDeque<Value> = VecDeque::new();
+    let mut delegation_results = Vec::<Value>::new();
+    let mut delegation_agent = String::new();
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else {
             break;
@@ -201,6 +232,11 @@ fn main() {
                     json!({"type":"user","uuid":value["uuid"],"isReplay":true,"message":value["message"],"session_id":session,"parent_tool_use_id":null}),
                 );
                 match text.as_str() {
+                    text if text.starts_with("delegate-script:") => {
+                        delegation_actions=serde_json::from_str(text.strip_prefix("delegate-script:").unwrap()).unwrap();
+                        delegation_results.clear(); delegation_agent.clear();
+                        let action=delegation_actions.pop_front().unwrap(); delegation_action(&action,&delegation_agent);
+                    }
                     "steer-busy" | "steer-closed-input" => {
                         if text == "steer-closed-input" {
                             unsafe { libc::close(0); }
@@ -345,6 +381,21 @@ fn main() {
                 let response = &value["response"]["response"]["mcp_response"];
                 assert_eq!(response["id"], 73);
                 finish(session, &response.to_string(), false);
+            }
+            Some("control_response") if value["response"]["request_id"] == "delegation_call" => {
+                let result = value["response"]["response"]["mcp_response"]["result"].clone();
+                if let Some(text) = result["content"][0]["text"].as_str()
+                    && let Ok(parsed) = serde_json::from_str::<Value>(text)
+                    && let Some(id) = parsed["agent_id"].as_str()
+                {
+                    delegation_agent = id.into();
+                }
+                delegation_results.push(result);
+                if let Some(action) = delegation_actions.pop_front() {
+                    delegation_action(&action, &delegation_agent);
+                } else {
+                    finish(session, &json!(delegation_results).to_string(), false);
+                }
             }
             Some("control_response") if value["response"]["request_id"] == "permission_fake" => {
                 let allowed = value["response"]["response"]["behavior"] == "allow";

@@ -35,9 +35,13 @@ struct Facade {
 
 impl Facade {
     async fn start(claude: &str) -> Self {
+        Self::start_with_model(claude, "fake-claude").await
+    }
+
+    async fn start_with_model(claude: &str, model: &str) -> Self {
         let state = tempfile::tempdir().unwrap();
         let socket = state.path().join("f.sock");
-        let child = Self::launch(&state, &socket, claude).await;
+        let child = Self::launch_with_model(&state, &socket, claude, model).await;
         Self {
             _child: child,
             socket,
@@ -46,12 +50,21 @@ impl Facade {
     }
 
     async fn launch(state: &tempfile::TempDir, socket: &Path, claude: &str) -> Child {
+        Self::launch_with_model(state, socket, claude, "fake-claude").await
+    }
+
+    async fn launch_with_model(
+        state: &tempfile::TempDir,
+        socket: &Path,
+        claude: &str,
+        model: &str,
+    ) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
         }
         let child = command
-            .args(["app-server", "--claude", claude, "--model", "fake-claude"])
+            .args(["app-server", "--claude", claude, "--model", model])
             .args(["--initialize-timeout-seconds", "3"])
             .arg("--listen")
             .arg(format!("unix://{}", socket.display()))
@@ -80,10 +93,26 @@ struct Desktop {
     output: Lines<BufReader<ChildStdout>>,
     history: Vec<Value>,
     serial: u64,
+    deadline: Duration,
 }
 
 impl Desktop {
     async fn connect(socket: &Path, seeded_codex_threads: usize) -> Self {
+        Self::connect_with_codex(
+            socket,
+            seeded_codex_threads,
+            env!("CARGO_BIN_EXE_fake-codex"),
+            DEADLINE,
+        )
+        .await
+    }
+
+    async fn connect_with_codex(
+        socket: &Path,
+        seeded_codex_threads: usize,
+        codex: &str,
+        deadline: Duration,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
@@ -91,7 +120,7 @@ impl Desktop {
         let mut child = command
             .arg("--sock")
             .arg(socket)
-            .args(["route", "--codex", env!("CARGO_BIN_EXE_fake-codex"), "--"])
+            .args(["route", "--codex", codex, "--"])
             .args(DESKTOP_ARGS)
             .env("FAKE_CODEX_THREADS", seeded_codex_threads.to_string())
             .stdin(Stdio::piped())
@@ -106,6 +135,7 @@ impl Desktop {
             _child: child,
             history: vec![],
             serial: 0,
+            deadline,
         };
         let init = desktop
             .ok(
@@ -114,7 +144,12 @@ impl Desktop {
                     "capabilities":{"experimentalApi":true}}),
             )
             .await;
-        assert_eq!(init["userAgent"], "codex_cli_rs/9.9.9-fake");
+        assert!(
+            init["userAgent"]
+                .as_str()
+                .is_some_and(|agent| agent.contains("codex")),
+            "{init}"
+        );
         desktop
             .send(json!({"method":"initialized","params":{}}))
             .await;
@@ -130,7 +165,7 @@ impl Desktop {
     }
 
     async fn next(&mut self) -> Value {
-        let line = tokio::time::timeout(DEADLINE, self.output.next_line())
+        let line = tokio::time::timeout(self.deadline, self.output.next_line())
             .await
             .expect("router output")
             .unwrap()
@@ -202,6 +237,517 @@ fn ids(page: &Value) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+fn script(actions: Value) -> String {
+    format!("delegate-script:{actions}")
+}
+
+fn reports(completed: &Value) -> Vec<Value> {
+    let text = completed["params"]["turn"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "agentMessage")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+fn result(report: &Value) -> Value {
+    assert_eq!(report["isError"], false, "{report}");
+    serde_json::from_str(report["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn inherited_mcp_endpoint_cannot_use_another_native_callers_permissions() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"gpt-fake","approvalPolicy":"never"}))
+        .await;
+    let actions = json!([
+        {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"task"},"meta":{"threadId":"native-child"}},
+        {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"task"},"meta":{}},
+        {"tool":"list_agents","arguments":{}}
+    ]);
+    desktop.turn(&parent, "gpt-fake", &script(actions)).await;
+    let completed = desktop.completed(&parent).await;
+    let reports = reports(&completed);
+    for report in &reports[..2] {
+        assert_eq!(report["isError"], true);
+        assert!(
+            report["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("does not match")
+        );
+    }
+    assert!(result(&reports[2])["agents"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn refused_followup_preserves_queued_messages_for_the_next_native_turn() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"opus","approvalPolicy":"never"}))
+        .await;
+    let actions = json!([
+        {"tool":"spawn_agent","arguments":{"harness":"codex","model":"gpt-fake","message":"task"}},
+        {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}},
+        {"tool":"send_message","arguments":{"agent_id":"$agent","message":"queued context"}},
+        {"tool":"followup_task","arguments":{"agent_id":"$agent","message":"fail-turn-start"}},
+        {"tool":"followup_task","arguments":{"agent_id":"$agent","message":"retry task"}},
+        {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}}
+    ]);
+    desktop.turn(&parent, "opus", &script(actions)).await;
+    let completed = desktop.completed(&parent).await;
+    let reports = reports(&completed);
+    assert_eq!(reports[3]["isError"], true);
+    assert_eq!(
+        result(&reports[5])["report"],
+        "Codex: queued context\n\nretry task"
+    );
+}
+
+#[tokio::test]
+async fn native_mcp_delegation_works_in_both_directions_with_linked_history() {
+    for (parent_model, harness, child_model, expected) in [
+        ("gpt-fake", "claude", "opus", "Echo: delegated task"),
+        ("opus", "codex", "gpt-fake", "Codex: delegated task"),
+    ] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent=desktop.thread(json!({"model":parent_model,"cwd":facade._state.path(),
+            "sandbox":"workspace-write","approvalPolicy":"never","approvalsReviewer":"auto_review"})).await;
+        let actions = json!([
+            {"tool":"spawn_agent","arguments":{"harness":harness,"model":child_model,"message":"delegated task","name":"Cross-harness worker"}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}},
+            {"tool":"list_agents","arguments":{}}
+        ]);
+        assert!(
+            desktop
+                .turn(&parent, parent_model, &script(actions))
+                .await
+                .get("error")
+                .is_none()
+        );
+        let completed = desktop.completed(&parent).await;
+        let reports = reports(&completed);
+        let child = result(&reports[0])["agent_id"].as_str().unwrap().to_owned();
+        let waited = result(&reports[1]);
+        assert_eq!(waited["status"], "completed");
+        assert_eq!(waited["report"], expected);
+        assert_eq!(result(&reports[2])["agents"].as_array().unwrap().len(), 1);
+        let list = desktop
+            .ok("thread/list", json!({"parentThreadId":parent}))
+            .await;
+        assert_eq!(ids(&list).as_slice(), std::slice::from_ref(&child));
+        assert_eq!(
+            list["data"][0]["source"]["subAgent"]["thread_spawn"]["parent_thread_id"],
+            parent
+        );
+        assert_eq!(list["data"][0]["agentNickname"], "Cross-harness worker");
+        let normal = desktop.ok("thread/list", json!({})).await;
+        assert!(
+            !ids(&normal).contains(&child),
+            "Delegates appeared as unrelated top-level chats"
+        );
+        let read = desktop
+            .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+            .await;
+        assert_eq!(read["thread"]["parentThreadId"], parent);
+        assert_eq!(read["thread"]["canAcceptDirectInput"], true);
+        let permissions = desktop.ok("thread/resume", json!({"threadId":child})).await;
+        assert_eq!(permissions["approvalPolicy"], "never");
+        assert_eq!(permissions["approvalsReviewer"], "auto_review");
+        assert_eq!(permissions["sandbox"]["type"], "workspaceWrite");
+        assert_eq!(permissions["sandbox"]["networkAccess"], false);
+        let history = desktop
+            .ok(
+                "thread/read",
+                json!({"threadId":parent,"includeTurns":true}),
+            )
+            .await;
+        let spawn = history["thread"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .find(|item| item["type"] == "collabAgentToolCall")
+            .unwrap();
+        assert_eq!(spawn["receiverThreadIds"], json!([child]));
+        assert_eq!(spawn["tool"], "spawnAgent");
+    }
+}
+
+#[tokio::test]
+async fn delegation_wait_steer_queue_and_followup_preserve_one_native_child() {
+    for (parent_model, harness, child_model) in [
+        ("gpt-fake", "claude", "opus"),
+        ("opus", "codex", "gpt-fake"),
+    ] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent = desktop
+            .thread(json!({"model":parent_model,"approvalPolicy":"never"}))
+            .await;
+        let actions = json!([
+            {"tool":"spawn_agent","arguments":{"harness":harness,"model":child_model,"message":"hang"}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":0}},
+            {"tool":"send_message","arguments":{"agent_id":"$agent","message":"finish task"}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}},
+            {"tool":"send_message","arguments":{"agent_id":"$agent","message":"queued context"}},
+            {"tool":"followup_task","arguments":{"agent_id":"$agent","message":"follow-up task"}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}},
+            {"tool":"list_agents","arguments":{}}
+        ]);
+        desktop.turn(&parent, parent_model, &script(actions)).await;
+        let completed = desktop.completed(&parent).await;
+        let reports = reports(&completed);
+        let child = result(&reports[0])["agent_id"].clone();
+        assert_eq!(result(&reports[1])["status"], "running");
+        assert!(
+            result(&reports[3])["report"]
+                .as_str()
+                .unwrap()
+                .contains("finish task")
+        );
+        assert_eq!(result(&reports[4])["queued"], true);
+        assert_eq!(result(&reports[5])["agent_id"], child);
+        assert!(
+            result(&reports[6])["report"]
+                .as_str()
+                .unwrap()
+                .contains("queued context\n\nfollow-up task")
+        );
+        assert_eq!(result(&reports[7])["agents"].as_array().unwrap().len(), 1);
+        let read = desktop
+            .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+            .await;
+        assert_eq!(read["thread"]["turns"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn delegated_native_approvals_round_trip_on_the_child_thread() {
+    for (parent_model, harness, child_model) in [
+        ("gpt-fake", "claude", "opus"),
+        ("opus", "codex", "gpt-fake"),
+    ] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent=desktop.thread(json!({"model":parent_model,"approvalPolicy":"on-request","approvalsReviewer":"user"})).await;
+        let message = if harness == "claude" {
+            "tool"
+        } else {
+            "permission"
+        };
+        desktop.turn(&parent,parent_model,&script(json!([
+            {"tool":"spawn_agent","arguments":{"harness":harness,"model":child_model,"message":message}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}}
+        ]))).await;
+        let approval = desktop
+            .until(|message| message["method"] == "item/commandExecution/requestApproval")
+            .await;
+        let child = approval["params"]["threadId"].as_str().unwrap().to_owned();
+        assert_ne!(child, parent);
+        desktop
+            .send(json!({"id":approval["id"],"result":{"decision":"decline"}}))
+            .await;
+        let completed = desktop.completed(&parent).await;
+        let reports = reports(&completed);
+        assert_eq!(result(&reports[0])["agent_id"], child);
+        assert!(
+            result(&reports[1])["report"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("denied")
+        );
+    }
+}
+
+/// Opt-in model-backed verification. Uses normal native authentication, creates
+/// only test threads, archives them afterwards, and never installs or restarts
+/// the user's service.
+#[tokio::test]
+#[ignore = "requires CLAUDEX_NATIVE_CODEX, CLAUDEX_NATIVE_CLAUDE and native authentication; makes model calls"]
+async fn native_shared_delegation() {
+    let codex = std::env::var("CLAUDEX_NATIVE_CODEX").expect("genuine Codex executable");
+    let claude = std::env::var("CLAUDEX_NATIVE_CLAUDE").expect("native Claude executable");
+    let gpt = std::env::var("CLAUDEX_NATIVE_GPT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
+    let facade = Facade::start_with_model(&claude, "opus").await;
+    let mut desktop =
+        Desktop::connect_with_codex(&facade.socket, 0, &codex, Duration::from_secs(60)).await;
+    for (parent_model, harness, child_model) in [
+        (gpt.as_str(), "claude", "opus"),
+        ("opus", "codex", gpt.as_str()),
+    ] {
+        let parent = desktop
+            .thread(json!({"model":parent_model,"cwd":facade._state.path(),
+            "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":"user"}))
+            .await;
+        let prompt = format!(
+            "Verify cross-harness delegation. Use the claudex_agents MCP tools, not native subagent tools or shell subprocesses. Call spawn_agent with harness={harness}, model={child_model}, name=Native verification, and message=Reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Then call wait_agent on the returned agent_id until it finishes. Finally reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
+        );
+        let reply = desktop.turn(&parent, parent_model, &prompt).await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let completed = loop {
+            let message = desktop
+                .until(|message| {
+                    message["method"] == "turn/completed" && message["params"]["threadId"] == parent
+                        || message.get("method").is_some() && message.get("id").is_some()
+                })
+                .await;
+            if message["method"] == "turn/completed" {
+                break message;
+            }
+            if message["method"] == "mcpServer/elicitation/request"
+                && message["params"]["serverName"] == "claudex_agents"
+                && message["params"]["_meta"]["codex_approval_kind"] == "mcp_tool_call"
+            {
+                let arguments = &message["params"]["_meta"]["tool_params"];
+                if arguments.get("harness").is_some() {
+                    assert_eq!(arguments["harness"], harness);
+                    assert_eq!(arguments["model"], child_model);
+                }
+                desktop
+                    .send(json!({"id":message["id"],"result":{"action":"accept","content":{}}}))
+                    .await;
+                continue;
+            }
+            panic!("Unexpected approval outside the native delegation probe: {message}");
+        };
+        assert_eq!(
+            completed["params"]["turn"]["status"], "completed",
+            "{completed}"
+        );
+        let spawn = completed["params"]["turn"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "collabAgentToolCall" && item["tool"] == "spawnAgent")
+            .unwrap_or_else(||panic!("Native model did not spawn through the shared tool: {completed}; MCP startup: {:?}",desktop.history.iter().filter(|message|message["method"] == "mcpServer/startupStatus/updated").collect::<Vec<_>>()));
+        let child = spawn["receiverThreadIds"][0].as_str().unwrap();
+        let child = desktop
+            .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+            .await;
+        assert_eq!(child["thread"]["parentThreadId"], parent);
+        let report = child["thread"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .filter(|item| item["type"] == "agentMessage")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(report.contains("CROSS_HARNESS_CHILD_OK"), "{report}");
+        eprintln!(
+            "Verified native {parent_model} -> {harness}/{child_model}: child {child_id}",
+            child_id = child["thread"]["id"]
+        );
+        desktop
+            .ok("thread/archive", json!({"threadId":child["thread"]["id"]}))
+            .await;
+        desktop
+            .ok("thread/archive", json!({"threadId":parent}))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn delegated_interruption_and_scope_boundaries_are_enforced() {
+    for (parent_model, harness, child_model) in [
+        ("gpt-fake", "claude", "opus"),
+        ("opus", "codex", "gpt-fake"),
+    ] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent = desktop
+            .thread(json!({"model":parent_model,"approvalPolicy":"never"}))
+            .await;
+        desktop.turn(&parent,parent_model,&script(json!([
+            {"tool":"spawn_agent","arguments":{"harness":harness,"model":child_model,"message":"hang"}}
+        ]))).await;
+        let completed = desktop.completed(&parent).await;
+        let child = result(&reports(&completed)[0])["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let unrelated = desktop.thread(json!({"model":parent_model})).await;
+        desktop
+            .turn(
+                &unrelated,
+                parent_model,
+                &script(json!([
+                    {"tool":"interrupt_agent","arguments":{"agent_id":child}}
+                ])),
+            )
+            .await;
+        let rejected = desktop.completed(&unrelated).await;
+        let denied = reports(&rejected);
+        assert_eq!(denied[0]["isError"], true);
+        assert!(
+            denied[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("outside the caller's task tree")
+        );
+        desktop
+            .turn(
+                &parent,
+                parent_model,
+                &script(json!([
+                    {"tool":"interrupt_agent","arguments":{"agent_id":child}},
+                    {"tool":"wait_agent","arguments":{"agent_id":child,"timeout_ms":10_000}}
+                ])),
+            )
+            .await;
+        let stopped = desktop.completed(&parent).await;
+        assert_eq!(result(&reports(&stopped)[1])["status"], "interrupted");
+    }
+}
+
+#[tokio::test]
+async fn delegated_children_survive_router_reload_and_paginate_without_duplicates() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"gpt-fake","approvalPolicy":"never"}))
+        .await;
+    let actions:Vec<Value>=(0..3).flat_map(|index|[
+        json!({"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"task","name":format!("Worker {index}")}}),
+        json!({"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}})
+    ]).collect();
+    desktop
+        .turn(&parent, "gpt-fake", &script(json!(actions)))
+        .await;
+    let completed = desktop.completed(&parent).await;
+    let reports = reports(&completed);
+    let expected: HashSet<String> = reports
+        .iter()
+        .step_by(2)
+        .map(|report| result(report)["agent_id"].as_str().unwrap().to_owned())
+        .collect();
+    drop(desktop);
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let mut seen = HashSet::new();
+    let mut cursor = Value::Null;
+    for _ in 0..5 {
+        let page = desktop
+            .ok(
+                "thread/list",
+                json!({"parentThreadId":parent,"limit":1,"cursor":cursor}),
+            )
+            .await;
+        assert_eq!(page["data"].as_array().unwrap().len(), 1);
+        for id in ids(&page) {
+            assert!(seen.insert(id), "duplicate child on a later page");
+        }
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert_eq!(seen, expected);
+    let filtered = desktop
+        .ok(
+            "thread/list",
+            json!({"parentThreadId":parent,"sourceKinds":["appServer"]}),
+        )
+        .await;
+    assert!(filtered["data"].as_array().unwrap().is_empty());
+    for child in expected {
+        let read = desktop
+            .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+            .await;
+        assert_eq!(read["thread"]["parentThreadId"], parent);
+    }
+}
+
+#[tokio::test]
+async fn router_disconnect_and_crash_recovery_stop_native_claude_children() {
+    for graceful in [true, false] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent = desktop
+            .thread(json!({"model":"gpt-fake","approvalPolicy":"never"}))
+            .await;
+        desktop.turn(&parent,"gpt-fake",&script(json!([
+            {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"hang"}}
+        ]))).await;
+        let completed = desktop.completed(&parent).await;
+        let child = result(&reports(&completed)[0])["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        if graceful {
+            let Desktop {
+                mut _child, input, ..
+            } = desktop;
+            drop(input);
+            tokio::time::timeout(DEADLINE, _child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            desktop._child.kill().await.unwrap();
+            drop(desktop);
+        }
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        if !graceful {
+            desktop.completed(&child).await;
+        }
+        let read = desktop
+            .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+            .await;
+        assert_eq!(
+            read["thread"]["turns"].as_array().unwrap().last().unwrap()["status"],
+            "interrupted"
+        );
+        assert_eq!(read["thread"]["parentThreadId"], parent);
+    }
+}
+
+#[tokio::test]
+async fn nested_delegation_keeps_one_tree_across_both_harnesses() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"gpt-fake","approvalPolicy":"never"}))
+        .await;
+    let nested = script(json!([
+        {"tool":"spawn_agent","arguments":{"harness":"codex","model":"gpt-fake","message":"nested task"}},
+        {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}}
+    ]));
+    desktop.turn(&parent,"gpt-fake",&script(json!([
+        {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":nested}},
+        {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}},
+        {"tool":"list_agents","arguments":{}}
+    ]))).await;
+    let completed = desktop.completed(&parent).await;
+    let reports = reports(&completed);
+    let outer = result(&reports[0])["agent_id"].clone();
+    assert_eq!(result(&reports[2])["agents"].as_array().unwrap().len(), 2);
+    let all = desktop
+        .ok("thread/list", json!({"ancestorThreadId":parent}))
+        .await;
+    assert_eq!(all["data"].as_array().unwrap().len(), 2);
+    assert!(
+        all["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["parentThreadId"] == outer)
+    );
+    let direct = desktop
+        .ok("thread/list", json!({"parentThreadId":parent}))
+        .await;
+    assert_eq!(direct["data"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

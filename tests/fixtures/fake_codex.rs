@@ -3,7 +3,182 @@
 //! persisted threads with descending timestamps. `fake/state` reports what the
 //! router asked of this backend.
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::{
+    collections::HashMap,
+    io::{self, BufRead, BufReader, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+struct Mcp {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    serial: u64,
+}
+
+impl Mcp {
+    fn start(config: &Value) -> Self {
+        let mut child = Command::new(config["command"].as_str().unwrap())
+            .args(
+                config["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap()),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut mcp = Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            serial: 0,
+        };
+        mcp.request("initialize",json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake-codex","version":"1"}}));
+        writeln!(
+            mcp.input,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        let tools = mcp.request("tools/list", json!({}));
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "spawn_agent")
+        );
+        mcp
+    }
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.serial += 1;
+        writeln!(
+            self.input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":self.serial,"method":method,"params":params})
+        )
+        .unwrap();
+        self.input.flush().unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.output.read_line(&mut line).unwrap() > 0,
+                "MCP closed before replying"
+            );
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            if reply["id"] == self.serial {
+                return reply;
+            }
+        }
+    }
+}
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+type Histories = Arc<Mutex<HashMap<String, Vec<Value>>>>;
+
+fn complete(thread: &str, turn: &str, text: &str, status: &str, histories: &Histories) {
+    let turn = json!({"id":turn,"status":status,"items":[{"type":"agentMessage","id":uuid::Uuid::new_v4().to_string(),"text":text,"phase":"final_answer"}],"error":null});
+    let mut history = histories.lock().unwrap();
+    let turns = history.entry(thread.into()).or_default();
+    if let Some(entry) = turns.iter_mut().find(|entry| entry["id"] == turn["id"]) {
+        *entry = turn.clone();
+    } else {
+        turns.push(turn.clone());
+    }
+    drop(history);
+    emit(json!({"method":"turn/completed","params":{"threadId":thread,"turn":turn}}));
+}
+
+fn substitute(value: &mut Value, agent: &str) {
+    match value {
+        Value::String(text) if text == "$agent" => *text = agent.into(),
+        Value::Array(values) => {
+            for value in values {
+                substitute(value, agent);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                substitute(value, agent);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn script(
+    thread: String,
+    turn: String,
+    actions: Vec<Value>,
+    mcp: Arc<Mutex<Mcp>>,
+    histories: Histories,
+    cancel: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut agent = String::new();
+        let mut results = vec![];
+        for mut action in actions {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            substitute(&mut action, &agent);
+            let reply = mcp.lock().unwrap().request(
+                "tools/call",
+                json!({"name":action["tool"],"arguments":action["arguments"],
+                    "_meta":action.get("meta").cloned().unwrap_or_else(||json!({"threadId":thread}))}),
+            );
+            let result = reply["result"].clone();
+            if let Some(text) = result["content"][0]["text"].as_str()
+                && let Ok(value) = serde_json::from_str::<Value>(text)
+                && let Some(id) = value["agent_id"].as_str()
+            {
+                agent = id.into();
+            }
+            results.push(result);
+        }
+        if !cancel.load(Ordering::Acquire) {
+            complete(
+                &thread,
+                &turn,
+                &json!(results).to_string(),
+                "completed",
+                &histories,
+            );
+        }
+    });
+}
+
+fn settings(params: &Value) -> Value {
+    let sandbox = match params["sandbox"].as_str().unwrap_or("danger-full-access") {
+        "workspace-write" => {
+            let config = &params["config"]["sandbox_workspace_write"];
+            json!({"type":"workspaceWrite","writableRoots":config["writable_roots"].as_array().cloned().unwrap_or_default(),
+                "networkAccess":config["network_access"].as_bool().unwrap_or(false),"excludeSlashTmp":config["exclude_slash_tmp"].as_bool().unwrap_or(false),
+                "excludeTmpdirEnvVar":config["exclude_tmpdir_env_var"].as_bool().unwrap_or(false)})
+        }
+        "read-only" => json!({"type":"readOnly","networkAccess":false}),
+        _ => json!({"type":"dangerFullAccess"}),
+    };
+    json!({"cwd":params["cwd"].as_str().map(str::to_owned).unwrap_or_else(||std::env::current_dir().unwrap().to_string_lossy().into()),
+        "approvalPolicy":params["approvalPolicy"].as_str().unwrap_or("on-request"),
+        "approvalsReviewer":params["approvalsReviewer"].as_str().unwrap_or("user"),
+        "sandbox":sandbox,"disabledPluginIds":params["disabledPluginIds"].as_array().cloned().unwrap_or_default(),
+        "runtimeWorkspaceRoots":params["runtimeWorkspaceRoots"].as_array().cloned().unwrap_or_default(),
+        "reasoningEffort":params["config"]["model_reasoning_effort"],"activePermissionProfile":null})
+}
 
 fn emit(value: Value) {
     let mut out = io::stdout().lock();
@@ -39,9 +214,29 @@ fn main() {
     let mut requests: Vec<String> = vec![];
     let mut serial = 0u64;
     let mut default_model = "gpt-fake".to_owned();
+    let mut effective = HashMap::<String, Value>::new();
+    let mut mcps = HashMap::<String, Arc<Mutex<Mcp>>>::new();
+    let histories: Histories = Arc::new(Mutex::new(HashMap::new()));
+    let mut active = HashMap::<String, (String, Arc<AtomicBool>)>::new();
+    let mut permissions = HashMap::<String, (String, String)>::new();
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let Some(method) = message["method"].as_str() else {
+            if let Some((thread, turn)) = permissions.remove(message["id"].as_str().unwrap_or("")) {
+                let allowed = message["result"]["decision"] == "accept"
+                    || message["result"]["decision"] == "acceptForSession";
+                complete(
+                    &thread,
+                    &turn,
+                    if allowed {
+                        "Native Codex approved"
+                    } else {
+                        "Native Codex denied"
+                    },
+                    "completed",
+                    &histories,
+                );
+            }
             continue;
         };
         let Some(id) = message.get("id").cloned() else {
@@ -75,36 +270,168 @@ fn main() {
                 let model = p["model"].as_str().unwrap_or("gpt-fake");
                 let created = 2_000_000_000 + serial as i64;
                 let started = thread(&id, created, model, 0);
+                effective.insert(id.clone(), settings(p));
+                if p["config"]["mcp_servers.claudex_agents"].is_object() {
+                    mcps.insert(
+                        id.clone(),
+                        Arc::new(Mutex::new(Mcp::start(
+                            &p["config"]["mcp_servers.claudex_agents"],
+                        ))),
+                    );
+                }
                 threads.push(started.clone());
                 emit(json!({"method": "thread/started", "params": {"thread": started}}));
-                Ok(json!({"thread": started, "model": model}))
+                let mut result = effective[&id].clone();
+                result["thread"] = started;
+                result["model"] = json!(model);
+                Ok(result)
             }
             "turn/start" => {
+                if p["input"].as_array().into_iter().flatten().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("fail-turn-start"))
+                }) {
+                    emit(
+                        json!({"id":id,"error":{"code":-32603,"message":"fixture refused turn start"}}),
+                    );
+                    continue;
+                }
                 let thread_id = p["threadId"].as_str().unwrap_or("");
                 match threads.iter_mut().find(|t| t["id"] == thread_id) {
                     Some(thread) => {
                         thread["fakeTurns"] = json!(thread["fakeTurns"].as_u64().unwrap() + 1);
-                        thread["model"] = p["model"].clone();
+                        if let Some(model) = p["model"].as_str() {
+                            thread["model"] = json!(model);
+                        }
                         serial += 1;
                         let turn = json!({"id": format!("codex-turn-{serial}"), "items": [], "status": "inProgress"});
+                        let turn_id = turn["id"].as_str().unwrap().to_owned();
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        active.insert(thread_id.into(), (turn_id.clone(), cancel.clone()));
+                        histories
+                            .lock()
+                            .unwrap()
+                            .entry(thread_id.into())
+                            .or_default()
+                            .push(turn.clone());
                         emit(json!({"id": id, "result": {"turn": turn}}));
                         emit(
                             json!({"method": "turn/started", "params": {"threadId": thread_id, "turn": turn}}),
                         );
-                        emit(
-                            json!({"method": "turn/completed", "params": {"threadId": thread_id,
-                            "turn": {"id": turn["id"], "items": [], "status": "completed"}}}),
-                        );
+                        let text = p["input"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Some(script_text) = text.strip_prefix("delegate-script:") {
+                            let actions: Vec<Value> = serde_json::from_str(script_text).unwrap();
+                            script(
+                                thread_id.into(),
+                                turn_id,
+                                actions,
+                                mcps[thread_id].clone(),
+                                histories.clone(),
+                                cancel,
+                            );
+                        } else if text == "hang" {
+                            // Await native steering or interruption from the router.
+                        } else if text == "permission"
+                            && effective[thread_id]["approvalPolicy"] != "never"
+                        {
+                            let request = format!("native-codex-approval-{serial}");
+                            permissions
+                                .insert(request.clone(), (thread_id.into(), turn_id.clone()));
+                            emit(
+                                json!({"id":request,"method":"item/commandExecution/requestApproval","params":{
+                                "threadId":thread_id,"turnId":turn_id,"itemId":"native-command","command":"printf fixture","cwd":effective[thread_id]["cwd"]}}),
+                            );
+                        } else {
+                            let report = if text == "permission" {
+                                "Native Codex denied without prompting".to_owned()
+                            } else {
+                                format!("Codex: {text}")
+                            };
+                            complete(thread_id, &turn_id, &report, "completed", &histories);
+                        }
                         continue;
                     }
                     None => Err("thread not found"),
                 }
             }
-            "thread/read" => threads
-                .iter()
-                .find(|t| t["id"] == p["threadId"])
-                .map(|t| json!({"thread": t}))
-                .ok_or("thread not found"),
+            "thread/read" | "thread/resume" => {
+                let thread_id = p["threadId"].as_str().unwrap();
+                if method == "thread/resume"
+                    && p["config"]["mcp_servers.claudex_agents"].is_object()
+                {
+                    mcps.insert(
+                        thread_id.into(),
+                        Arc::new(Mutex::new(Mcp::start(
+                            &p["config"]["mcp_servers.claudex_agents"],
+                        ))),
+                    );
+                }
+                threads
+                    .iter()
+                    .find(|t| t["id"] == thread_id)
+                    .map(|t| {
+                        let mut thread = t.clone();
+                        thread["turns"] = json!(
+                            histories
+                                .lock()
+                                .unwrap()
+                                .get(thread_id)
+                                .cloned()
+                                .unwrap_or_default()
+                        );
+                        let mut result = effective
+                            .get(thread_id)
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        result["thread"] = thread;
+                        result["model"] = t["model"].clone();
+                        result
+                    })
+                    .ok_or("thread not found")
+            }
+            "turn/interrupt" => match active.get(p["threadId"].as_str().unwrap()) {
+                Some((turn, cancel)) if *turn == p["turnId"] => {
+                    cancel.store(true, Ordering::Release);
+                    complete(
+                        p["threadId"].as_str().unwrap(),
+                        turn,
+                        "Native Codex interrupted",
+                        "interrupted",
+                        &histories,
+                    );
+                    Ok(json!({}))
+                }
+                _ => Err("no matching native turn"),
+            },
+            "turn/steer" => {
+                let thread_id = p["threadId"].as_str().unwrap();
+                match active.get(thread_id) {
+                    Some((turn, _)) if *turn == p["expectedTurnId"] => {
+                        complete(
+                            thread_id,
+                            turn,
+                            &format!("Codex steered: {}", p["input"][0]["text"].as_str().unwrap()),
+                            "completed",
+                            &histories,
+                        );
+                        Ok(json!({"turnId":turn}))
+                    }
+                    _ => Err("no matching native turn"),
+                }
+            }
+            "thread/name/set" => {
+                if let Some(thread) = threads.iter_mut().find(|t| t["id"] == p["threadId"]) {
+                    thread["name"] = p["name"].clone();
+                }
+                Ok(json!({}))
+            }
             "thread/metadata/update" => match threads.iter_mut().find(|t| t["id"] == p["threadId"])
             {
                 Some(thread) => {
@@ -142,9 +469,13 @@ fn main() {
                 let mut listed: Vec<Value> = threads
                     .iter()
                     .filter(|t| {
-                        p["searchTerm"]
-                            .as_str()
-                            .is_none_or(|term| t["id"].as_str().unwrap().contains(term))
+                        (p["parentThreadId"].is_null()
+                            || t["parentThreadId"] == p["parentThreadId"])
+                            && (p["ancestorThreadId"].is_null()
+                                || t["parentThreadId"] == p["ancestorThreadId"])
+                            && p["searchTerm"]
+                                .as_str()
+                                .is_none_or(|term| t["id"].as_str().unwrap().contains(term))
                     })
                     .cloned()
                     .collect();

@@ -1,5 +1,7 @@
 # Local desktop router contract
 
+For cross-harness child agents, see [shared delegation](shared-delegation.md).
+
 The local router must implement the desktop's task-creation transaction, not only
 `thread/start` followed immediately by `turn/start`. This reference was checked
 against the installed desktop build 20156, bundled Codex CLI

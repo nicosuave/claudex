@@ -656,6 +656,8 @@ impl Server {
             Err(RpcError::new(-32600, "Already initialized"))
         } else if method == ADOPT_THREAD_METHOD {
             self.adopt_thread(client, &id, &message["params"]).await
+        } else if method == "claudex/delegation/attach" {
+            self.attach_delegation_tools(&message["params"])
         } else {
             match Schemas::get().validate(method, &message) {
                 Ok(()) => {
@@ -670,6 +672,47 @@ impl Server {
             Ok(Some(result)) => self.send(client, response(id, result)),
             Ok(None) => {}
             Err(error) => self.send(client, error.response(id)),
+        }
+    }
+
+    /// The local router merges its delegation catalog into an older saved chat.
+    /// No caller-supplied descriptors or permission changes are accepted here.
+    fn attach_delegation_tools(&mut self, params: &Value) -> RpcResult<Option<Value>> {
+        supported_fields(params, &["threadId"])?;
+        let id = required_str(params, "threadId")?;
+        #[cfg(unix)]
+        {
+            let mut record = self.record(id)?.clone();
+            let expected =
+                crate::dynamic_tools::parse(&json!([crate::delegation::dynamic_spec()]))?;
+            let current: Vec<_> = record
+                .settings
+                .dynamic_tools
+                .iter()
+                .filter(|tool| tool.namespace.as_deref() == Some(crate::delegation::NAMESPACE))
+                .collect();
+            if !current.is_empty() {
+                if serde_json::to_value(current).map_err(RpcError::internal)? != json!(expected) {
+                    return Err(RpcError::invalid(
+                        "The claudex_agents namespace is reserved by the router",
+                    ));
+                }
+                return Ok(Some(json!({})));
+            }
+            if self.active.contains_key(id) {
+                return Err(RpcError::invalid(
+                    "Delegation tools can only be attached between turns",
+                ));
+            }
+            record.settings.dynamic_tools.extend(expected);
+            self.store.save(&record).map_err(RpcError::internal)?;
+            self.records.insert(id.to_owned(), record);
+            Ok(Some(json!({})))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = id;
+            Err(RpcError::unsupported("claudex/delegation/attach"))
         }
     }
 
