@@ -48,6 +48,13 @@ struct Args {
     initialize_timeout_seconds: u64,
     #[arg(long, default_value_t = 300, global = true)]
     approval_timeout_seconds: u64,
+    /// Keep a thread's Claude process this long after a turn so the next turn
+    /// reuses it and its prompt cache; 0 starts a new process for every turn.
+    #[arg(long, default_value_t = 3600, global = true)]
+    idle_session_timeout_seconds: u64,
+    /// Idle Claude processes kept across all threads; the oldest closes first.
+    #[arg(long, default_value_t = 8, global = true)]
+    max_idle_sessions: usize,
     /// Replace PATH with the one the user's interactive login shell configures,
     /// so a LaunchAgent-started server matches the user's terminal.
     #[arg(long, global = true)]
@@ -229,6 +236,8 @@ async fn run(args: Args) -> Result<()> {
         default_cwd: std::env::current_dir()?,
         default_model: args.model,
         approval_timeout: Duration::from_secs(args.approval_timeout_seconds),
+        idle_session_timeout: Duration::from_secs(args.idle_session_timeout_seconds),
+        max_idle_sessions: args.max_idle_sessions,
     };
     let store = Store::open(state)?;
     let (events, receiver) = mpsc::channel(512);
