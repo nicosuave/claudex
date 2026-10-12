@@ -52,6 +52,38 @@ expanded path). Port is **22**; the display name can be **Claude**. Select this
 connection for your project/chat and choose a Claude model, such as `opus`.
 Do not substitute plain `localhost`, which can select your ordinary SSH identity.
 
+### One local window without SSH
+
+The desktop can instead run Claude and Codex side by side on its local
+connection: Claude models appear in the same model picker and Claude chats in
+the same sidebar. The desktop app is not modified. It honors `CODEX_CLI_PATH`
+for its local Codex CLI, and the installer writes a stand-in at
+`~/Library/Application Support/claude-codex/router/codex`. Use
+`claudex install --no-ssh` if you don't want the SSH connection; Remote Login is
+then not required. Quit the desktop app and relaunch it with the stand-in:
+
+```sh
+open -a ChatGPT --env CODEX_CLI_PATH="$HOME/Library/Application Support/claude-codex/router/codex"
+```
+
+The variable applies only to that launch; starting the app normally returns to
+plain Codex. The stand-in runs the Codex CLI bundled with the desktop app,
+unchanged, for every command except the desktop's own app-server launch. That
+launch gets a router (`claudex route`) which:
+
+- sends everything to genuine Codex, with your normal `~/.codex` home and login,
+  except Claude models and Claude chats, which go to the Claude service;
+- appends Claude models to Codex's model list (Codex keeps the default);
+- merges chat lists from both, ordered by the requested sort key;
+- moves a new, still-empty chat to Claude when its first message uses a Claude
+  model (the desktop starts chats before you pick a model).
+
+A chat stays on the backend it started with. Choosing a GPT model in a Claude
+chat, or a Claude model in a Codex chat that already has messages, is refused
+with a message asking you to start a new chat. If the Claude service is not
+running, the window behaves as plain Codex. Set `CLAUDE_CODEX_ROUTER_CODEX` to
+use a different genuine Codex executable.
+
 Use **Workspace write** and **Approve for me** for native Claude auto review.
 Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit
 sandbox escapes use the selected automatic or manual reviewer. MCP integrations

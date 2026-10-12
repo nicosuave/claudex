@@ -47,6 +47,11 @@ required-features = ["test-backend"]
 test-backend = []
 
 [[bin]]
+name = "fake-codex"
+path = "tests/fixtures/fake_codex.rs"
+required-features = ["test-backend"]
+
+[[bin]]
 name = "approval-claude"
 path = "tests/fixtures/approval_claude.rs"
 required-features = ["test-backend"]

@@ -2269,3 +2269,75 @@ async fn background_subagent_keeps_its_child_turn_open_past_the_launch_ack() {
     assert!(parent_waiting < child_done);
     client.close().await;
 }
+
+#[tokio::test]
+async fn idle_claude_process_serves_later_turns_until_its_launch_changes() {
+    // Returns the fake backend's process ID and how many prompts that process has seen.
+    async fn probe(client: &mut Client, thread: &str, options: Value) -> (i32, u32) {
+        let mut params = json!({"threadId":thread,
+            "input":[{"type":"text","text":"process-info","text_elements":[]}]});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let turn = client.ok("turn/start", params).await["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let completed = client.completed(&turn).await;
+        assert_eq!(completed["status"], "completed");
+        let text = agent_texts(&completed).pop().unwrap();
+        let words: Vec<&str> = text.split(' ').collect();
+        (words[1].parse().unwrap(), words[3].parse().unwrap())
+    }
+    fn running(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let (first, prompts) = probe(&mut client, &thread, json!({})).await;
+    assert_eq!(prompts, 1);
+    // An unchanged launch reuses the process, keeping Claude's request prefix cached.
+    assert_eq!(probe(&mut client, &thread, json!({})).await, (first, 2));
+    // A changed launch closes the idle process and resumes the session in a new one.
+    let (second, prompts) = probe(&mut client, &thread, json!({"model":"opus"})).await;
+    assert_ne!(second, first);
+    assert_eq!(prompts, 1);
+    assert!(!running(first));
+    assert!(running(second));
+    client
+        .ok("thread/archive", json!({"threadId":thread}))
+        .await;
+    assert!(!running(second));
+    client.close().await;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--idle-session-timeout-seconds", "0"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let (first, _) = probe(&mut client, &thread, json!({})).await;
+    let (second, prompts) = probe(&mut client, &thread, json!({})).await;
+    assert_ne!(second, first);
+    assert_eq!(prompts, 1);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn first_prompt_waits_for_connecting_mcp_servers() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client =
+        Client::spawn_with_args(state.path(), &["--claude-arg=--fake-mcp-pending"]).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let turn = client.start(&thread, "mcp-info").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(
+        agent_texts(&completed),
+        ["prompted while MCP connecting: false"]
+    );
+    client.close().await;
+}

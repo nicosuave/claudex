@@ -650,6 +650,12 @@ impl AcpBackend {
         Ok(next)
     }
 
+    pub fn is_running(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self.alive.load(Ordering::Acquire)
+            && self.tasks.iter().all(|task| !task.is_finished())
+    }
+
     pub fn initialization(&self) -> &Value {
         &self.initialization
     }

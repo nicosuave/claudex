@@ -33,6 +33,15 @@ pub enum ServiceAction {
     Uninstall,
 }
 
+struct SshSetup {
+    block: String,
+    authorized_line: String,
+    config_path: PathBuf,
+    config: String,
+    authorized_path: PathBuf,
+    authorized: String,
+}
+
 /// Each installation has its own LaunchAgent, state, socket, SSH key and host,
 /// so several agents can be selected separately in Codex.
 pub struct Installation {
@@ -100,7 +109,9 @@ impl Installation {
         format!("{}/{}", self.domain(), self.label)
     }
 
-    pub async fn install(&self, claude: &Path) -> Result<()> {
+    /// `ssh: false` installs only the service and the local desktop router;
+    /// it needs no Remote Login, key, or SSH configuration.
+    pub async fn install(&self, claude: &Path, ssh: bool) -> Result<()> {
         let binary = std::env::current_exe()?.canonicalize()?;
         // An ACP installation runs its agent instead of Claude, and uses Claude,
         // when installed, only to review the agent's permission requests.
@@ -112,6 +123,7 @@ impl Installation {
             None => (Some(resolve_executable(claude)?), None),
         };
         let codex = genuine_codex()?;
+        let desktop_codex = desktop_codex().unwrap_or_else(|| codex.clone());
         let plugin_home = std::env::var_os("CLAUDE_CODEX_PLUGIN_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| self.home.join(".codex"));
@@ -124,14 +136,15 @@ impl Installation {
             check_claude(claude).await?;
         }
         check_codex(&codex).await?;
-        if tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect("127.0.0.1:22"),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_none()
+        if ssh
+            && tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect("127.0.0.1:22"),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_none()
         {
             bail!(
                 "Enable Remote Login for your user in System Settings > General > Sharing, then rerun install. No system settings were changed."
@@ -142,9 +155,95 @@ impl Installation {
             self.require_idle(false)?;
         }
         self.check_owned_files()?;
-        for directory in ["", "bin", "sockets", "codex-home", "state", "logs"] {
+        for directory in [
+            "",
+            "bin",
+            "router",
+            "sockets",
+            "codex-home",
+            "state",
+            "logs",
+        ] {
             private_directory(&self.root.join(directory))?;
         }
+        let ssh_setup = if ssh {
+            Some(self.prepare_ssh().await?)
+        } else {
+            None
+        };
+        // Record ownership before copying the executable so an interrupted
+        // first install can be retried safely. Ownership checks ran above.
+        let metadata = json!({"application":"claude-codex-server","version":env!("CARGO_PKG_VERSION"),
+            "claude":claude,"codex":codex,"desktopCodex":desktop_codex,"ssh":ssh,
+            "acp":self.acp.as_ref().map(|acp| json!({"agent":agent,"args":acp.args,
+                "providerId":acp.provider_id,"providerName":acp.provider_name}))});
+        atomic_write(
+            &self.root.join("installation.json"),
+            &serde_json::to_vec_pretty(&metadata)?,
+            0o600,
+        )?;
+        let installed_binary = self.root.join("bin/claude-codex-server");
+        if binary != installed_binary {
+            atomic_write(&installed_binary, &fs::read(&binary)?, 0o700)?;
+        }
+        let environment = self.environment(claude.as_deref(), &codex, &plugin_home)?;
+        let launcher = self.launcher(&installed_binary, &environment, agent.as_deref())?;
+        atomic_write(&self.root.join("bin/codex"), launcher.as_bytes(), 0o700)?;
+        // The desktop runs this in place of its bundled Codex. It deliberately
+        // keeps the desktop's own environment (CODEX_HOME included) for Codex.
+        let router = format!(
+            "#!/bin/bash\n{GENERATED}\nexec {} --sock {} route --log {} --codex \"${{CLAUDE_CODEX_ROUTER_CODEX:-{}}}\" -- \"$@\"\n",
+            shell_quote(&installed_binary)?,
+            shell_quote(&self.socket())?,
+            shell_quote(&self.root.join("logs/router.log"))?,
+            shell_quote(&desktop_codex)?
+        );
+        atomic_write(&self.router_codex(), router.as_bytes(), 0o700)?;
+        if let Some(setup) = &ssh_setup {
+            let session = format!(
+                "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec /bin/sh -c \"${{SSH_ORIGINAL_COMMAND:?SSH command required}}\"\n"
+            );
+            atomic_write(&self.root.join("ssh-session"), session.as_bytes(), 0o700)?;
+            atomic_write(&self.root.join("ssh-config"), setup.block.as_bytes(), 0o600)?;
+            atomic_write(
+                &self.root.join("authorized-key.txt"),
+                setup.authorized_line.as_bytes(),
+                0o600,
+            )?;
+            write_user_file(&setup.config_path, setup.config.as_bytes())?;
+            write_user_file(&setup.authorized_path, setup.authorized.as_bytes())?;
+        }
+        // A changed definition is unloaded and bootstrapped by service install.
+        // Only an unchanged, already-loaded definition needs an explicit restart
+        // to pick up the new binary and launcher environment.
+        let restart = loaded && read_optional(&self.plist)? == self.render_plist()?;
+        self.service(ServiceAction::Install, false).await?;
+        if restart {
+            // install is explicitly an upgrade, but only after the idle check.
+            self.service(ServiceAction::Restart, false).await?;
+        }
+        if ssh {
+            self.check_ssh().await?;
+            println!(
+                "Installed. In Codex Settings > Connections, select SSH host {}.\nChoose the identity file: {}\nYour normal Codex connection is unchanged.",
+                self.host,
+                self.root.join("id_ed25519").display()
+            );
+        } else {
+            println!("Installed the Claude service without an SSH connection.");
+        }
+        println!(
+            "To show Claude models beside Codex in one local desktop window, quit the desktop app and launch it with:\n  open -a ChatGPT --env CODEX_CLI_PATH={}",
+            shell_quote(&self.router_codex())?
+        );
+        Ok(())
+    }
+
+    fn router_codex(&self) -> PathBuf {
+        self.root.join("router/codex")
+    }
+
+    async fn prepare_ssh(&self) -> Result<SshSetup> {
         let key = self.root.join("id_ed25519");
         if fs::symlink_metadata(&key).is_err() {
             run(
@@ -212,51 +311,14 @@ impl Installation {
             }
             atomic_write(&known_hosts, &scanned, 0o600)?;
         }
-        // Record ownership before copying the executable so an interrupted
-        // first install can be retried safely. Ownership checks ran above.
-        let metadata = json!({"application":"claude-codex-server","version":env!("CARGO_PKG_VERSION"),
-            "claude":claude,"codex":codex,"acp":self.acp.as_ref().map(|acp| json!({"agent":agent,
-                "args":acp.args,"providerId":acp.provider_id,"providerName":acp.provider_name}))});
-        atomic_write(
-            &self.root.join("installation.json"),
-            &serde_json::to_vec_pretty(&metadata)?,
-            0o600,
-        )?;
-        let installed_binary = self.root.join("bin/claude-codex-server");
-        if binary != installed_binary {
-            atomic_write(&installed_binary, &fs::read(&binary)?, 0o700)?;
-        }
-        let environment = self.environment(claude.as_deref(), &codex, &plugin_home)?;
-        let launcher = self.launcher(&installed_binary, &environment, agent.as_deref())?;
-        let session = format!(
-            "#!/bin/bash\n{GENERATED}\nset -euo pipefail\n{environment}exec /bin/sh -c \"${{SSH_ORIGINAL_COMMAND:?SSH command required}}\"\n"
-        );
-        atomic_write(&self.root.join("bin/codex"), launcher.as_bytes(), 0o700)?;
-        atomic_write(&self.root.join("ssh-session"), session.as_bytes(), 0o700)?;
-        atomic_write(&self.root.join("ssh-config"), ssh_block.as_bytes(), 0o600)?;
-        atomic_write(
-            &self.root.join("authorized-key.txt"),
-            authorized_line.as_bytes(),
-            0o600,
-        )?;
-        write_user_file(&config_path, config.as_bytes())?;
-        write_user_file(&authorized_path, authorized.as_bytes())?;
-        // A changed definition is unloaded and bootstrapped by service install.
-        // Only an unchanged, already-loaded definition needs an explicit restart
-        // to pick up the new binary and launcher environment.
-        let restart = loaded && read_optional(&self.plist)? == self.render_plist()?;
-        self.service(ServiceAction::Install, false).await?;
-        if restart {
-            // install is explicitly an upgrade, but only after the idle check.
-            self.service(ServiceAction::Restart, false).await?;
-        }
-        self.check_ssh().await?;
-        println!(
-            "Installed. In Codex Settings > Connections, select SSH host {}.\nChoose the identity file: {}\nYour normal Codex connection is unchanged.",
-            self.host,
-            self.root.join("id_ed25519").display()
-        );
-        Ok(())
+        Ok(SshSetup {
+            block: ssh_block,
+            authorized_line,
+            config_path,
+            config,
+            authorized_path,
+            authorized,
+        })
     }
 
     /// The service launcher: the installed binary with this instance's backend.
@@ -293,7 +355,11 @@ impl Installation {
     }
 
     fn check_owned_files(&self) -> Result<()> {
-        for path in [self.root.join("bin/codex"), self.root.join("ssh-session")] {
+        for path in [
+            self.root.join("bin/codex"),
+            self.router_codex(),
+            self.root.join("ssh-session"),
+        ] {
             if path.exists() && !read_optional(&path)?.lines().any(|line| line == GENERATED) {
                 bail!("Refusing to replace unrelated file: {}", path.display());
             }
@@ -661,10 +727,12 @@ impl Installation {
             .await
             .context("Service is not ready; run install or service start")?;
         println!("Private service socket: OK");
-        self.check_ssh()
-            .await
-            .context("Local SSH connection failed; check Remote Login and run install again")?;
-        println!("Dedicated SSH connection: OK");
+        if installed_ssh(&read_optional(&self.root.join("installation.json"))?) {
+            self.check_ssh()
+                .await
+                .context("Local SSH connection failed; check Remote Login and run install again")?;
+            println!("Dedicated SSH connection: OK");
+        }
         let Some(claude) = claude else {
             // ACP agents have no common status command; a turn reports an
             // authentication error with the agent's advertised sign-in methods.
@@ -718,6 +786,25 @@ impl Installation {
         );
         Ok(())
     }
+}
+
+/// Installations that predate the SSH-free mode always configured SSH.
+fn installed_ssh(metadata: &str) -> bool {
+    serde_json::from_str::<Value>(metadata)
+        .ok()
+        .is_none_or(|v| v["ssh"] != false)
+}
+
+/// The Codex CLI bundled with the desktop app, which the desktop itself would run.
+fn desktop_codex() -> Option<PathBuf> {
+    ["ChatGPT", "Codex"]
+        .iter()
+        .map(|app| {
+            PathBuf::from(format!(
+                "/Applications/{app}.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+            ))
+        })
+        .find(|path| resolve_executable(path).is_ok())
 }
 
 fn installed_version(metadata: &str) -> Option<String> {

@@ -13,12 +13,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     backend::{Backend, BackendConfig, BackendEvent, BackendProtocol, SessionOptions},
     protocol::{
-        self, RpcError, RpcResult, Schemas, notification, now_ms, required_str, response,
-        supported_fields,
+        self, ADOPT_THREAD_METHOD, RpcError, RpcResult, Schemas, notification, now_ms,
+        required_str, response, supported_fields,
     },
     store::{ModelDefaults, Record, Settings, Store},
     translate::{self, Translator},
 };
+
+/// How long a new Claude process may wait for MCP servers before its first prompt.
+const MCP_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -26,12 +29,22 @@ pub struct ServerConfig {
     pub default_cwd: PathBuf,
     pub default_model: String,
     pub approval_timeout: Duration,
+    /// How long a thread keeps its Claude process between turns; zero disables reuse.
+    pub idle_session_timeout: Duration,
+    /// Idle Claude processes kept across all threads; zero disables reuse.
+    pub max_idle_sessions: usize,
     /// Reviews ACP permission requests when a thread selects automatic review.
     pub reviewer: Option<crate::auto_review::ReviewerConfig>,
 }
 
 pub enum Event {
     PluginNotification(Value),
+    /// The turn's Claude process is ready to serve the thread's next turn.
+    Parked {
+        thread_id: String,
+        turn_id: String,
+        session: crate::warm::WarmSession,
+    },
     PluginsReady {
         thread_id: String,
         turn_id: String,
@@ -114,6 +127,8 @@ struct Connection {
 }
 
 struct ActiveTurn {
+    /// Set when the process may serve later turns with the same launch settings.
+    launch_key: Option<Value>,
     usage: crate::usage::Tracker,
     plugins: Option<crate::plugin_runtime::Runtime>,
     plugin_calls: HashMap<String, Value>,
@@ -197,6 +212,7 @@ pub struct Server {
     loaded: HashSet<String>,
     connections: HashMap<u64, Connection>,
     active: HashMap<String, ActiveTurn>,
+    idle_sessions: HashMap<String, crate::warm::Parked>,
     pending: HashMap<String, Pending>,
     /// Permission requests under automatic review, by review id.
     reviews: HashMap<String, Review>,
@@ -224,6 +240,7 @@ impl Server {
             loaded: HashSet::new(),
             connections: HashMap::new(),
             active: HashMap::new(),
+            idle_sessions: HashMap::new(),
             pending: HashMap::new(),
             reviews: HashMap::new(),
             commands: crate::commands::CommandManager::default(),
@@ -248,6 +265,25 @@ impl Server {
                         active.plugins = Some(runtime);
                     } else {
                         runtime.client.shutdown().await;
+                    }
+                }
+                Event::Parked {
+                    thread_id,
+                    turn_id,
+                    session,
+                } => {
+                    let key = self
+                        .active
+                        .get_mut(&thread_id)
+                        .filter(|active| active.id == turn_id)
+                        .and_then(|active| {
+                            // The parked session owns the plugin runtime from now on.
+                            active.plugins = None;
+                            active.launch_key.clone()
+                        });
+                    match key {
+                        Some(key) => self.park(thread_id, key, session).await,
+                        None => session.close().await,
                     }
                 }
                 Event::PluginToolFinished {
@@ -344,6 +380,9 @@ impl Server {
         for id in ids {
             self.finish(&id, "interrupted", Some("Facade is shutting down".into()))
                 .await;
+        }
+        for (_, parked) in self.idle_sessions.drain() {
+            parked.close().await;
         }
         for (&client, connection) in &self.connections {
             connection.cancel.cancel();
@@ -475,6 +514,50 @@ impl Server {
         }
         Ok(())
     }
+    async fn park(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
+        self.idle_sessions.retain(|_, parked| parked.is_open());
+        while self.idle_sessions.len() >= self.config.max_idle_sessions {
+            let Some(oldest) = self
+                .idle_sessions
+                .iter()
+                .min_by_key(|(_, parked)| parked.parked_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.idle_sessions.remove(&oldest).unwrap().close().await;
+        }
+        let session_id = self.records[&id].session_id.clone();
+        let parked =
+            crate::warm::Parked::new(key, session_id, session, self.config.idle_session_timeout);
+        self.idle_sessions.insert(id, parked);
+    }
+
+    /// The thread's idle Claude process, if it can serve this launch. Any other
+    /// idle process is closed first: two processes must never share a session.
+    async fn reclaim(
+        &mut self,
+        id: &str,
+        options: &SessionOptions,
+        key: Option<&Value>,
+    ) -> Option<crate::warm::WarmSession> {
+        let parked = self.idle_sessions.remove(id)?;
+        match crate::warm::mismatch(&parked, options, key) {
+            None => parked.take().await,
+            Some(reason) => {
+                eprintln!("Restarting Claude for thread {id}: {reason}");
+                parked.close().await;
+                None
+            }
+        }
+    }
+
+    async fn close_idle_session(&mut self, id: &str) {
+        if let Some(parked) = self.idle_sessions.remove(id) {
+            parked.close().await;
+        }
+    }
+
     fn save(&self, id: &str) -> RpcResult<()> {
         self.store
             .save(self.record(id)?)
@@ -571,9 +654,14 @@ impl Server {
             Err(RpcError::new(-32000, "Not initialized"))
         } else if method == "initialize" && self.connections[&client].initialized {
             Err(RpcError::new(-32600, "Already initialized"))
+        } else if method == ADOPT_THREAD_METHOD {
+            self.adopt_thread(client, &id, &message["params"]).await
         } else {
             match Schemas::get().validate(method, &message) {
-                Ok(()) => self.request(client, &id, method, &message["params"]).await,
+                Ok(()) => {
+                    self.request(client, &id, method, &message["params"], None)
+                        .await
+                }
                 Err(error) => Err(error),
             }
         };
@@ -585,12 +673,37 @@ impl Server {
         }
     }
 
+    /// Start a Claude thread under an identifier the client already holds. The
+    /// local router uses this when the desktop's prewarmed (still empty) Codex
+    /// thread receives its first turn for a Claude model.
+    async fn adopt_thread(
+        &mut self,
+        client: u64,
+        rpc_id: &Value,
+        p: &Value,
+    ) -> RpcResult<Option<Value>> {
+        supported_fields(p, &["threadId", "params"])?;
+        let thread_id = required_str(p, "threadId")?;
+        if uuid::Uuid::parse_str(thread_id).is_err() {
+            return Err(RpcError::invalid("threadId must be a UUID"));
+        }
+        if self.records.contains_key(thread_id) {
+            return Err(RpcError::invalid("Thread already exists"));
+        }
+        let params = p.get("params").cloned().unwrap_or_else(|| json!({}));
+        let start = json!({"id": rpc_id, "method": "thread/start", "params": params});
+        Schemas::get().validate("thread/start", &start)?;
+        self.request(client, rpc_id, "thread/start", &params, Some(thread_id))
+            .await
+    }
+
     async fn request(
         &mut self,
         client: u64,
         rpc_id: &Value,
         method: &str,
         p: &Value,
+        adopted_id: Option<&str>,
     ) -> RpcResult<Option<Value>> {
         let (mut params, warnings) = crate::desktop::normalize(method, p)?;
         // Named workspace presets use the host defaults. Never override an
@@ -804,12 +917,17 @@ impl Server {
                 };
                 settings.apply(p)?;
                 self.check_backend_settings(&settings)?;
-                let record = Record::new(
-                    settings,
-                    self.store.threads_dir(),
-                    p,
-                    &self.connections[&client].originator,
-                );
+                let originator = &self.connections[&client].originator;
+                let record = match adopted_id {
+                    Some(id) => Record::with_id(
+                        id.to_owned(),
+                        settings,
+                        self.store.threads_dir(),
+                        p,
+                        originator,
+                    ),
+                    None => Record::new(settings, self.store.threads_dir(), p, originator),
+                };
                 self.store.save(&record).map_err(RpcError::internal)?;
                 let thread_id = record.id().to_owned();
                 let result = record.response(false, false);
@@ -883,8 +1001,9 @@ impl Server {
                 {
                     return Err(RpcError::invalid("Cannot reconfigure an active thread"));
                 }
-                // Each idle turn launches a new Claude process with --resume
-                // and current instructions, while retaining the native transcript.
+                // The next turn reuses the thread's idle Claude process only if
+                // these settings leave its launch unchanged; otherwise it starts
+                // a new process with --resume and the current instructions.
                 record.touch();
                 let mut result =
                     record.response(!p["excludeTurns"].as_bool().unwrap_or(false), true);
@@ -1154,6 +1273,9 @@ impl Server {
                 supported_fields(p, &["threadId"])?;
                 let id = required_str(p, "threadId")?;
                 self.idle(id)?;
+                if method == "thread/archive" {
+                    self.close_idle_session(id).await;
+                }
                 let mut record = self.record(id)?.clone();
                 record.archived = method == "thread/archive";
                 record.touch();
@@ -2160,6 +2282,10 @@ impl Server {
                 .map(|t| t.mcp_spec())
                 .collect(),
         };
+        let launch_key = crate::warm::launch_key(&options).filter(|_| {
+            self.config.max_idle_sessions > 0 && !self.config.idle_session_timeout.is_zero()
+        });
+        let warm = self.reclaim(id, &options, launch_key.as_ref()).await;
         let (control, commands) = mpsc::channel(32);
         let input_admission = Arc::new(Mutex::new(InputAdmission::default()));
         let cancel = CancellationToken::new();
@@ -2173,6 +2299,8 @@ impl Server {
                 )
             }),
             options,
+            warm,
+            park: launch_key.is_some(),
             thread_id: id.to_owned(),
             turn_id: turn_id.clone(),
             input: claude_input,
@@ -2184,6 +2312,7 @@ impl Server {
         self.active.insert(
             id.to_owned(),
             ActiveTurn {
+                launch_key,
                 usage: crate::usage::Tracker::default(),
                 plugins: None,
                 plugin_calls: HashMap::new(),
@@ -4048,6 +4177,10 @@ struct BackendTurn {
         Vec<crate::dynamic_tools::Tool>,
     )>,
     options: SessionOptions,
+    /// The thread's idle process from an earlier turn with identical launch settings.
+    warm: Option<crate::warm::WarmSession>,
+    /// Keep the process for the next turn after a clean finish.
+    park: bool,
     thread_id: String,
     turn_id: String,
     input: Vec<Value>,
@@ -4062,6 +4195,8 @@ async fn run_backend(turn: BackendTurn) {
         config,
         plugins,
         mut options,
+        warm,
+        park,
         thread_id,
         turn_id,
         input,
@@ -4103,6 +4238,20 @@ async fn run_backend(turn: BackendTurn) {
     let mut queued_input = Vec::new();
     let spawned = {
         let future = async {
+            if let Some(warm) = warm {
+                if let Some(runtime) = &warm.plugins {
+                    events
+                        .send(Event::PluginsReady {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            runtime: runtime.clone(),
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Facade event loop closed"))?;
+                }
+                return Ok((warm.backend, warm.output, warm.plugins));
+            }
+            let mut plugin_runtime = None;
             if let Some((plugin_config, disabled, desktop)) = plugins {
                 // Ask the configured Claude installation which plugins it already
                 // supplies. Failure retains Codex plugin guidance rather than hiding it.
@@ -4138,6 +4287,7 @@ async fn run_backend(turn: BackendTurn) {
                     options.append_system_prompt.as_deref().unwrap_or(""),
                     runtime.instructions
                 ));
+                plugin_runtime = Some(runtime.clone());
                 events
                     .send(Event::PluginsReady {
                         thread_id: thread_id.clone(),
@@ -4147,7 +4297,16 @@ async fn run_backend(turn: BackendTurn) {
                     .await
                     .map_err(|_| anyhow::anyhow!("Facade event loop closed"))?;
             }
-            Backend::spawn_cancellable(&config, &options, startup_cancel.clone()).await
+            let (mut backend, output) =
+                Backend::spawn_cancellable(&config, &options, startup_cancel.clone()).await?;
+            tokio::select! {
+                _ = backend.wait_for_mcp(MCP_CONNECT_DEADLINE) => {}
+                _ = startup_cancel.cancelled() => {
+                    backend.terminate().await?;
+                    anyhow::bail!("Claude startup cancelled");
+                }
+            }
+            Ok((backend, output, plugin_runtime))
         };
         tokio::pin!(future);
         loop {
@@ -4173,8 +4332,8 @@ async fn run_backend(turn: BackendTurn) {
             }
         }
     };
-    let (mut backend, mut output) = match spawned {
-        Ok(pair) => pair,
+    let (mut backend, mut output, plugin_runtime) = match spawned {
+        Ok(spawned) => spawned,
         Err(error) => {
             input_admission.lock().unwrap().closed = true;
             send(BackendEvent::Exited {
@@ -4188,6 +4347,8 @@ async fn run_backend(turn: BackendTurn) {
     let prompt = json!({"type": "user", "uuid":protocol::id(), "session_id": options.session_id, "message": {"role": "user", "content": input}, "parent_tool_use_id": null});
     let mut run = RunState::default();
     let mut interrupt_deadline = None;
+    // Only a turn that ran to Claude's idle state leaves a process fit for reuse.
+    let mut idle = false;
     let run_future = async {
         for message in std::iter::once(prompt).chain(queued_input) {
             run.submitted(&message);
@@ -4258,6 +4419,7 @@ async fn run_backend(turn: BackendTurn) {
                                 if message["is_error"] == true || interrupt_deadline.is_some() { return Some(BackendEvent::Message(message)); }
                             } else if !send(BackendEvent::Message(message)).await { return None; }
                             if run.finished() && input_admission.lock().unwrap().close_if_drained() {
+                                idle = true;
                                 return run.result.take().map(BackendEvent::Message);
                             }
                         }
@@ -4268,6 +4430,29 @@ async fn run_backend(turn: BackendTurn) {
     };
     let terminal = tokio::select! { _ = cancel.cancelled() => None, result = run_future => result };
     input_admission.lock().unwrap().closed = true;
+    if park && idle && !cancel.is_cancelled() {
+        let session = crate::warm::WarmSession {
+            backend,
+            output,
+            plugins: plugin_runtime,
+        };
+        // Reserve first so a cancelled delivery still closes the session gracefully.
+        let permit = tokio::select! { _ = cancel.cancelled() => None, permit = events.reserve() => permit.ok() };
+        match permit {
+            Some(permit) => {
+                permit.send(Event::Parked {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    session,
+                });
+                if let Some(event) = terminal {
+                    send(event).await;
+                }
+            }
+            None => session.close().await,
+        }
+        return;
+    }
     let cleanup = if cancel.is_cancelled()
         || !matches!(&terminal, Some(BackendEvent::Message(v)) if v["type"] == "result")
     {

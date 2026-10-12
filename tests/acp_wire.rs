@@ -104,6 +104,11 @@ struct Client {
 impl Client {
     /// A facade serving the fake ACP agent, which keeps sessions in `state`.
     async fn spawn(state: &Path, agent_flags: &[&str]) -> Self {
+        Self::spawn_with(state, agent_flags, &[]).await
+    }
+
+    /// `facade_args` are passed to the facade itself.
+    async fn spawn_with(state: &Path, agent_flags: &[&str], facade_args: &[&str]) -> Self {
         schemas();
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
         command
@@ -132,6 +137,7 @@ impl Client {
         for flag in agent_flags {
             command.arg(format!("--acp-arg={flag}"));
         }
+        command.args(facade_args);
         // Plugin runtime coverage lives in plugin tests; keep the host's Codex out.
         command.env_remove("CLAUDE_CODEX_PLUGIN_EXECUTABLE");
         let mut child = command
@@ -418,9 +424,11 @@ async fn turns_stream_messages_reasoning_usage_and_identify_the_provider() {
 
 #[tokio::test]
 async fn later_turns_resume_or_load_the_session_and_instructions_arrive_once() {
+    // Without kept processes every turn starts the agent and resumes or loads.
+    let cold = ["--idle-session-timeout-seconds", "0"];
     for flags in [&[][..], &["--no-resume"][..]] {
         let state = tempfile::tempdir().unwrap();
-        let mut client = Client::spawn(state.path(), flags).await;
+        let mut client = Client::spawn_with(state.path(), flags, &cold).await;
         let thread = client
             .thread(json!({"sandbox":"danger-full-access","developerInstructions":"Be terse."}))
             .await;
@@ -447,7 +455,7 @@ async fn later_turns_resume_or_load_the_session_and_instructions_arrive_once() {
         client.close().await;
     }
     let state = tempfile::tempdir().unwrap();
-    let mut client = Client::spawn(state.path(), &["--no-resume", "--no-load"]).await;
+    let mut client = Client::spawn_with(state.path(), &["--no-resume", "--no-load"], &cold).await;
     let thread = client.thread(full_access()).await;
     let turn = client.start(&thread, "hello").await;
     assert_eq!(client.completed(&turn).await["status"], "completed");
@@ -1137,6 +1145,38 @@ async fn automatic_review_fails_closed_and_stops_repeated_denials() {
     assert_eq!(
         reviews(&client, &turn)[0]["params"]["review"]["status"],
         "aborted"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn idle_agent_processes_serve_later_turns_until_settings_change() {
+    // An agent that can neither resume nor load still continues a thread
+    // while the facade keeps its process between turns.
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path(), &["--no-resume", "--no-load"]).await;
+    let thread = client.thread(full_access()).await;
+    let turn = client.start(&thread, "hello").await;
+    assert_eq!(client.completed(&turn).await["status"], "completed");
+    let turn = client.start(&thread, "history").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert!(
+        Client::reply(&completed).starts_with("turns=2 "),
+        "{completed}"
+    );
+    // A different model needs a new launch, which this agent cannot resume into.
+    let turn = client
+        .start_with(&thread, "hello", json!({"model":"fake-b"}))
+        .await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "failed");
+    assert!(
+        completed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("can neither resume nor load sessions"),
+        "{completed}"
     );
     client.close().await;
 }

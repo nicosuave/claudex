@@ -766,6 +766,35 @@ impl ClaudeBackend {
         &self.initialization
     }
 
+    /// Wait, at most `deadline`, until no MCP server is still connecting. Claude
+    /// sends requests without servers that are still connecting; their tools
+    /// join a later request and invalidate the prompt cache for the whole
+    /// conversation. Claude without `mcp_status` proceeds immediately.
+    pub async fn wait_for_mcp(&self, deadline: Duration) {
+        let until = tokio::time::Instant::now() + deadline;
+        while tokio::time::Instant::now() < until {
+            let Ok(status) = self
+                .control(json!({"subtype":"mcp_status"}), Duration::from_secs(5))
+                .await
+            else {
+                return;
+            };
+            let connecting = status["mcpServers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|server| server["status"] == "pending");
+            if !connecting {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.cancel.is_cancelled() && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
     pub async fn send(&self, message: Value) -> Result<()> {
         if self.cancel.is_cancelled() || self.task.as_ref().is_none_or(|task| task.is_finished()) {
             bail!("Claude backend is closed");
@@ -918,6 +947,21 @@ impl Backend {
         match self {
             Self::Claude(backend) => backend.initialization(),
             Self::Acp(backend) => backend.initialization(),
+        }
+    }
+
+    /// Claude only: an ACP agent connects its MCP servers before answering
+    /// session setup, so there is nothing left to wait for.
+    pub async fn wait_for_mcp(&self, deadline: Duration) {
+        if let Self::Claude(backend) = self {
+            backend.wait_for_mcp(deadline).await;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        match self {
+            Self::Claude(backend) => backend.is_running(),
+            Self::Acp(backend) => backend.is_running(),
         }
     }
 

@@ -28,6 +28,10 @@ Install Codex desktop and Claude Code, run `claude auth login`, and enable
 
 3. Select `claude-codex-local` in Codex **Settings > Connections**.
 
+To use Claude models beside Codex in the desktop's ordinary local window instead,
+without SSH, see
+[One local window without SSH](DESKTOP.md#one-local-window-without-ssh).
+
 If you need to diagnose a connection problem, run `claudex doctor`. It checks
 the setup; it does not install or upgrade anything.
 
@@ -89,6 +93,8 @@ Useful options:
 | `--acp-arg=acp` | Forward an argument to the ACP agent; repeat as needed |
 | `--provider-id`, `--provider-name` | Model provider reported to Codex for an ACP agent (default: the executable name) |
 | `--auto-review-model sonnet` | Claude model that reviews an ACP agent's permission requests when a thread selects automatic review |
+| `--idle-session-timeout-seconds 3600` | Keep a thread's Claude process between turns so its prompt cache stays valid; `0` starts a process per turn |
+| `--max-idle-sessions 8` | Idle Claude processes kept across threads; the oldest closes first |
 
 State defaults to `~/.local/state/claude-codex-server` (`claude-codex-server-<provider-id>` for an ACP agent), independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
 

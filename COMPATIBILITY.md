@@ -50,6 +50,8 @@ Desktop submission options are translated before dispatch: `approvalsReviewer: u
 
 `baseInstructions` maps to `--system-prompt`; `developerInstructions` maps to `--append-system-prompt`. An idle resumed thread can refresh both instruction fields, model, cwd, or approval policy. The facade disables native system-prompt snapshots so refreshed instructions take effect while native conversation history is preserved. Active turns reject reconfiguration.
 
+After a turn finishes cleanly, the thread keeps its Claude process (and Codex plugin runtime) idle. The next turn reuses it when its launch is unchanged: same model, effort, permission mode, cwd, sandbox, instructions, dynamic tools, plugin and environment overrides, and no output schema, rewind, or fork. A fresh launch renders Claude's request prefix again, and any difference (MCP servers that connect in a different order, a rebuilt plugin catalog) invalidates the prompt cache for the whole conversation. Otherwise the idle process closes and the turn resumes the session in a new one. Idle processes also close after `--idle-session-timeout-seconds` (default one hour, Claude's longest cache lifetime), when more than `--max-idle-sessions` are idle, on archive, and if Claude starts work while no turn is open. Plugin installations made while a process is idle reach the thread on its next new launch. A new process waits up to 30 seconds for MCP servers that are still connecting before its first prompt: Claude Code otherwise sends that request without them, and their tools joining the next request invalidate the cache again.
+
 ## Notifications and tool translation
 
 Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, and `error`.
@@ -127,7 +129,7 @@ With `--acp-agent`, the same Codex surface is served by an [Agent Client Protoco
 
 | Codex behavior | ACP mapping |
 | --- | --- |
-| Turn | One agent process per turn: `initialize`, then `session/new` (first turn), `session/resume`, or `session/load` (history replay suppressed), then `session/prompt`. An agent with neither resume nor load cannot continue a thread past its first turn. |
+| Turn | `initialize`, then `session/new` (first turn), `session/resume`, or `session/load` (history replay suppressed), then `session/prompt`. As for Claude, a cleanly finished thread keeps its agent process for `--idle-session-timeout-seconds`, and the next turn with unchanged settings reuses it with another `session/prompt`. A turn that needs a new process resumes or loads the session; an agent with neither cannot continue a thread in a new process. |
 | Instructions | ACP has no system prompt. Base/developer instructions, Codex plugin guidance and the desktop visualization directory are sent once, as a text block ahead of the first prompt of a new session. |
 | Streaming | `agent_message_chunk` → `agentMessage` deltas (one item per message id); `agent_thought_chunk` → `reasoning` (hidden with `summary: none`). |
 | Tools | `tool_call`/`tool_call_update`: `execute` → `commandExecution` (command from `rawInput`, output from content/`rawOutput`, streamed deltas, exit code); `edit`/`delete`/`move` → `fileChange` with unified diffs from ACP diff content; other kinds → `dynamicToolCall` under the provider namespace. The item type is fixed by the call's first kind. |
