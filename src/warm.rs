@@ -4,6 +4,10 @@
 //! connect, and the Codex plugin catalog is rebuilt. Any difference invalidates
 //! the prompt cache for the whole conversation, so a thread keeps its process
 //! while idle and the next turn reuses it when nothing it was launched with changed.
+//!
+//! An idle Claude process can also start work by itself: a background command
+//! or agent that outlived its turn finishes, and Claude answers the
+//! notification. The process is then handed back to the server as a new turn.
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -37,19 +41,31 @@ pub struct Parked {
     watcher: JoinHandle<Option<WarmSession>>,
 }
 
+/// Where an idle session goes when Claude starts work by itself.
+pub struct Wake {
+    pub thread_id: String,
+    pub events: mpsc::Sender<crate::server::Event>,
+}
+
 impl Parked {
-    pub fn new(key: Value, session_id: String, session: WarmSession, timeout: Duration) -> Self {
+    pub fn new(
+        key: Value,
+        session_id: String,
+        session: WarmSession,
+        timeout: Duration,
+        wake: Wake,
+    ) -> Self {
         let reclaim = CancellationToken::new();
         Self {
+            watcher: tokio::spawn(watch(session, reclaim.clone(), timeout, key.clone(), wake)),
             key,
             session_id,
             parked_at: Instant::now(),
-            watcher: tokio::spawn(watch(session, reclaim.clone(), timeout)),
             reclaim,
         }
     }
 
-    /// False once the watcher closed the session itself.
+    /// False once the watcher closed the session or handed it back as a wake.
     pub fn is_open(&self) -> bool {
         !self.watcher.is_finished()
     }
@@ -70,9 +86,13 @@ async fn watch(
     mut session: WarmSession,
     reclaim: CancellationToken,
     timeout: Duration,
+    key: Value,
+    wake: Wake,
 ) -> Option<WarmSession> {
     let expired = tokio::time::sleep(timeout);
     tokio::pin!(expired);
+    // Status frames since parking, such as the task notification that woke Claude.
+    let mut idle_frames = Vec::new();
     loop {
         tokio::select! {
             _ = reclaim.cancelled() => {
@@ -88,7 +108,21 @@ async fn watch(
             }
             _ = &mut expired => break,
             event = session.output.recv() => match event {
-                Some(event) if quiet(&event) => {}
+                Some(BackendEvent::Message(frame)) => {
+                    let busy = !quiet(&BackendEvent::Message(frame.clone()));
+                    idle_frames.push(frame);
+                    if busy {
+                        let woke = crate::server::Event::Woke {
+                            thread_id: wake.thread_id,
+                            key,
+                            session,
+                            frames: idle_frames,
+                        };
+                        // A closed event loop drops the session, which kills the process.
+                        let _ = wake.events.send(woke).await;
+                        return None;
+                    }
+                }
                 _ => break,
             },
         }
@@ -97,8 +131,8 @@ async fn watch(
     None
 }
 
-/// Idle Claude only reports status. Anything else means it started work that no
-/// turn can observe or approve, so the session is closed instead of reused.
+/// Idle Claude only reports status. Anything else means it started work, which
+/// needs a turn to observe and approve it.
 fn quiet(event: &BackendEvent) -> bool {
     match event {
         BackendEvent::Message(frame) => match frame["type"].as_str() {

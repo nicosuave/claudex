@@ -2491,6 +2491,42 @@ async fn fast_service_tier_selects_claude_fast_mode() {
 }
 
 #[tokio::test]
+async fn idle_claude_work_after_a_turn_arrives_as_a_new_turn() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let first = client.start(&thread, "background-bash").await;
+    let completed = client.completed(&first).await;
+    assert_eq!(agent_texts(&completed), ["Started"]);
+    // Claude answers the background command's notification on its own.
+    let started = client
+        .until(|v| {
+            v["method"] == "turn/started"
+                && v["params"]["threadId"] == thread.as_str()
+                && v["params"]["turn"]["id"] != first.as_str()
+        })
+        .await;
+    let woke = started["params"]["turn"]["id"].as_str().unwrap().to_owned();
+    let completed = client.completed(&woke).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(agent_texts(&completed), ["Background output: BGDONE"]);
+    let turns = client
+        .ok(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await["thread"]["turns"]
+        .clone();
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    // The woken process is parked again and serves the next turn.
+    let next = client.start(&thread, "process-info").await;
+    let text = agent_texts(&client.completed(&next).await).pop().unwrap();
+    assert!(text.ends_with("prompt 2"), "{text}");
+    client.close().await;
+}
+
+#[tokio::test]
 async fn first_prompt_waits_for_connecting_mcp_servers() {
     let state = tempfile::tempdir().unwrap();
     let mut client =
