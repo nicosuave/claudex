@@ -384,6 +384,79 @@ async fn native_mcp_delegation_works_in_both_directions_with_linked_history() {
 }
 
 #[tokio::test]
+async fn desktop_can_open_running_delegate_without_reconfiguring_it() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"gpt-fake","cwd":facade._state.path(),
+            "sandbox":"workspace-write","approvalPolicy":"never","approvalsReviewer":"auto_review"}))
+        .await;
+    desktop.turn(&parent, "gpt-fake", &script(json!([
+        {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"hang"}}
+    ]))).await;
+    let completed = desktop.completed(&parent).await;
+    let child = result(&reports(&completed)[0])["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = desktop.ok("thread/resume", json!({"threadId":child})).await;
+    assert_eq!(before["thread"]["turns"][0]["status"], "inProgress");
+    let open = json!({"threadId":child,"path":before["thread"]["path"],
+        "excludeTurns":true,"initialTurnsPage":{"limit":10},
+        "cwd":facade._state.path(),"model":"fable","effort":"high",
+        "approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"danger-full-access",
+        "developerInstructions":"Desktop opening context","baseInstructions":"Desktop base context",
+        "dynamicTools":[]});
+    let opened = desktop.ok("thread/resume", open.clone()).await;
+    assert_eq!(opened["model"], "opus");
+    assert_eq!(opened["approvalPolicy"], before["approvalPolicy"]);
+    assert_eq!(opened["approvalsReviewer"], before["approvalsReviewer"]);
+    assert_eq!(opened["sandbox"], before["sandbox"]);
+    assert_eq!(opened["thread"]["turns"], json!([]));
+    assert_eq!(
+        opened["initialTurnsPage"]["data"][0]["status"],
+        "inProgress"
+    );
+    assert_eq!(opened["thread"]["parentThreadId"], parent);
+    // Direct control still reaches the running child after hydration.
+    desktop
+        .ok(
+            "turn/interrupt",
+            json!({"threadId":child,"turnId":before["thread"]["turns"][0]["id"]}),
+        )
+        .await;
+    let completed = desktop.completed(&child).await;
+    assert_eq!(completed["params"]["turn"]["status"], "interrupted");
+    let idle = desktop.ok("thread/resume", open).await;
+    assert_eq!(idle["model"], "opus");
+    assert_eq!(idle["sandbox"], before["sandbox"]);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(before["thread"]["path"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert!(
+        saved["settings"]["developer_instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are a delegated child agent")
+    );
+    assert_eq!(saved["settings"]["base_instructions"], Value::Null);
+    assert!(
+        !saved["settings"]["dynamic_tools"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":child,"model":"fable"}),
+        )
+        .await;
+    let changed = desktop.ok("thread/resume", json!({"threadId":child})).await;
+    assert_eq!(changed["model"], "fable");
+}
+
+#[tokio::test]
 async fn delegation_wait_steer_queue_and_followup_preserve_one_native_child() {
     for (parent_model, harness, child_model) in [
         ("gpt-fake", "claude", "opus"),

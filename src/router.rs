@@ -621,6 +621,24 @@ impl Router {
             self.blocked = Some(Block::Resume);
             return;
         }
+        if side == Side::Claude
+            && message["method"] == "thread/resume"
+            && message["params"]["threadId"]
+                .as_str()
+                .is_some_and(|thread| self.agents.registry.agents.contains_key(thread))
+            && let Some(params) = message["params"].as_object_mut()
+        {
+            // Desktop supplies its own launch settings when opening a chat.
+            // A delegated session owns its inherited permissions, instructions
+            // and tools: opening it only hydrates and subscribes, including while
+            // its turn is active. Explicit settings/turn requests still apply.
+            params.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "threadId" | "path" | "excludeTurns" | "initialTurnsPage"
+                )
+            });
+        }
         let delegation_scope = match self.prepare_agent_tools(side, &mut message) {
             Ok(scope) => scope,
             Err(failure) => {

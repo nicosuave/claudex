@@ -79,6 +79,12 @@ hide delegated children, matching native subagent presentation. The native
 sessions can accept direct input; embedded Claude `Agent` transcripts retain
 their existing read-only behavior.
 
+Opening a delegated Claude chat hydrates and subscribes to its native thread,
+even while its turn is running. Desktop resume defaults do not replace the
+child's inherited permissions, instructions, model or tools. Explicit
+`thread/settings/update` and turn requests remain available for changing settings
+and sending direct input.
+
 Persistent child metadata and final reports are atomically written in a private
 directory beside the facade socket (`<socket stem>.agents`). Native backends own
 the transcripts. Ephemeral child metadata is kept in memory only. The router
