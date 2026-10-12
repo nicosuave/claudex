@@ -468,3 +468,36 @@ async fn native_user_review_after_auto_selection_prompts_before_mcp_execution() 
     assert_eq!(std::fs::read_to_string(note_path).unwrap(), nonce);
     child.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn approved_subagent_tool_call_completes_with_its_native_result() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    let thread = client
+        .ok("thread/start", json!({"sandbox":"danger-full-access"}))
+        .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let turn = client.start(&thread, "subagent", json!({})).await;
+    let request = client.request(&turn).await;
+    assert_eq!(request["method"], "item/commandExecution/requestApproval");
+    assert_eq!(request["params"]["itemId"], "permission-tool");
+    client
+        .send(json!({"id":request["id"],"result":{"decision":"accept"}}))
+        .await;
+    assert_eq!(client.finish(&turn).await["behavior"], "allow");
+    let completed = client
+        .until(|v| {
+            v["method"] == "item/completed" && v["params"]["item"]["id"] == "permission-tool"
+        })
+        .await;
+    assert_eq!(completed["params"]["item"]["status"], "completed");
+    assert!(
+        completed["params"]["item"]["aggregatedOutput"]
+            .as_str()
+            .unwrap()
+            .contains("allow")
+    );
+    client.close().await;
+}

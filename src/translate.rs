@@ -243,8 +243,23 @@ impl Translator {
     pub fn receive(&mut self, message: &Value) -> RpcResult<Vec<Value>> {
         let mut events = vec![];
         // Claude may forward subagent messages; these belong to the parent tool's result,
-        // not to the top-level assistant response.
+        // not to the top-level assistant response. A subagent tool call that needed
+        // approval already has an item here, so its result must still complete it.
         if !message["parent_tool_use_id"].is_null() {
+            if message["type"] == "user" {
+                let blocks: Vec<&Value> = message["message"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| {
+                        block["type"] == "tool_result"
+                            && self.items.iter().any(|v| v["id"] == block["tool_use_id"])
+                    })
+                    .collect();
+                for block in blocks {
+                    self.tool_result(block, &message["tool_use_result"], &mut events);
+                }
+            }
             return Ok(events);
         }
         match message["type"].as_str() {

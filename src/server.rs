@@ -2035,6 +2035,17 @@ impl Server {
                     return;
                 }
                 if !message["parent_tool_use_id"].is_null() {
+                    // Subagent frames never anchor the parent session; the translator
+                    // only completes items that a subagent permission request started.
+                    let translated = self
+                        .active
+                        .get_mut(id)
+                        .unwrap()
+                        .translator
+                        .receive(&message);
+                    if let Ok(events) = translated {
+                        self.translated(id, events);
+                    }
                     return;
                 }
                 if message["type"] == "control_cancel_request" {

@@ -366,3 +366,24 @@ fn visualization_reference_is_normalized_once_after_streaming() {
         assert_eq!(translator.snapshot()[0]["text"], text);
     }
 }
+
+#[test]
+fn subagent_results_complete_only_items_started_by_permission_requests() {
+    let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
+    let mut events = translator.tool_start("child-bash", "Bash", &json!({"command":"ls"}));
+    events.extend(
+        translator
+            .receive(
+                &json!({"type":"user","parent_tool_use_id":"agent","message":{"content":[
+        {"type":"tool_result","tool_use_id":"child-bash","content":"listing"},
+        {"type":"tool_result","tool_use_id":"child-read","content":"unrelated"}]}}),
+            )
+            .unwrap(),
+    );
+    let items = translator.snapshot();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["status"], "completed");
+    assert_eq!(items[0]["aggregatedOutput"], "listing");
+    assert!(translator.finish().is_empty());
+    contracts(&events);
+}
