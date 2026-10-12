@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    backend::{Backend, BackendConfig, BackendEvent, SessionOptions},
+    backend::{Backend, BackendConfig, BackendEvent, BackendProtocol, SessionOptions},
     protocol::{
         self, ADOPT_THREAD_METHOD, RpcError, RpcResult, Schemas, notification, now_ms,
         required_str, response, supported_fields,
@@ -33,6 +33,8 @@ pub struct ServerConfig {
     pub idle_session_timeout: Duration,
     /// Idle Claude processes kept across all threads; zero disables reuse.
     pub max_idle_sessions: usize,
+    /// Reviews ACP permission requests when a thread selects automatic review.
+    pub reviewer: Option<crate::auto_review::ReviewerConfig>,
 }
 
 pub enum Event {
@@ -82,6 +84,10 @@ pub enum Event {
         thread_id: String,
         turn_id: String,
         grant: crate::approvals::SessionGrant,
+    },
+    AutoReviewFinished {
+        review_id: String,
+        outcome: crate::auto_review::Outcome,
     },
     Shutdown,
 }
@@ -133,6 +139,7 @@ struct ActiveTurn {
     input_admission: Arc<Mutex<InputAdmission>>,
     translator: Translator,
     agents: crate::subagents::Agents,
+    breaker: crate::auto_review::Breaker,
     interrupting: bool,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
@@ -178,6 +185,14 @@ impl Drop for PendingTimeout {
     }
 }
 
+/// A permission request awaiting its automatic review.
+struct Review {
+    pending: Pending,
+    action: Value,
+    target: Value,
+    started_ms: u64,
+}
+
 struct DynamicPending {
     message_id: Value,
     item: Value,
@@ -190,6 +205,8 @@ pub struct Server {
     defaults: ModelDefaults,
     workspace_defaults: crate::sandbox::WorkspaceDefaults,
     model_catalog: Option<Vec<Value>>,
+    /// ACP agent info and capabilities from its most recent initialization.
+    acp_agent: Option<Value>,
     store: Store,
     records: BTreeMap<String, Record>,
     loaded: HashSet<String>,
@@ -197,6 +214,8 @@ pub struct Server {
     active: HashMap<String, ActiveTurn>,
     idle_sessions: HashMap<String, crate::warm::Parked>,
     pending: HashMap<String, Pending>,
+    /// Permission requests under automatic review, by review id.
+    reviews: HashMap<String, Review>,
     commands: crate::commands::CommandManager,
     command_cleanup: tokio::task::JoinSet<()>,
     events: mpsc::Sender<Event>,
@@ -215,6 +234,7 @@ impl Server {
             defaults,
             workspace_defaults,
             model_catalog: None,
+            acp_agent: None,
             store,
             records,
             loaded: HashSet::new(),
@@ -222,6 +242,7 @@ impl Server {
             active: HashMap::new(),
             idle_sessions: HashMap::new(),
             pending: HashMap::new(),
+            reviews: HashMap::new(),
             commands: crate::commands::CommandManager::default(),
             command_cleanup: tokio::task::JoinSet::new(),
             events,
@@ -348,6 +369,9 @@ impl Server {
                             }
                         }
                     }
+                }
+                Event::AutoReviewFinished { review_id, outcome } => {
+                    self.finish_review(&review_id, outcome).await
                 }
                 Event::Shutdown => break,
             }
@@ -538,6 +562,37 @@ impl Server {
         self.store
             .save(self.record(id)?)
             .map_err(RpcError::internal)
+    }
+
+    fn acp(&self) -> bool {
+        self.config.backend.protocol == BackendProtocol::Acp
+    }
+
+    /// Settings an ACP agent cannot honor. Its tools run in its own process, so
+    /// the facade cannot confine them or delegate review to Claude's classifier.
+    fn check_backend_settings(&self, settings: &Settings) -> RpcResult<()> {
+        if !self.acp() {
+            return Ok(());
+        }
+        if settings.sandbox.is_workspace() {
+            return Err(RpcError::invalid(
+                "ACP agents run their own tools, which this facade cannot confine to a workspace sandbox; use danger-full-access",
+            ));
+        }
+        if settings.approvals_reviewer != "user" && self.config.reviewer.is_none() {
+            return Err(RpcError::invalid(
+                "Automatic approval review needs a Claude reviewer; start the facade with --claude",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the cached ACP agent capabilities rule out a session operation.
+    /// Unknown capabilities (no turn has run yet) defer the check to the agent.
+    fn acp_lacks(&self, capability: &str) -> bool {
+        self.acp_agent.as_ref().is_some_and(|agent| {
+            !agent["agentCapabilities"]["sessionCapabilities"][capability].is_object()
+        })
     }
 
     async fn input(&mut self, client: u64, message: Value) {
@@ -855,8 +910,13 @@ impl Server {
                 let mut settings =
                     Settings::new(self.config.default_cwd.clone(), self.defaults.model.clone());
                 settings.effort = self.defaults.effort.clone();
-                settings.sandbox = self.workspace_defaults.policy();
+                settings.sandbox = if self.acp() {
+                    crate::sandbox::Policy::DangerFullAccess
+                } else {
+                    self.workspace_defaults.policy()
+                };
                 settings.apply(p)?;
+                self.check_backend_settings(&settings)?;
                 let originator = &self.connections[&client].originator;
                 let record = match adopted_id {
                     Some(id) => Record::with_id(
@@ -934,6 +994,7 @@ impl Server {
                 let previous =
                     serde_json::to_value(&record.settings).map_err(RpcError::internal)?;
                 record.settings.apply(p)?;
+                self.check_backend_settings(&record.settings)?;
                 if self.active.contains_key(id)
                     && previous
                         != serde_json::to_value(&record.settings).map_err(RpcError::internal)?
@@ -1010,8 +1071,28 @@ impl Server {
                         "Ephemeral Claude sessions cannot be forked",
                     ));
                 }
+                if self.acp() {
+                    if self.acp_lacks("fork") {
+                        return Err(RpcError::invalid(
+                            "This ACP agent does not support forking sessions",
+                        ));
+                    }
+                    // session/fork copies the whole session; it cannot fork at an earlier turn.
+                    let latest = source.turns.last().and_then(|turn| turn["id"].as_str());
+                    match crate::history_recovery::HistoryBoundary::for_fork(p)? {
+                        crate::history_recovery::HistoryBoundary::Full => {}
+                        crate::history_recovery::HistoryBoundary::ThroughTurn(id)
+                            if Some(id.as_str()) == latest => {}
+                        _ => {
+                            return Err(RpcError::invalid(
+                                "ACP agents can fork a thread only at its latest turn",
+                            ));
+                        }
+                    }
+                }
                 let mut settings = source.settings.clone();
                 settings.apply(p)?;
+                self.check_backend_settings(&settings)?;
                 let mut record = Record::new(
                     settings,
                     self.store.threads_dir(),
@@ -1044,6 +1125,11 @@ impl Server {
             }
             "thread/revert" | "thread/rollback" => {
                 supported_fields(p, &["threadId", "beforeTurnId", "numTurns"])?;
+                if self.acp() {
+                    return Err(RpcError::invalid(
+                        "ACP agents cannot rewind a session, so thread history cannot be reverted",
+                    ));
+                }
                 let id = required_str(p, "threadId")?;
                 self.idle(id)?;
                 if !self.loaded.contains(id) {
@@ -1252,6 +1338,7 @@ impl Server {
                 self.start_turn(client, rpc_id, p, None).await?;
                 Ok(None)
             }
+            "thread/approveGuardianDeniedAction" => self.approve_denied_action(p).map(Some),
             "thread/queue/add"
             | "thread/queue/list"
             | "thread/queue/update"
@@ -1380,7 +1467,13 @@ impl Server {
                         resume: false,
                         fork_from: None,
                         resume_at: None,
-                        model: self.defaults.model.clone(),
+                        // An ACP probe keeps the agent default, so an unavailable
+                        // configured default cannot hide the catalog.
+                        model: if self.acp() {
+                            crate::acp::DEFAULT_MODEL.into()
+                        } else {
+                            self.defaults.model.clone()
+                        },
                         permission_mode: "dontAsk".into(),
                         system_prompt: None,
                         append_system_prompt: None,
@@ -1394,11 +1487,18 @@ impl Server {
                         .await
                         .map_err(RpcError::internal)?;
                     let models = backend.initialization()["models"].as_array().cloned();
+                    if self.acp() {
+                        self.acp_agent = Some(backend.initialization()["agent"].clone());
+                    }
                     backend.terminate().await.map_err(RpcError::internal)?;
-                    self.model_catalog =
-                        Some(models.filter(|m| !m.is_empty()).ok_or_else(|| {
-                            RpcError::internal("Claude returned no model catalog")
-                        })?);
+                    // An agent without model selection still serves its own default.
+                    self.model_catalog = Some(
+                        models
+                            .filter(|m| self.acp() || !m.is_empty())
+                            .ok_or_else(|| {
+                                RpcError::internal("Claude returned no model catalog")
+                            })?,
+                    );
                 }
                 let mut models = self
                     .model_catalog
@@ -1408,7 +1508,19 @@ impl Server {
                     .map(|model| protocol::claude_model_entry(model, &self.defaults.model))
                     .collect::<RpcResult<Vec<_>>>()?;
                 if !models.iter().any(|m| m["isDefault"] == true) {
-                    models.insert(0, protocol::model_entry(&self.defaults.model, true));
+                    let mut entry = protocol::model_entry(&self.defaults.model, true);
+                    if self.acp() && self.defaults.model == crate::acp::DEFAULT_MODEL {
+                        entry["displayName"] = json!("Agent default");
+                        entry["description"] = json!("The model the agent selects by default");
+                    }
+                    models.insert(0, entry);
+                }
+                if let Some(agent) = self.acp_agent.as_ref().filter(|_| self.acp())
+                    && agent["agentCapabilities"]["promptCapabilities"]["image"] != true
+                {
+                    for model in &mut models {
+                        model["inputModalities"] = json!(["text"]);
+                    }
                 }
                 let mut page = page(models, p, false, "models")?;
                 page.as_object_mut().unwrap().remove("backwardsCursor");
@@ -1433,6 +1545,21 @@ impl Server {
             }
             "plugin/list" | "plugin/installed" | "plugin/search" | "plugin/read"
             | "plugin/install" | "plugin/uninstall" => {
+                // Claude's native plugin catalog does not apply to another agent.
+                if self.acp() {
+                    return match method {
+                        "plugin/list" => Ok(Some(
+                            json!({"marketplaces":[],"marketplaceLoadErrors":[],"featuredPluginIds":[]}),
+                        )),
+                        "plugin/installed" => {
+                            Ok(Some(json!({"marketplaces":[],"marketplaceLoadErrors":[]})))
+                        }
+                        "plugin/search" => Ok(Some(json!({"data":[],"nextCursor":null}))),
+                        _ => Err(RpcError::invalid(
+                            "No plugin catalog is configured for this ACP agent",
+                        )),
+                    };
+                }
                 let service = self.plugin_service(None);
                 let output = self.connections[&client].output.clone();
                 let rpc_id = rpc_id.clone();
@@ -1468,6 +1595,11 @@ impl Server {
                         .as_str()
                         .is_some_and(|key| key.starts_with("plugins."))
                 }) {
+                    if self.acp() {
+                        return Err(RpcError::invalid(
+                            "No plugin catalog is configured for this ACP agent",
+                        ));
+                    }
                     if edits.len() != 1 {
                         return Err(RpcError::invalid(
                             "Native plugin edits must be submitted individually; mixed transactions cannot be atomic",
@@ -1552,16 +1684,24 @@ impl Server {
                 }
                 config.insert("model".into(), json!(self.defaults.model));
                 config.insert("model_reasoning_effort".into(), json!(self.defaults.effort));
-                config.insert("model_provider".into(), json!("anthropic"));
+                let provider = protocol::provider();
+                config.insert("model_provider".into(), json!(provider.id));
                 config.insert(
                     "model_providers".into(),
-                    json!({"anthropic": {
-                        "name": "Claude Code", "requires_openai_auth": false
+                    json!({ provider.id.clone(): {
+                        "name": provider.name, "requires_openai_auth": false
                     }}),
                 );
                 config.insert("approval_policy".into(), json!("on-request"));
                 config.insert("approvals_reviewer".into(), json!("user"));
-                config.insert("sandbox_mode".into(), json!("workspace-write"));
+                config.insert(
+                    "sandbox_mode".into(),
+                    json!(if self.acp() {
+                        "danger-full-access"
+                    } else {
+                        "workspace-write"
+                    }),
+                );
                 // These are host-configured facade defaults, not the plugin
                 // sidecar's permissions. The desktop must show the actual grants.
                 config.insert(
@@ -1603,6 +1743,15 @@ impl Server {
                     });
                     return Ok(None);
                 }
+                if self.acp() {
+                    config.insert("plugins".into(), json!({}));
+                    let layers = if p["includeLayers"] == true {
+                        json!([])
+                    } else {
+                        Value::Null
+                    };
+                    return Ok(Some(json!({"config":config,"origins":{},"layers":layers})));
+                }
                 let service = self.plugin_service(p["cwd"].as_str());
                 let output = self.connections[&client].output.clone();
                 let rpc_id = rpc_id.clone();
@@ -1622,11 +1771,23 @@ impl Server {
                 });
                 Ok(None)
             }
-            "configRequirements/read" => Ok(Some(json!({"requirements": {
-                "allowedSandboxModes": ["workspace-write", "danger-full-access"],
-                "allowedApprovalPolicies": ["on-request", "never"],
-                "allowedApprovalsReviewers": ["user", "auto_review", "guardian_subagent"]
-            }}))),
+            "configRequirements/read" => Ok(Some(if self.acp() {
+                json!({"requirements": {
+                    "allowedSandboxModes": ["danger-full-access"],
+                    "allowedApprovalPolicies": ["on-request", "never"],
+                    "allowedApprovalsReviewers": if self.config.reviewer.is_some() {
+                        json!(["user", "auto_review", "guardian_subagent"])
+                    } else {
+                        json!(["user"])
+                    }
+                }})
+            } else {
+                json!({"requirements": {
+                    "allowedSandboxModes": ["workspace-write", "danger-full-access"],
+                    "allowedApprovalPolicies": ["on-request", "never"],
+                    "allowedApprovalsReviewers": ["user", "auto_review", "guardian_subagent"]
+                }})
+            })),
             // Advertise no Codex-only modes/features. Claude's native features
             // are not interchangeable with these desktop capabilities.
             "collaborationMode/list" => Ok(Some(json!({"data": []}))),
@@ -1697,9 +1858,9 @@ impl Server {
                     && !r.ephemeral()
                     && p.get("projectId")
                         .is_none_or(|v| *v == r.thread["projectId"])
-                    && p["modelProviders"]
-                        .as_array()
-                        .is_none_or(|v| v.is_empty() || v.iter().any(|p| p == "anthropic"))
+                    && p["modelProviders"].as_array().is_none_or(|v| {
+                        v.is_empty() || v.iter().any(|p| *p == protocol::provider().id.as_str())
+                    })
                     && (p["cwd"].is_null()
                         || p["cwd"] == r.thread["cwd"]
                         || p["cwd"]
@@ -2021,9 +2182,44 @@ impl Server {
             ));
         }
         record.settings.apply(p)?;
+        self.check_backend_settings(&record.settings)?;
+        if self.acp() {
+            if p.get("outputSchema")
+                .is_some_and(|schema| !schema.is_null())
+            {
+                return Err(RpcError::invalid(
+                    "ACP agents do not support structured output schemas",
+                ));
+            }
+            if !record.has_session && record.fork_from.is_some() {
+                if self.acp_lacks("fork") {
+                    return Err(RpcError::invalid(
+                        "This ACP agent does not support forking sessions",
+                    ));
+                }
+                // session/fork copies the source as it is now, so the fork is exact
+                // only while the source has not advanced since thread/fork.
+                if let Some(source) = record.thread["forkedFromId"]
+                    .as_str()
+                    .and_then(|source| self.records.get(source))
+                    && source.backend_message_id != record.backend_message_id
+                {
+                    return Err(RpcError::invalid(
+                        "The source thread continued after this fork; fork it again from its latest turn",
+                    ));
+                }
+            }
+        }
         let (codex_input, mut claude_input) = translate::user_input(&p["input"]).await?;
         record.tracks_turn_anchors = true;
         append_additional_context(&mut claude_input, &p["additionalContext"]);
+        // Context queued while the thread was idle precedes the new input.
+        for text in std::mem::take(&mut record.pending_context)
+            .into_iter()
+            .rev()
+        {
+            claude_input.insert(0, json!({"type":"text","text":text}));
+        }
         let turn_id = protocol::id();
         let turn = protocol::new_turn(&turn_id);
         let item = json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input});
@@ -2128,6 +2324,7 @@ impl Server {
                 translator: Translator::new(id, &turn_id, &record.settings.cwd)
                     .with_reasoning(record.settings.reasoning_summary.as_deref() != Some("none")),
                 agents: Default::default(),
+                breaker: Default::default(),
                 interrupting: false,
                 worker,
                 cancel,
@@ -2259,6 +2456,12 @@ impl Server {
                     // A fork can receive a fresh backend id; facade thread ids remain stable.
                     self.records.get_mut(id).unwrap().session_id = session_id.to_owned();
                 }
+                if message["type"] == "system"
+                    && message["subtype"] == "init"
+                    && message["acp"].is_object()
+                {
+                    self.acp_agent = Some(message["acp"].clone());
+                }
                 if message["type"] == "assistant"
                     || (message["type"] == "result" && message["subtype"] == "success")
                 {
@@ -2295,8 +2498,13 @@ impl Server {
                 }
                 self.link_spawns(id, None);
                 if let Some(last) = self.active.get_mut(id).unwrap().usage.receive(&message) {
-                    self.records.get_mut(id).unwrap().tracks_request_usage = true;
-                    self.records.get_mut(id).unwrap().token_usage["last"] = last;
+                    let window = self.active[id].usage.context_window(&Value::Null);
+                    let record = self.records.get_mut(id).unwrap();
+                    record.tracks_request_usage = true;
+                    record.token_usage["last"] = last;
+                    if let Some(window) = window {
+                        record.token_usage["modelContextWindow"] = json!(window);
+                    }
                     self.emit(id, notification("thread/tokenUsage/updated", json!({"threadId":id,"turnId":turn_id,"tokenUsage":self.records[id].token_usage})));
                 }
                 if message["type"] == "result" {
@@ -2417,6 +2625,20 @@ impl Server {
                     "item/completed",
                     json!({"threadId":id,"turnId":active.id,"item":item,"completedAtMs":now_ms()}),
                 )],
+            );
+        }
+        let reviews: Vec<String> = self
+            .reviews
+            .iter()
+            .filter(|(_, review)| review.pending.thread_id == id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for review_id in reviews {
+            let review = self.reviews.remove(&review_id).unwrap();
+            self.review_completed(
+                &review_id,
+                &review,
+                json!({"status":"aborted","riskLevel":null,"userAuthorization":null,"rationale":null}),
             );
         }
         let pending: Vec<String> = self
@@ -3305,9 +3527,222 @@ impl Server {
                 .await;
             return;
         }
+        if self.acp()
+            && self.records[id].settings.approvals_reviewer == "auto_review"
+            && pending.questions.is_none()
+        {
+            self.start_review(id, pending);
+            return;
+        }
         self.pending.insert(rpc_id.clone(), pending);
         self.update_wait_status(id);
         self.deliver_pending(&rpc_id);
+    }
+
+    /// Review an ACP permission request instead of showing it to the user.
+    fn start_review(&mut self, id: &str, pending: Pending) {
+        // A turn being interrupted (for example by repeated denials) gets no
+        // further reviews; its remaining requests are refused.
+        if self.active[id].interrupting {
+            let _ = self.active[id]
+                .control
+                .try_send(Control::Reply(control_reply(
+                    &pending.claude_request_id,
+                    json!({"behavior":"deny","message":"The turn is being interrupted"}),
+                )));
+            return;
+        }
+        let review_id = format!("review-{}", protocol::id());
+        let record = &self.records[id];
+        let action = crate::auto_review::action(
+            &pending.tool,
+            &pending.input,
+            &record.settings.cwd,
+            &protocol::provider().id,
+        );
+        let target = pending.request["params"]["itemId"].clone();
+        let started_ms = now_ms();
+        self.emit(
+            id,
+            notification(
+                "item/autoApprovalReview/started",
+                json!({"threadId":id,"turnId":pending.turn_id,"reviewId":review_id,
+                    "targetItemId":target,"startedAtMs":started_ms,"action":action,
+                    "review":{"status":"inProgress","riskLevel":null,"userAuthorization":null,"rationale":null}}),
+            ),
+        );
+        let transcript = crate::auto_review::transcript(&record.turns);
+        let approved = record.approved_actions.clone();
+        let cwd = record.settings.cwd.clone();
+        let reviewer = self.config.reviewer.clone();
+        let events = self.events.clone();
+        let reviewed = action.clone();
+        let finished_id = review_id.clone();
+        tokio::spawn(async move {
+            let outcome = match reviewer {
+                Some(reviewer) => {
+                    crate::auto_review::review(&reviewer, &cwd, &transcript, &reviewed, &approved)
+                        .await
+                }
+                None => crate::auto_review::Outcome::Failed("no reviewer is configured".into()),
+            };
+            let _ = events
+                .send(Event::AutoReviewFinished {
+                    review_id: finished_id,
+                    outcome,
+                })
+                .await;
+        });
+        self.reviews.insert(
+            review_id,
+            Review {
+                pending,
+                action,
+                target,
+                started_ms,
+            },
+        );
+    }
+
+    fn review_completed(&self, review_id: &str, review: &Review, result: Value) {
+        let thread = &review.pending.thread_id;
+        self.emit(
+            thread,
+            notification(
+                "item/autoApprovalReview/completed",
+                json!({"threadId":thread,"turnId":review.pending.turn_id,"reviewId":review_id,
+                    "targetItemId":review.target,"startedAtMs":review.started_ms,"completedAtMs":now_ms(),
+                    "decisionSource":"agent","action":review.action,"review":result}),
+            ),
+        );
+    }
+
+    async fn finish_review(&mut self, review_id: &str, outcome: crate::auto_review::Outcome) {
+        let Some(review) = self.reviews.remove(review_id) else {
+            return;
+        };
+        let id = review.pending.thread_id.clone();
+        // A review that outlived its turn was already reported as aborted.
+        if self
+            .active
+            .get(&id)
+            .is_none_or(|active| active.id != review.pending.turn_id)
+        {
+            return;
+        }
+        self.review_completed(review_id, &review, outcome.review());
+        let allowed = outcome.allowed();
+        let data = if allowed {
+            json!({"behavior":"allow","updatedInput":review.pending.input})
+        } else {
+            json!({"behavior":"deny","message":outcome.denial_message()})
+        };
+        let active = self.active.get_mut(&id).unwrap();
+        let trip = active.breaker.record(!allowed);
+        let _ = active.control.try_send(Control::Reply(control_reply(
+            &review.pending.claude_request_id,
+            data,
+        )));
+        if allowed {
+            return;
+        }
+        let mut record = self.records[&id].clone();
+        record
+            .auto_review_denials
+            .push(json!({"reviewId":review_id,"tool":review.pending.tool,
+            "input":review.pending.input,"action":review.action}));
+        let excess = record.auto_review_denials.len().saturating_sub(20);
+        record.auto_review_denials.drain(..excess);
+        match self.store.save(&record) {
+            Ok(()) => {
+                self.records.insert(id.clone(), record);
+            }
+            Err(error) => self.emit(
+                &id,
+                notification(
+                    "warning",
+                    json!({"threadId":id,
+                "message":format!("The denied action cannot be approved later: {error}")}),
+                ),
+            ),
+        }
+        if trip {
+            self.emit(&id, notification("guardianWarning", json!({"threadId":id,
+                "message":"Automatic review denied several actions in a row, so this turn was interrupted. Review the denials, approve an action if you intend it, or give the agent new instructions."})));
+            let active = self.active.get_mut(&id).unwrap();
+            active.interrupting = true;
+            let _ = active.control.try_send(Control::Interrupt);
+        }
+    }
+
+    /// The user approves an action automatic review denied: allow that exact
+    /// action from now on in this thread, and tell the agent so it can retry.
+    fn approve_denied_action(&mut self, p: &Value) -> RpcResult<Value> {
+        supported_fields(p, &["threadId", "event"])?;
+        let id = required_str(p, "threadId")?;
+        if !self.acp() {
+            return Err(RpcError::invalid(
+                "Claude threads use Claude's native auto review; ask Claude to retry the action after approving it in chat",
+            ));
+        }
+        let review_id = required_str(&p["event"], "id")?;
+        if p["event"]["status"]
+            .as_str()
+            .is_some_and(|status| status != "denied")
+        {
+            return Err(RpcError::invalid("Only denied reviews can be approved"));
+        }
+        let mut record = self.record(id)?.clone();
+        let denial = record
+            .auto_review_denials
+            .iter()
+            .find(|denial| denial["reviewId"] == review_id)
+            .cloned()
+            .ok_or_else(|| RpcError::invalid("Denied review not found in this thread"))?;
+        let grant = crate::approvals::SessionGrant::new(
+            denial["tool"].as_str().unwrap_or(""),
+            &denial["input"],
+            &record.settings.cwd.to_string_lossy(),
+        );
+        if !record.session_grants.contains(&grant) {
+            record.session_grants.push(grant);
+        }
+        record
+            .auto_review_denials
+            .retain(|denial| denial["reviewId"] != review_id);
+        record.approved_actions.push(denial["action"].clone());
+        let excess = record.approved_actions.len().saturating_sub(20);
+        record.approved_actions.drain(..excess);
+        // The same instruction Codex gives its own agent.
+        let text = format!(
+            "The user has manually approved a specific action that was previously `Rejected`.\n\nTreat this as approval to perform that exact action in the same context in which it was originally requested.\nDo not assume this also authorizes similar operations with different payloads.\n\nApproved action:\n{}",
+            serde_json::to_string_pretty(&json!({"action":denial["action"],"outcome":"allowed"}))
+                .unwrap_or_default()
+        );
+        // Persist the grant before the agent can act on the approval.
+        self.store.save(&record).map_err(RpcError::internal)?;
+        let delivered = self.active.get(id).is_some_and(|active| {
+            let Ok(permit) = active.control.try_reserve() else {
+                return false;
+            };
+            let mut admission = active.input_admission.lock().unwrap();
+            if admission.closed {
+                return false;
+            }
+            admission.queued += 1;
+            permit.send(Control::UserInput(
+                json!({"type":"user","uuid":protocol::id(),
+                "session_id":record.session_id,"parent_tool_use_id":null,
+                "message":{"role":"user","content":[{"type":"text","text":text}]}}),
+            ));
+            true
+        });
+        if !delivered {
+            record.pending_context.push(text);
+            self.store.save(&record).map_err(RpcError::internal)?;
+        }
+        self.records.insert(id.to_owned(), record);
+        Ok(json!({}))
     }
 
     /// Resolution goes to the thread the request was shown on (a subagent's
@@ -3772,10 +4207,13 @@ async fn run_backend(turn: BackendTurn) {
     } = turn;
     // Auto-mode terminal denials never create a can_use_tool callback. Explain
     // the supported per-chat recovery instead of suggesting global allow rules.
-    options.append_system_prompt = Some(format!(
-        "{}\nThis session runs in Codex through the Claude facade. If Claude's auto-mode classifier denies an action, report the denial and its reason. There is no pending approval to answer for that denied call. If the user subsequently gives explicit authorization for that specific denied action (for example, 'I allow that' in direct response to the denial), retry that same action once through the normal tool and native reviewer so the new authorization is considered. Preserve its destination and scope; do not substitute another remote, tool, or encoding to evade review. User authorization is context for a fresh review, not an automatic allow or a permission-mode change. If the fresh review denies it again, report that outcome and offer 'Ask for approval' in this chat's permissions menu as the manual review path. Do not require a permissions-menu change before trying newly authorized work. Do not claim global permissions.allow edits or Full Access are required, and do not change permission settings yourself. Explicit native deny rules and managed restrictions still apply.\n",
-        options.append_system_prompt.as_deref().unwrap_or("")
-    ));
+    // ACP agents have no Claude auto mode, so the guidance does not apply.
+    if config.protocol == BackendProtocol::Claude {
+        options.append_system_prompt = Some(format!(
+            "{}\nThis session runs in Codex through the Claude facade. If Claude's auto-mode classifier denies an action, report the denial and its reason. There is no pending approval to answer for that denied call. If the user subsequently gives explicit authorization for that specific denied action (for example, 'I allow that' in direct response to the denial), retry that same action once through the normal tool and native reviewer so the new authorization is considered. Preserve its destination and scope; do not substitute another remote, tool, or encoding to evade review. User authorization is context for a fresh review, not an automatic allow or a permission-mode change. If the fresh review denies it again, report that outcome and offer 'Ask for approval' in this chat's permissions menu as the manual review path. Do not require a permissions-menu change before trying newly authorized work. Do not claim global permissions.allow edits or Full Access are required, and do not change permission settings yourself. Explicit native deny rules and managed restrictions still apply.\n",
+            options.append_system_prompt.as_deref().unwrap_or("")
+        ));
+    }
     // The desktop validates inline visualization paths against this thread's
     // workspace, not the genuine Codex subprocess's plugin home.
     let visualization_dir = options.cwd.join("outputs/visualizations").join(&thread_id);
@@ -3822,9 +4260,13 @@ async fn run_backend(turn: BackendTurn) {
                     None,
                     options.cwd.clone(),
                 );
-                let native_config = tokio::select! {
-                    _ = startup_cancel.cancelled() => anyhow::bail!("Plugin startup cancelled"),
-                    result = native_service.enabled_config() => result.unwrap_or_default(),
+                let native_config = if config.protocol == BackendProtocol::Claude {
+                    tokio::select! {
+                        _ = startup_cancel.cancelled() => anyhow::bail!("Plugin startup cancelled"),
+                        result = native_service.enabled_config() => result.unwrap_or_default(),
+                    }
+                } else {
+                    Value::Null
                 };
                 let native_plugins = native_config
                     .as_object()

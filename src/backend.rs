@@ -23,8 +23,8 @@ use tokio_util::{
     sync::CancellationToken,
 };
 
-const MAX_FRAME: usize = 32 * 1024 * 1024;
-const STDERR_TAIL: usize = 16 * 1024;
+pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
+pub(crate) const STDERR_TAIL: usize = 16 * 1024;
 // Well below the native hook's 60-second fail-open timeout.
 const FILE_CALLBACK_DEADLINE: Duration = Duration::from_secs(5);
 // Workspace sessions need --managed-settings and list_permission_rules.
@@ -35,7 +35,7 @@ const EVENT_BACKLOG: usize = if cfg!(test) { 64 * 1024 } else { 4 * MAX_FRAME };
 // Deployment settings for the facade process itself. Claude sessions must not
 // inherit them: a codex or facade run inside a session would otherwise use the
 // facade's private homes and sockets instead of the user's.
-const FACADE_ENVIRONMENT: &[&str] = &[
+pub(crate) const FACADE_ENVIRONMENT: &[&str] = &[
     "CODEX_HOME",
     "CODEX_INSTALL_DIR",
     "CODEX_SSH_SKIP_APP_SERVER_BOOT",
@@ -47,11 +47,22 @@ const FACADE_ENVIRONMENT: &[&str] = &[
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
 
+/// Which agent protocol the configured executable speaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendProtocol {
+    /// Claude Code's bidirectional stream-json transport.
+    #[default]
+    Claude,
+    /// An Agent Client Protocol (v1) agent over stdio.
+    Acp,
+}
+
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     pub executable: PathBuf,
     pub extra_args: Vec<String>,
     pub initialize_timeout: Duration,
+    pub protocol: BackendProtocol,
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +91,7 @@ pub enum BackendEvent {
     Exited { success: bool, message: String },
 }
 
-pub struct Backend {
+pub struct ClaudeBackend {
     stdin: SharedStdin,
     pending: Pending,
     controls: Semaphore,
@@ -381,7 +392,7 @@ fn merge_settings(target: &mut Value, overlay: Value) {
 }
 
 // The process group belongs to this backend, including tool subprocesses.
-fn kill_group(id: u32) {
+pub(crate) fn kill_group(id: u32) {
     #[cfg(unix)]
     unsafe {
         libc::kill(-(id as i32), libc::SIGKILL);
@@ -391,9 +402,9 @@ fn kill_group(id: u32) {
 }
 
 // A supervisor panic must also kill descendants, not just Child's main process.
-struct ProcessGroupGuard {
-    id: u32,
-    alive: Arc<AtomicBool>,
+pub(crate) struct ProcessGroupGuard {
+    pub(crate) id: u32,
+    pub(crate) alive: Arc<AtomicBool>,
 }
 
 impl Drop for ProcessGroupGuard {
@@ -424,45 +435,58 @@ fn mcp_control_response(value: &Value, tools: &[Value]) -> Option<Value> {
     }
     let request = &value["request"];
     let message = &request["message"];
-    let error = |code: i32, text: &str| json!({"jsonrpc":"2.0","id":message["id"],"error":{"code":code,"message":text}});
     let response = if request["server_name"] != "codex_desktop" || tools.is_empty() {
-        error(-32601, "SDK MCP server not registered")
-    } else if !message.is_object() || message["jsonrpc"] != "2.0" {
-        error(-32600, "Invalid JSON-RPC message")
-    } else if message.get("id").is_none() {
-        // Notifications have no JSON-RPC response, but their outer control
-        // request still needs the SDK's empty acknowledgement.
-        json!({"jsonrpc":"2.0","result":{}})
+        mcp_error(message, -32601, "SDK MCP server not registered")
     } else {
-        let result = match message["method"].as_str() {
-            Some("tools/call") => return None,
-            Some("initialize") => {
-                let requested = message["params"]["protocolVersion"].as_str().unwrap_or("");
-                let version = match requested {
-                    "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" => requested,
-                    _ => "2025-11-25",
-                };
-                json!({"protocolVersion":version,"capabilities":{"tools":{}},
-                    "serverInfo":{"name":"codex_desktop","version":env!("CARGO_PKG_VERSION")}})
-            }
-            Some("tools/list") => json!({"tools":tools}),
-            Some("ping") => json!({}),
-            Some(_) => {
-                return Some(mcp_response_envelope(
-                    value,
-                    error(-32601, "Method not found"),
-                ));
-            }
-            None => {
-                return Some(mcp_response_envelope(
-                    value,
-                    error(-32600, "Invalid JSON-RPC request"),
-                ));
-            }
-        };
-        json!({"jsonrpc":"2.0","id":message["id"],"result":result})
+        match mcp_local(message, tools) {
+            McpLocal::Call => return None,
+            McpLocal::Reply(response) => response,
+            // Notifications have no JSON-RPC response, but their outer control
+            // request still needs the SDK's empty acknowledgement.
+            McpLocal::Notification => json!({"jsonrpc":"2.0","result":{}}),
+        }
     };
     Some(mcp_response_envelope(value, response))
+}
+
+/// How the desktop tool MCP server handles one inbound JSON-RPC message.
+pub(crate) enum McpLocal {
+    /// tools/call: the server executes it and supplies the result.
+    Call,
+    /// Answered locally from the registered tool catalog.
+    Reply(Value),
+    /// A notification, which has no JSON-RPC response.
+    Notification,
+}
+
+pub(crate) fn mcp_local(message: &Value, tools: &[Value]) -> McpLocal {
+    if !message.is_object() || message["jsonrpc"] != "2.0" {
+        return McpLocal::Reply(mcp_error(message, -32600, "Invalid JSON-RPC message"));
+    }
+    if message.get("id").is_none() {
+        return McpLocal::Notification;
+    }
+    let result = match message["method"].as_str() {
+        Some("tools/call") => return McpLocal::Call,
+        Some("initialize") => {
+            let requested = message["params"]["protocolVersion"].as_str().unwrap_or("");
+            let version = match requested {
+                "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" => requested,
+                _ => "2025-11-25",
+            };
+            json!({"protocolVersion":version,"capabilities":{"tools":{}},
+                "serverInfo":{"name":"codex_desktop","version":env!("CARGO_PKG_VERSION")}})
+        }
+        Some("tools/list") => json!({"tools":tools}),
+        Some("ping") => json!({}),
+        Some(_) => return McpLocal::Reply(mcp_error(message, -32601, "Method not found")),
+        None => return McpLocal::Reply(mcp_error(message, -32600, "Invalid JSON-RPC request")),
+    };
+    McpLocal::Reply(json!({"jsonrpc":"2.0","id":message["id"],"result":result}))
+}
+
+fn mcp_error(message: &Value, code: i32, text: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":message["id"],"error":{"code":code,"message":text}})
 }
 
 fn mcp_response_envelope(request: &Value, response: Value) -> Value {
@@ -489,7 +513,7 @@ async fn write_frame(stdin: &SharedStdin, message: &Value) -> Result<()> {
     .context("Claude stdin write timed out")?
 }
 
-impl Backend {
+impl ClaudeBackend {
     pub async fn spawn(
         config: &BackendConfig,
         options: &SessionOptions,
@@ -865,7 +889,7 @@ impl Backend {
     }
 }
 
-impl Drop for Backend {
+impl Drop for ClaudeBackend {
     fn drop(&mut self) {
         self.cancel.cancel();
         if self.alive.load(Ordering::Acquire) {
@@ -881,6 +905,85 @@ struct PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// One turn's agent process. Both variants accept and emit Claude stream-json
+/// control frames, so the server drives either through the same contract.
+pub enum Backend {
+    Claude(ClaudeBackend),
+    Acp(Box<crate::acp::AcpBackend>),
+}
+
+impl Backend {
+    pub async fn spawn(
+        config: &BackendConfig,
+        options: &SessionOptions,
+    ) -> Result<(Self, mpsc::Receiver<BackendEvent>)> {
+        Self::spawn_cancellable(config, options, CancellationToken::new()).await
+    }
+
+    pub async fn spawn_cancellable(
+        config: &BackendConfig,
+        options: &SessionOptions,
+        startup_cancel: CancellationToken,
+    ) -> Result<(Self, mpsc::Receiver<BackendEvent>)> {
+        Ok(match config.protocol {
+            BackendProtocol::Claude => {
+                let (backend, events) =
+                    ClaudeBackend::spawn_cancellable(config, options, startup_cancel).await?;
+                (Self::Claude(backend), events)
+            }
+            BackendProtocol::Acp => {
+                let (backend, events) =
+                    crate::acp::AcpBackend::spawn_cancellable(config, options, startup_cancel)
+                        .await?;
+                (Self::Acp(Box::new(backend)), events)
+            }
+        })
+    }
+
+    pub fn initialization(&self) -> &Value {
+        match self {
+            Self::Claude(backend) => backend.initialization(),
+            Self::Acp(backend) => backend.initialization(),
+        }
+    }
+
+    /// Claude only: an ACP agent connects its MCP servers before answering
+    /// session setup, so there is nothing left to wait for.
+    pub async fn wait_for_mcp(&self, deadline: Duration) {
+        if let Self::Claude(backend) = self {
+            backend.wait_for_mcp(deadline).await;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        match self {
+            Self::Claude(backend) => backend.is_running(),
+            Self::Acp(backend) => backend.is_running(),
+        }
+    }
+
+    pub async fn send(&self, message: Value) -> Result<()> {
+        match self {
+            Self::Claude(backend) => backend.send(message).await,
+            Self::Acp(backend) => backend.send(message).await,
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Claude(backend) => backend.shutdown().await,
+            Self::Acp(backend) => backend.shutdown().await,
+        }
+    }
+
+    pub async fn terminate(&mut self) -> Result<()> {
+        match self {
+            Self::Claude(backend) => backend.terminate().await,
+            Self::Acp(backend) => backend.terminate().await,
+        }
     }
 }
 
@@ -976,6 +1079,7 @@ mod tests {
             executable: "/bin/sh".into(),
             extra_args: vec!["-c".into(), script.into()],
             initialize_timeout: Duration::from_secs(2),
+            protocol: BackendProtocol::Claude,
         }
     }
 
@@ -1088,7 +1192,7 @@ mod tests {
         options.dynamic_tools = vec![
             json!({"name":"lookup","description":"Find a record","inputSchema":{"type":"object"}}),
         ];
-        let (mut backend, mut events) = Backend::spawn(&shell_config(&script), &options)
+        let (mut backend, mut events) = ClaudeBackend::spawn(&shell_config(&script), &options)
             .await
             .unwrap();
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -1116,9 +1220,10 @@ mod tests {
             while read -r line; do :; done
         "#
         );
-        let (mut backend, mut events) = Backend::spawn(&shell_config(&script), &test_options())
-            .await
-            .unwrap();
+        let (mut backend, mut events) =
+            ClaudeBackend::spawn(&shell_config(&script), &test_options())
+                .await
+                .unwrap();
         assert_eq!(backend.initialization(), &json!({"models":[]}));
         backend.interrupt().await.unwrap();
         assert!(
@@ -1134,7 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn forced_termination_reaps_the_backend_before_returning() {
         let script = format!("read -r line\n{ACK}\nwhile read -r line; do :; done");
-        let (mut backend, _events) = Backend::spawn(&shell_config(&script), &test_options())
+        let (mut backend, _events) = ClaudeBackend::spawn(&shell_config(&script), &test_options())
             .await
             .unwrap();
         let process_id = backend.process_id as i32;
@@ -1150,7 +1255,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn early_exit_includes_stderr() {
-        let result = Backend::spawn(
+        let result = ClaudeBackend::spawn(
             &shell_config("echo initialization-failed >&2; exit 23"),
             &test_options(),
         )
@@ -1176,9 +1281,10 @@ mod tests {
             sleep 60
         "#
         );
-        let (mut backend, mut events) = Backend::spawn(&shell_config(&script), &test_options())
-            .await
-            .unwrap();
+        let (mut backend, mut events) =
+            ClaudeBackend::spawn(&shell_config(&script), &test_options())
+                .await
+                .unwrap();
         backend
             .send(json!({"type":"user","message":{"role":"user","content":"malformed"}}))
             .await
@@ -1241,7 +1347,7 @@ mod tests {
                 exit 37
             "#
             );
-            let error = Backend::spawn(&shell_config(&script), &options)
+            let error = ClaudeBackend::spawn(&shell_config(&script), &options)
                 .await
                 .err()
                 .unwrap();
@@ -1284,7 +1390,7 @@ mod tests {
                 if broken_transport { "exec 0<&-" } else { ":" },
                 marker.display()
             );
-            let error = Backend::spawn(&shell_config(&script), &options)
+            let error = ClaudeBackend::spawn(&shell_config(&script), &options)
                 .await
                 .err()
                 .unwrap();
@@ -1321,7 +1427,7 @@ mod tests {
         let mut config = shell_config(&script);
         config.initialize_timeout = Duration::from_secs(15);
         let started = std::time::Instant::now();
-        let error = Backend::spawn(&config, &options).await.err().unwrap();
+        let error = ClaudeBackend::spawn(&config, &options).await.err().unwrap();
         assert!(
             format!("{error:#}").contains("native file callback deadline exceeded"),
             "{error:#}"
@@ -1345,7 +1451,7 @@ mod tests {
             exit 37
         "#
         );
-        let error = Backend::spawn(&shell_config(&script), &options)
+        let error = ClaudeBackend::spawn(&shell_config(&script), &options)
             .await
             .err()
             .unwrap();
@@ -1366,7 +1472,7 @@ mod tests {
             sleep 60
         "#
         );
-        let error = Backend::spawn(&shell_config(&script), &options)
+        let error = ClaudeBackend::spawn(&shell_config(&script), &options)
             .await
             .err()
             .unwrap();

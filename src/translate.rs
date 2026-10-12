@@ -23,6 +23,20 @@ pub struct Translator {
     native_tasks: HashMap<String, String>,
     spawns: Vec<(String, Value)>,
     include_reasoning: bool,
+    acp: AcpState,
+}
+
+/// Item state for ACP session updates.
+#[derive(Default)]
+struct AcpState {
+    /// The open message or thought item: (item id, thinking, agent message id).
+    text: Option<(String, bool, Option<String>)>,
+    /// Accumulated tool call state by tool call id.
+    tools: HashMap<String, Value>,
+    /// Bytes of each command's output already streamed as deltas.
+    output: HashMap<String, usize>,
+    /// Calls whose items the server owns (bridged desktop tools).
+    skipped: HashSet<String>,
 }
 
 impl Translator {
@@ -45,6 +59,7 @@ impl Translator {
             native_tasks: HashMap::new(),
             spawns: Vec::new(),
             include_reasoning: true,
+            acp: AcpState::default(),
         }
     }
     pub fn with_reasoning(mut self, include: bool) -> Self {
@@ -465,6 +480,8 @@ impl Translator {
                 }
             }
             Some("user") => {
+                // A new ACP prompt starts a new message.
+                self.acp_close_text(&mut events);
                 for block in message["message"]["content"]
                     .as_array()
                     .into_iter()
@@ -535,7 +552,9 @@ impl Translator {
                 self.start(json!({"type": "contextCompaction", "id": id}), &mut events);
                 self.complete(&id, &mut events);
             }
+            Some("acp") => self.acp_update(&message["update"], &mut events),
             Some("result") => {
+                self.acp_close_text(&mut events);
                 if let Some(output) = message.get("structured_output").filter(|v| !v.is_null()) {
                     let id = protocol::id();
                     self.start(agent_message(&id), &mut events);
@@ -557,6 +576,240 @@ impl Translator {
             _ => {}
         }
         Ok(events)
+    }
+
+    fn acp_update(&mut self, update: &Value, events: &mut Vec<Value>) {
+        match update["sessionUpdate"].as_str() {
+            Some(kind @ ("agent_message_chunk" | "agent_thought_chunk")) => {
+                let thinking = kind == "agent_thought_chunk";
+                if thinking && !self.include_reasoning {
+                    return;
+                }
+                let text = acp_content_text(&update["content"]);
+                if text.is_empty() {
+                    return;
+                }
+                let message_id = update["messageId"].as_str().map(str::to_owned);
+                let reuse = self
+                    .acp
+                    .text
+                    .as_ref()
+                    .is_some_and(|(_, open_thinking, open_id)| {
+                        *open_thinking == thinking
+                            && (message_id.is_none() || *open_id == message_id)
+                    });
+                if !reuse {
+                    self.acp_close_text(events);
+                    let id = protocol::id();
+                    self.start(
+                        if thinking {
+                            json!({"type": "reasoning", "id": id, "summary": [], "content": [""]})
+                        } else {
+                            agent_message(&id)
+                        },
+                        events,
+                    );
+                    self.acp.text = Some((id, thinking, message_id));
+                }
+                let id = self.acp.text.as_ref().unwrap().0.clone();
+                self.text_delta(&id, &text, thinking, events);
+            }
+            Some("tool_call" | "tool_call_update") => self.acp_tool(update, events),
+            Some("plan") => {
+                let plan: Vec<Value> = update["entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| {
+                        let status = match entry["status"].as_str() {
+                            Some("completed") => "completed",
+                            Some("in_progress") => "inProgress",
+                            _ => "pending",
+                        };
+                        json!({"step": entry["content"].as_str().unwrap_or(""), "status": status})
+                    })
+                    .collect();
+                events.push(self.event(
+                    "turn/plan/updated",
+                    json!({"explanation": null, "plan": plan}),
+                ));
+            }
+            Some("compaction_update") if update["status"] == "completed" => {
+                let id = protocol::id();
+                self.start(json!({"type": "contextCompaction", "id": id}), events);
+                self.complete(&id, events);
+            }
+            Some("notice") => {
+                if let Some(title) = update["title"].as_str() {
+                    events.push(self.event("warning", json!({"message": title})));
+                }
+            }
+            // Mode, command, config, session-info and usage updates have no item.
+            _ => {}
+        }
+    }
+
+    fn acp_close_text(&mut self, events: &mut Vec<Value>) {
+        if let Some((id, _, _)) = self.acp.text.take() {
+            self.complete(&id, events);
+        }
+    }
+
+    fn acp_tool(&mut self, update: &Value, events: &mut Vec<Value>) {
+        let Some(id) = update["toolCallId"].as_str().map(str::to_owned) else {
+            return;
+        };
+        self.acp_close_text(events);
+        if update["desktopTool"] == true {
+            self.acp.skipped.insert(id);
+            return;
+        }
+        if self.acp.skipped.contains(&id) || self.completed.contains(&id) {
+            return;
+        }
+        let call = self
+            .acp
+            .tools
+            .entry(id.clone())
+            .or_insert_with(|| json!({}));
+        crate::acp::merge_tool(call, update);
+        if call["itemKind"].is_null() {
+            call["itemKind"] = json!(call["kind"].as_str().unwrap_or("other"));
+        }
+        let call = call.clone();
+        let item = self.acp_item(&id, &call);
+        let output = (item["type"] == "commandExecution")
+            .then(|| item["aggregatedOutput"].as_str().unwrap_or("").to_owned());
+        if let Some(existing) = self.items.iter_mut().find(|v| v["id"] == id) {
+            // Refresh fields as the agent fills in input, content and status.
+            *existing = item;
+        } else {
+            self.start(item, events);
+        }
+        if let Some(output) = output {
+            let sent = self.acp.output.entry(id.clone()).or_default();
+            if output.len() > *sent && output.is_char_boundary(*sent) {
+                let delta = output[*sent..].to_owned();
+                *sent = output.len();
+                events.push(self.event(
+                    "item/commandExecution/outputDelta",
+                    json!({"itemId": id, "delta": delta}),
+                ));
+            }
+        }
+        if matches!(call["status"].as_str(), Some("completed" | "failed")) {
+            self.complete(&id, events);
+        }
+    }
+
+    /// The Codex item for an accumulated ACP tool call.
+    fn acp_item(&self, id: &str, call: &Value) -> Value {
+        let status = match call["status"].as_str() {
+            Some("completed") => "completed",
+            Some("failed") => "failed",
+            _ => "inProgress",
+        };
+        let text = call["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|content| content["type"] == "content")
+            .map(|content| acp_content_text(&content["content"]))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let duration = self
+            .started_at
+            .get(id)
+            .filter(|_| status != "inProgress")
+            .map(|start| now_ms().saturating_sub(*start));
+        let diffs: Vec<&Value> = call["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|content| content["type"] == "diff")
+            .collect();
+        // An item keeps the type chosen when it started, even if a later
+        // update reports a different kind.
+        match call["itemKind"].as_str() {
+            Some("execute") => {
+                let raw = &call["rawOutput"];
+                let output = if text.is_empty() {
+                    match raw {
+                        Value::String(output) => output.clone(),
+                        _ => raw["stdout"]
+                            .as_str()
+                            .or(raw["output"].as_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                    }
+                } else {
+                    text
+                };
+                let exit_code = ["exitCode", "exit_code", "code"]
+                    .iter()
+                    .find_map(|key| raw[*key].as_i64());
+                json!({"type": "commandExecution", "id": id, "pluginId": null, "scriptPath": null,
+                    "command": crate::acp::command_text(call),
+                    "cwd": call["rawInput"]["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| self.cwd.clone()),
+                    "processId": null, "source": "agent", "status": status, "commandActions": [],
+                    "aggregatedOutput": if output.is_empty() && status == "inProgress" { Value::Null } else { json!(output) },
+                    "exitCode": exit_code, "durationMs": duration})
+            }
+            Some(kind @ ("edit" | "delete" | "move")) => {
+                let mut changes: Vec<Value> = diffs
+                    .iter()
+                    .map(|diff| {
+                        let path = diff["path"].as_str().unwrap_or("");
+                        let before = diff["oldText"].as_str();
+                        let after = diff["newText"].as_str().unwrap_or("");
+                        let change_kind = if kind == "delete" {
+                            json!({"type": "delete"})
+                        } else if before.is_none() {
+                            json!({"type": "add"})
+                        } else {
+                            json!({"type": "update", "move_path": null})
+                        };
+                        let diff = similar::TextDiff::from_lines(before.unwrap_or(""), after)
+                            .unified_diff()
+                            .header(path, path)
+                            .to_string();
+                        json!({"path": path, "kind": change_kind, "diff": diff})
+                    })
+                    .collect();
+                if changes.is_empty() {
+                    let locations = call["locations"].as_array().cloned().unwrap_or_default();
+                    let target = locations.get(1).and_then(|l| l["path"].as_str());
+                    changes = locations
+                        .iter()
+                        .take(1)
+                        .filter_map(|location| location["path"].as_str())
+                        .map(|path| {
+                            let change_kind = if kind == "delete" {
+                                json!({"type": "delete"})
+                            } else {
+                                json!({"type": "update", "move_path": target})
+                            };
+                            json!({"path": path, "kind": change_kind, "diff": ""})
+                        })
+                        .collect();
+                }
+                json!({"type": "fileChange", "id": id, "changes": changes, "status": status})
+            }
+            _ => {
+                let mut content = vec![];
+                if !text.is_empty() {
+                    content.push(json!({"type": "inputText", "text": text}));
+                }
+                json!({"type": "dynamicToolCall", "id": id, "namespace": crate::protocol::provider().id,
+                    "tool": call["title"].as_str().or(call["name"].as_str()).unwrap_or("tool"),
+                    "arguments": if call["rawInput"].is_null() { json!({}) } else { call["rawInput"].clone() },
+                    "status": status,
+                    "contentItems": if status == "inProgress" && content.is_empty() { Value::Null } else { json!(content) },
+                    "success": match status { "completed" => json!(true), "failed" => json!(false), _ => Value::Null },
+                    "durationMs": duration})
+            }
+        }
     }
 
     pub fn finish(&mut self) -> Vec<Value> {
@@ -612,6 +865,33 @@ fn normalize_visualization(text: &str) -> String {
             line.to_owned()
         })
         .collect()
+}
+
+/// Displayable text of one ACP content block.
+fn acp_content_text(block: &Value) -> String {
+    match block["type"].as_str() {
+        Some("text") => block["text"].as_str().unwrap_or("").to_owned(),
+        Some("resource_link") => format!(
+            "[{}]({})",
+            block["title"]
+                .as_str()
+                .or(block["name"].as_str())
+                .unwrap_or("resource"),
+            block["uri"].as_str().unwrap_or("")
+        ),
+        Some("resource") => block["resource"]["text"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "[{}]",
+                    block["resource"]["uri"].as_str().unwrap_or("resource")
+                )
+            }),
+        Some("image") => "[image]".into(),
+        Some("audio") => "[audio]".into(),
+        _ => String::new(),
+    }
 }
 
 fn agent_message(id: &str) -> Value {

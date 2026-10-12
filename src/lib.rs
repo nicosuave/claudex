@@ -1,5 +1,7 @@
+pub mod acp;
 pub mod approvals;
 pub mod attachments;
+pub mod auto_review;
 pub mod backend;
 pub mod commands;
 pub mod desktop;

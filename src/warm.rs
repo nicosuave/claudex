@@ -1,4 +1,4 @@
-//! Claude processes kept between turns.
+//! Backend processes (Claude or an ACP agent) kept between turns.
 //!
 //! Every Claude launch renders its request prefix again: MCP servers race to
 //! connect, and the Codex plugin catalog is rebuilt. Any difference invalidates
@@ -106,6 +106,17 @@ fn quiet(event: &BackendEvent) -> bool {
                 frame["subtype"] != "session_state_changed" || frame["state"] == "idle"
             }
             Some("rate_limit_event") => true,
+            // ACP agents announce commands, modes, config, titles and usage while idle.
+            Some("acp") => matches!(
+                frame["update"]["sessionUpdate"].as_str(),
+                Some(
+                    "available_commands_update"
+                        | "current_mode_update"
+                        | "config_option_update"
+                        | "session_info_update"
+                        | "usage_update"
+                )
+            ),
             _ => false,
         },
         BackendEvent::Exited { .. } => false,

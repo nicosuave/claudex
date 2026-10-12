@@ -11,3 +11,8 @@ see licenses/Codex-Apache-2.0.txt. It is unmodified output from
 
 The facade's original source is licensed under LICENSE. Claude Code is a
 separate executable and is not redistributed by this project.
+
+protocol/codex-guardian/policy_template.md and policy.md are copied unmodified
+from OpenAI Codex (codex-rs/core/src/guardian, commit ef00014a46) under the
+Apache License 2.0; see licenses/Codex-Apache-2.0.txt. The facade uses them as
+the policy for automatic review of ACP agent permission requests.

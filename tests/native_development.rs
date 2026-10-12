@@ -28,6 +28,7 @@ async fn native_workspace_tls_cache_and_local_server() {
             "--tools=Bash".into(),
         ],
         initialize_timeout: Duration::from_secs(30),
+        protocol: Default::default(),
     };
     let options = SessionOptions {
         state_dir: fixture.path().join("state"),

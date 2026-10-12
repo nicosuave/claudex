@@ -89,10 +89,34 @@ Useful options:
 | `--claude-arg=--safe-mode` | Forward an administrator-selected argument; repeat as needed |
 | `--initialize-timeout-seconds 60` | Claude control handshake deadline |
 | `--approval-timeout-seconds 300` | Deny unanswered permission requests after this much connected time |
+| `--acp-agent opencode` | Serve an [Agent Client Protocol](https://agentclientprotocol.com) agent instead of Claude (see below) |
+| `--acp-arg=acp` | Forward an argument to the ACP agent; repeat as needed |
+| `--provider-id`, `--provider-name` | Model provider reported to Codex for an ACP agent (default: the executable name) |
+| `--auto-review-model sonnet` | Claude model that reviews an ACP agent's permission requests when a thread selects automatic review |
 | `--idle-session-timeout-seconds 3600` | Keep a thread's Claude process between turns so its prompt cache stays valid; `0` starts a process per turn |
 | `--max-idle-sessions 8` | Idle Claude processes kept across threads; the oldest closes first |
 
-State defaults to `~/.local/state/claude-codex-server`, independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
+State defaults to `~/.local/state/claude-codex-server` (`claude-codex-server-<provider-id>` for an ACP agent), independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
+
+## Other agents over ACP
+
+The same facade can put any [Agent Client Protocol](https://agentclientprotocol.com) v1 agent behind Codex desktop instead of Claude: OpenCode, Gemini CLI, Goose, Claude Code's ACP adapter, and others. Each agent runs as its own facade with its own threads:
+
+```sh
+claudex app-server --stdio --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+claudex app-server --stdio --acp-agent gemini --acp-arg=--experimental-acp --provider-name Gemini
+```
+
+For the desktop, install one connection per agent. Each gets its own LaunchAgent, state, SSH key and host, `claude-codex-<provider-id>`, next to the Claude connection:
+
+```sh
+claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+# then select claude-codex-opencode in Codex Settings > Connections
+```
+
+`doctor`, `service` and `uninstall` take the same `--acp-agent`/`--provider-id` flags to select the instance. Sign in with the agent's own CLI first; a turn that needs authentication fails with the sign-in methods the agent advertises.
+
+The agent runs its own tools, so threads use full access and the agent's permission requests become Codex approvals. Models and reasoning effort come from the agent's session config options, and desktop dynamic tools reach the agent as a stdio MCP server. Fork works only at the latest turn and only for agents that support it; rollback, workspace sandboxing and structured output are refused. Automatic approval review works for ACP agents too: Claude reviews each agent permission request against the Codex guardian policy (`--auto-review-model`, default `sonnet`). See [COMPATIBILITY.md](COMPATIBILITY.md#acp-agents) for the full mapping.
 
 ## Minimal client exchange
 

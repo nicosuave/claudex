@@ -37,6 +37,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/fork",
     "thread/revert",
     "thread/rollback",
+    "thread/approveGuardianDeniedAction",
     "thread/attachment/add",
     "thread/attachment/list",
     "thread/attachment/remove",
@@ -235,6 +236,28 @@ impl Schemas {
         }
         Ok(())
     }
+}
+
+/// The model provider this process serves. One process serves one backend, so
+/// this is fixed at startup: Claude by default, or a configured ACP agent.
+#[derive(Clone, Debug)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+}
+
+static PROVIDER: OnceLock<Provider> = OnceLock::new();
+
+/// Must be called before the server starts; later calls are ignored.
+pub fn set_provider(provider: Provider) {
+    let _ = PROVIDER.set(provider);
+}
+
+pub fn provider() -> &'static Provider {
+    PROVIDER.get_or_init(|| Provider {
+        id: "anthropic".into(),
+        name: "Claude Code".into(),
+    })
 }
 
 pub fn new_turn(turn_id: &str) -> Value {

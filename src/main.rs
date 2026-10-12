@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use claude_codex_server::{
-    backend::BackendConfig,
+    backend::{BackendConfig, BackendProtocol},
     server::{Event, Server, ServerConfig},
     store::Store,
     transport,
@@ -42,8 +42,26 @@ struct Args {
     /// Separate state directory; never points at or modifies CODEX_HOME.
     #[arg(long, env = "CLAUDE_CODEX_HOME", global = true)]
     state_dir: Option<PathBuf>,
-    #[arg(long, default_value = "sonnet", global = true)]
-    model: String,
+    /// Default model: sonnet for Claude; the agent's own default for ACP agents.
+    #[arg(long, global = true)]
+    model: Option<String>,
+    /// Serve an Agent Client Protocol (v1) agent instead of Claude, e.g. `opencode`.
+    #[arg(long, global = true)]
+    acp_agent: Option<PathBuf>,
+    /// Passed to the ACP agent; repeat for each argument, e.g. `--acp-arg=acp`.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        global = true,
+        requires = "acp_agent"
+    )]
+    acp_arg: Vec<String>,
+    /// Model provider id reported to Codex (default: the agent executable name).
+    #[arg(long, global = true, requires = "acp_agent")]
+    provider_id: Option<String>,
+    /// Model provider display name (default: the provider id).
+    #[arg(long, global = true, requires = "acp_agent")]
+    provider_name: Option<String>,
     #[arg(long, default_value_t = 60, global = true)]
     initialize_timeout_seconds: u64,
     #[arg(long, default_value_t = 300, global = true)]
@@ -55,6 +73,12 @@ struct Args {
     /// Idle Claude processes kept across all threads; the oldest closes first.
     #[arg(long, default_value_t = 8, global = true)]
     max_idle_sessions: usize,
+    /// Claude model that automatically reviews ACP agent permission requests.
+    #[arg(long, default_value = "sonnet", global = true)]
+    auto_review_model: String,
+    /// Deadline for one automatic review; it then fails closed.
+    #[arg(long, default_value_t = 90, global = true)]
+    auto_review_timeout_seconds: u64,
     /// Replace PATH with the one the user's interactive login shell configures,
     /// so a LaunchAgent-started server matches the user's terminal.
     #[arg(long, global = true)]
@@ -65,6 +89,13 @@ struct Args {
 enum Command {
     #[command(hide = true)]
     SandboxProxyConnect { host: String, port: u16 },
+    /// Relay an ACP agent's stdio MCP connection to the desktop tool bridge.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    McpBridge {
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Run the Codex-compatible app-server (also the default without a command).
     AppServer {
         #[command(subcommand)]
@@ -152,23 +183,41 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
+    let acp = args
+        .acp_agent
+        .clone()
+        .map(|executable| {
+            claude_codex_server::acp::AcpAgent::new(
+                executable,
+                args.acp_arg.clone(),
+                args.provider_id.clone(),
+                args.provider_name.clone(),
+                args.model.clone(),
+                args.initialize_timeout_seconds,
+            )
+        })
+        .transpose()?;
     if let Some(Command::SandboxProxyConnect { host, port }) = &args.command {
         return claude_codex_server::ssh_proxy::connect(host, *port);
     }
     #[cfg(unix)]
+    if let Some(Command::McpBridge { socket }) = &args.command {
+        return claude_codex_server::acp::run_bridge(socket).await;
+    }
+    #[cfg(unix)]
     match &args.command {
         Some(Command::Install { no_ssh }) => {
-            return claude_codex_server::install::Installation::current()?
+            return claude_codex_server::install::Installation::current(acp.clone())?
                 .install(&args.claude, !no_ssh)
                 .await;
         }
         Some(Command::Doctor) => {
-            return claude_codex_server::install::Installation::current()?
+            return claude_codex_server::install::Installation::current(acp.clone())?
                 .doctor(&args.claude)
                 .await;
         }
         Some(Command::Service { action, force }) => {
-            return claude_codex_server::install::Installation::current()?
+            return claude_codex_server::install::Installation::current(acp.clone())?
                 .service(*action, *force)
                 .await;
         }
@@ -184,7 +233,7 @@ async fn run(args: Args) -> Result<()> {
             return claude_codex_server::router::run(codex, codex_args, socket, log.clone()).await;
         }
         Some(Command::Uninstall { force }) => {
-            return claude_codex_server::install::Installation::current()?
+            return claude_codex_server::install::Installation::current(acp.clone())?
                 .uninstall(*force)
                 .await;
         }
@@ -221,23 +270,65 @@ async fn run(args: Args) -> Result<()> {
     } else {
         args.listen
     };
+    // Each agent keeps its own threads; one process owns a state directory.
+    let state_name = match &acp {
+        Some(agent) => format!("claude-codex-server-{}", agent.provider_id),
+        None => "claude-codex-server".to_owned(),
+    };
     let state = args.state_dir.unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".local/state/claude-codex-server")
+            .join(".local/state")
+            .join(&state_name)
     });
+    // Claude threads use Claude's native auto mode; ACP agents are reviewed by Claude.
+    let reviewer = acp
+        .is_some()
+        .then(|| claude_codex_server::auto_review::ReviewerConfig {
+            executable: args.claude.clone(),
+            model: args.auto_review_model.clone(),
+            timeout: Duration::from_secs(args.auto_review_timeout_seconds),
+        });
+    let (backend, default_model) = match acp {
+        Some(agent) => {
+            if !args.claude_arg.is_empty() {
+                bail!("--claude-arg does not apply to an ACP agent; use --acp-arg");
+            }
+            claude_codex_server::protocol::set_provider(claude_codex_server::protocol::Provider {
+                id: agent.provider_id,
+                name: agent.provider_name,
+            });
+            (
+                BackendConfig {
+                    executable: agent.executable,
+                    extra_args: agent.args,
+                    initialize_timeout: Duration::from_secs(args.initialize_timeout_seconds),
+                    protocol: BackendProtocol::Acp,
+                },
+                agent
+                    .model
+                    .unwrap_or_else(|| claude_codex_server::acp::DEFAULT_MODEL.into()),
+            )
+        }
+        None => (
+            BackendConfig {
+                executable: args.claude,
+                extra_args: args.claude_arg,
+                initialize_timeout: Duration::from_secs(args.initialize_timeout_seconds),
+                protocol: BackendProtocol::Claude,
+            },
+            args.model.unwrap_or_else(|| "sonnet".into()),
+        ),
+    };
     let config = ServerConfig {
-        backend: BackendConfig {
-            executable: args.claude,
-            extra_args: args.claude_arg,
-            initialize_timeout: Duration::from_secs(args.initialize_timeout_seconds),
-        },
+        backend,
         default_cwd: std::env::current_dir()?,
-        default_model: args.model,
+        default_model,
         approval_timeout: Duration::from_secs(args.approval_timeout_seconds),
         idle_session_timeout: Duration::from_secs(args.idle_session_timeout_seconds),
         max_idle_sessions: args.max_idle_sessions,
+        reviewer,
     };
     let store = Store::open(state)?;
     let (events, receiver) = mpsc::channel(512);
