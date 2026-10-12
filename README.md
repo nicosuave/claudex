@@ -88,6 +88,7 @@ Useful options:
 | `--acp-agent opencode` | Serve an [Agent Client Protocol](https://agentclientprotocol.com) agent instead of Claude (see below) |
 | `--acp-arg=acp` | Forward an argument to the ACP agent; repeat as needed |
 | `--provider-id`, `--provider-name` | Model provider reported to Codex for an ACP agent (default: the executable name) |
+| `--auto-review-model sonnet` | Claude model that reviews an ACP agent's permission requests when a thread selects automatic review |
 
 State defaults to `~/.local/state/claude-codex-server` (`claude-codex-server-<provider-id>` for an ACP agent), independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
 
@@ -109,7 +110,7 @@ claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
 
 `doctor`, `service` and `uninstall` take the same `--acp-agent`/`--provider-id` flags to select the instance. Sign in with the agent's own CLI first; a turn that needs authentication fails with the sign-in methods the agent advertises.
 
-The agent runs its own tools, so threads use full access and the agent's permission requests become Codex approvals. Models and reasoning effort come from the agent's session config options, and desktop dynamic tools reach the agent as a stdio MCP server. Fork works only at the latest turn and only for agents that support it; rollback, workspace sandboxing, automatic review and structured output are refused. See [COMPATIBILITY.md](COMPATIBILITY.md#acp-agents) for the full mapping.
+The agent runs its own tools, so threads use full access and the agent's permission requests become Codex approvals. Models and reasoning effort come from the agent's session config options, and desktop dynamic tools reach the agent as a stdio MCP server. Fork works only at the latest turn and only for agents that support it; rollback, workspace sandboxing and structured output are refused. Automatic approval review works for ACP agents too: Claude reviews each agent permission request against the Codex guardian policy (`--auto-review-model`, default `sonnet`). See [COMPATIBILITY.md](COMPATIBILITY.md#acp-agents) for the full mapping.
 
 ## Minimal client exchange
 

@@ -35,6 +35,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/fork",
     "thread/revert",
     "thread/rollback",
+    "thread/approveGuardianDeniedAction",
     "thread/attachment/add",
     "thread/attachment/list",
     "thread/attachment/remove",

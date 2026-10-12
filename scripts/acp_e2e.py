@@ -33,6 +33,7 @@ class Facade:
         )
         self.frames = queue.Queue()
         self.serial = 0
+        self.reviews = []
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -81,6 +82,8 @@ class Facade:
                 else:
                     answer = {"decision": "accept"}
                 self.send({"id": frame["id"], "result": answer})
+            elif method == "item/autoApprovalReview/completed":
+                self.reviews.append(frame["params"]["review"]["status"])
             elif method == "turn/completed" and frame["params"]["turn"]["id"] == turn_id:
                 return frame["params"]["turn"]
 
@@ -106,7 +109,11 @@ def main():
                                   "capabilities": {"experimentalApi": True}})
     models = facade.request("model/list", {})["data"]
     check("model/list", models, f"{[m['id'] for m in models][:8]}")
-    thread = facade.request("thread/start", {"cwd": workspace, "sandbox": "danger-full-access"})
+    auto_review = os.environ.get("E2E_AUTO_REVIEW") == "1"
+    start = {"cwd": workspace, "sandbox": "danger-full-access"}
+    if auto_review:
+        start["approvalsReviewer"] = "auto_review"
+    thread = facade.request("thread/start", start)
     thread_id = thread["thread"]["id"]
     check("thread/start", thread["modelProvider"] != "anthropic", thread["modelProvider"])
 
@@ -129,6 +136,9 @@ def main():
     kinds = sorted({item["type"] for item in third["items"]})
     check("tool turn writes file", third["status"] == "completed" and content == "hi from acp",
           f"status={third['status']} content={content!r} items={kinds} approvals={sorted(set(approvals))} error={third.get('error')}")
+    if auto_review:
+        check("automatic review decided instead of the user", facade.reviews and not approvals,
+              f"reviews={facade.reviews} user approvals={approvals}")
 
     turns = 3
     chosen = os.environ.get("E2E_MODEL") or next((m["id"] for m in models if not m["isDefault"]), None)

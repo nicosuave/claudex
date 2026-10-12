@@ -136,7 +136,7 @@ An [ACP](https://agentclientprotocol.com) agent installs as a separate connectio
 claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
 ```
 
-This creates `~/Library/Application Support/claude-codex-<provider-id>`, LaunchAgent `com.claude-codex.desktop.<provider-id>` and SSH host `claude-codex-<provider-id>` (here `claude-codex-opencode`), each independent of the Claude installation. Pass the same `--acp-agent` (or `--provider-id`) to `doctor`, `service` and `uninstall` to select that instance. `--provider-id` defaults to the executable name. Use `--initialize-timeout-seconds` for agents that start slowly.
+This creates `~/Library/Application Support/claude-codex-<provider-id>`, LaunchAgent `com.claude-codex.desktop.<provider-id>` and SSH host `claude-codex-<provider-id>` (here `claude-codex-opencode`), each independent of the Claude installation. Pass the same `--acp-agent` (or `--provider-id`) to `doctor`, `service` and `uninstall` to select that instance. `--provider-id` defaults to the executable name. Use `--initialize-timeout-seconds` for agents that start slowly. Automatic review for the agent uses the installed, signed-in Claude Code CLI as its reviewer; without it, every automatically reviewed request is denied (fail closed) and can be approved from the desktop.
 
 ## Manage the service
 

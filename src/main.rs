@@ -66,6 +66,12 @@ struct Args {
     initialize_timeout_seconds: u64,
     #[arg(long, default_value_t = 300, global = true)]
     approval_timeout_seconds: u64,
+    /// Claude model that automatically reviews ACP agent permission requests.
+    #[arg(long, default_value = "sonnet", global = true)]
+    auto_review_model: String,
+    /// Deadline for one automatic review; it then fails closed.
+    #[arg(long, default_value_t = 90, global = true)]
+    auto_review_timeout_seconds: u64,
     /// Replace PATH with the one the user's interactive login shell configures,
     /// so a LaunchAgent-started server matches the user's terminal.
     #[arg(long, global = true)]
@@ -225,6 +231,14 @@ async fn run(args: Args) -> Result<()> {
             .join(".local/state")
             .join(&state_name)
     });
+    // Claude threads use Claude's native auto mode; ACP agents are reviewed by Claude.
+    let reviewer = acp
+        .is_some()
+        .then(|| claude_codex_server::auto_review::ReviewerConfig {
+            executable: args.claude.clone(),
+            model: args.auto_review_model.clone(),
+            timeout: Duration::from_secs(args.auto_review_timeout_seconds),
+        });
     let (backend, default_model) = match acp {
         Some(agent) => {
             if !args.claude_arg.is_empty() {
@@ -261,6 +275,7 @@ async fn run(args: Args) -> Result<()> {
         default_cwd: std::env::current_dir()?,
         default_model,
         approval_timeout: Duration::from_secs(args.approval_timeout_seconds),
+        reviewer,
     };
     let store = Store::open(state)?;
     let (events, receiver) = mpsc::channel(512);

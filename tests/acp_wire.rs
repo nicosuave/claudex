@@ -44,6 +44,7 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
             "PluginListResponse",
             "PluginInstalledResponse",
             "PluginSearchResponse",
+            "ThreadApproveGuardianDeniedActionResponse",
         ] {
             let mut schema = root["definitions"]["v2"][name].clone();
             if schema.is_null() {
@@ -86,6 +87,7 @@ fn response_schema(method: &str) -> &'static str {
         "plugin/list" => "PluginListResponse",
         "plugin/installed" => "PluginInstalledResponse",
         "plugin/search" => "PluginSearchResponse",
+        "thread/approveGuardianDeniedAction" => "ThreadApproveGuardianDeniedActionResponse",
         _ => panic!("unexpected success for {method}"),
     }
 }
@@ -118,6 +120,10 @@ impl Client {
                 "5",
                 "--approval-timeout-seconds",
                 "10",
+                "--claude",
+                env!("CARGO_BIN_EXE_fake-reviewer"),
+                "--auto-review-timeout-seconds",
+                "3",
             ])
             .arg(format!(
                 "--acp-arg=--store={}",
@@ -807,13 +813,9 @@ async fn settings_an_agent_cannot_honor_are_rejected() {
     for params in [
         json!({"sandbox":"workspace-write"}),
         json!({"permissions":":workspace"}),
-        json!({"sandbox":"danger-full-access","approvalsReviewer":"auto_review"}),
     ] {
         let message = client.error("thread/start", params.clone()).await;
-        assert!(
-            message.contains("cannot confine") || message.contains("approvalsReviewer=user"),
-            "{params}: {message}"
-        );
+        assert!(message.contains("cannot confine"), "{params}: {message}");
     }
     let thread = client.thread(full_access()).await;
     assert!(
@@ -983,4 +985,158 @@ async fn agent_updates_stop_reasons_and_failures_are_reported() {
         );
         client.close().await;
     }
+}
+
+fn auto_review() -> Value {
+    json!({"sandbox":"danger-full-access","approvalsReviewer":"auto_review"})
+}
+
+/// The completed review notifications of a turn, in order.
+fn reviews(client: &Client, turn: &str) -> Vec<Value> {
+    client.turn_events(turn, "item/autoApprovalReview/completed")
+}
+
+#[tokio::test]
+async fn automatic_review_approves_or_denies_agent_requests_without_prompting() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path(), &[]).await;
+    let requirements = client.ok("configRequirements/read", Value::Null).await;
+    assert_eq!(
+        requirements["requirements"]["allowedApprovalsReviewers"],
+        json!(["user", "auto_review", "guardian_subagent"])
+    );
+    let thread = client.thread(auto_review()).await;
+
+    let turn = client.start(&thread, "exec:ls -la").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec yes approved-context=false");
+    let started = client.turn_events(&turn, "item/autoApprovalReview/started");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["params"]["review"]["status"], "inProgress");
+    assert_eq!(
+        started[0]["params"]["action"],
+        json!({"type":"command","source":"shell","command":"ls -la",
+            "cwd":started[0]["params"]["action"]["cwd"]})
+    );
+    let review = &reviews(&client, &turn)[0]["params"];
+    assert_eq!(review["review"]["status"], "approved");
+    assert_eq!(review["review"]["riskLevel"], "low");
+    assert_eq!(review["decisionSource"], "agent");
+    assert_eq!(review["reviewId"], started[0]["params"]["reviewId"]);
+    assert_eq!(
+        review["targetItemId"],
+        Client::item(&completed, "commandExecution")["id"]
+    );
+    // The reviewer decides; the user is never asked.
+    assert!(
+        client
+            .turn_events(&turn, "item/commandExecution/requestApproval")
+            .is_empty()
+    );
+
+    let turn = client.start(&thread, "exec:rm -rf build").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec no approved-context=false");
+    let denied = reviews(&client, &turn)[0]["params"].clone();
+    assert_eq!(denied["review"]["status"], "denied");
+    assert_eq!(denied["review"]["riskLevel"], "high");
+    assert!(
+        denied["review"]["rationale"]
+            .as_str()
+            .unwrap()
+            .contains("not requested")
+    );
+
+    // The user approves the denied action: the agent learns of it with its
+    // next input, and that exact action is then allowed without another review.
+    let event = json!({"id":denied["reviewId"],"turn_id":turn,"status":"denied",
+        "action":denied["action"]});
+    client
+        .ok(
+            "thread/approveGuardianDeniedAction",
+            json!({"threadId":thread,"event":event}),
+        )
+        .await;
+    assert!(
+        client
+            .error(
+                "thread/approveGuardianDeniedAction",
+                json!({"threadId":thread,"event":event})
+            )
+            .await
+            .contains("not found")
+    );
+    let turn = client.start(&thread, "exec:rm -rf build").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec yes approved-context=true");
+    assert!(
+        reviews(&client, &turn).is_empty(),
+        "the session grant applies"
+    );
+    // A different payload is reviewed again, and later reviews see the approval.
+    let turn = client.start(&thread, "exec:rm -rf dist").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec yes approved-context=false");
+    assert_eq!(
+        reviews(&client, &turn)[0]["params"]["review"]["userAuthorization"],
+        "high"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn automatic_review_fails_closed_and_stops_repeated_denials() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path(), &[]).await;
+    let thread = client.thread(auto_review()).await;
+
+    let turn = client.start(&thread, "exec:crash-review").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec no approved-context=false");
+    let review = &reviews(&client, &turn)[0]["params"]["review"];
+    assert_eq!(review["status"], "denied");
+    assert!(
+        review["rationale"]
+            .as_str()
+            .unwrap()
+            .contains("reviewer exploded"),
+        "{review}"
+    );
+
+    let turn = client.start(&thread, "exec:slow-review").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(Client::reply(&completed), "exec no approved-context=false");
+    assert_eq!(
+        reviews(&client, &turn)[0]["params"]["review"]["status"],
+        "timedOut"
+    );
+
+    // Three consecutive denials in a turn interrupt it, as in Codex.
+    let turn = client.start(&thread, "exec*4:rm -rf /").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "interrupted", "{completed}");
+    assert_eq!(reviews(&client, &turn).len(), 3);
+    assert!(
+        client
+            .history
+            .iter()
+            .any(|v| v["method"] == "guardianWarning" && v["params"]["threadId"] == thread)
+    );
+
+    // An interrupted review is reported as aborted.
+    let turn = client.start(&thread, "exec:slow-review").await;
+    client
+        .until(|v| {
+            v["method"] == "item/autoApprovalReview/started" && v["params"]["turnId"] == turn
+        })
+        .await;
+    client
+        .ok("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+        .await;
+    assert_eq!(client.completed(&turn).await["status"], "interrupted");
+    assert_eq!(
+        reviews(&client, &turn)[0]["params"]["review"]["status"],
+        "aborted"
+    );
+    client.close().await;
 }

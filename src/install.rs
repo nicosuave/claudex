@@ -102,9 +102,13 @@ impl Installation {
 
     pub async fn install(&self, claude: &Path) -> Result<()> {
         let binary = std::env::current_exe()?.canonicalize()?;
-        // An ACP installation runs its agent instead of Claude.
+        // An ACP installation runs its agent instead of Claude, and uses Claude,
+        // when installed, only to review the agent's permission requests.
         let (claude, agent) = match &self.acp {
-            Some(acp) => (None, Some(resolve_executable(&acp.executable)?)),
+            Some(acp) => (
+                resolve_executable(claude).ok(),
+                Some(resolve_executable(&acp.executable)?),
+            ),
             None => (Some(resolve_executable(claude)?), None),
         };
         let codex = genuine_codex()?;
@@ -114,7 +118,9 @@ impl Installation {
         if !plugin_home.is_absolute() {
             bail!("CLAUDE_CODEX_PLUGIN_HOME must be absolute");
         }
-        if let Some(claude) = &claude {
+        if self.acp.is_none()
+            && let Some(claude) = &claude
+        {
             check_claude(claude).await?;
         }
         check_codex(&codex).await?;

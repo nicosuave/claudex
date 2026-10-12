@@ -38,6 +38,11 @@ name = "fake-acp"
 path = "tests/fixtures/fake_acp.rs"
 required-features = ["test-backend"]
 
+[[bin]]
+name = "fake-reviewer"
+path = "tests/fixtures/fake_reviewer.rs"
+required-features = ["test-backend"]
+
 [features]
 test-backend = []
 

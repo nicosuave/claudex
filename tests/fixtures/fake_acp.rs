@@ -379,6 +379,47 @@ fn run_prompt(
         }
         call
     };
+    // `exec:CMD` (or `exec*N:CMD`) asks permission to run CMD, N times.
+    if let Some((count, shell)) = command
+        .strip_prefix("exec")
+        .and_then(|rest| rest.split_once(':'))
+    {
+        let count: usize = count.strip_prefix('*').map_or(1, |n| n.parse().unwrap());
+        let mut choices = vec![];
+        for index in 0..count {
+            let id = format!("call-exec-{}-{index}", session.prompts.len());
+            let raw = json!({"command": shell});
+            agent.update(
+                session_id,
+                tool(&id, "execute", "Run command", json!({"rawInput": raw})),
+            );
+            let choice = permission(
+                agent,
+                session_id,
+                json!({"toolCallId": id, "title": "Run command", "kind": "execute", "rawInput": raw}),
+            );
+            if choice == "cancelled" {
+                return ("cancelled", String::new(), None);
+            }
+            let status = if choice == "no" {
+                "failed"
+            } else {
+                "completed"
+            };
+            agent.update(
+                session_id,
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": status}),
+            );
+            choices.push(choice);
+        }
+        let approved_context = prompt_text(prompt).contains("The user has manually approved");
+        let reply = format!(
+            "exec {} approved-context={approved_context}",
+            choices.join(",")
+        );
+        message(agent, session_id, &reply);
+        return ("end_turn", reply, usage);
+    }
     let reply = match command.as_str() {
         "history" => {
             let full = session

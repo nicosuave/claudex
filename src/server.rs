@@ -26,6 +26,8 @@ pub struct ServerConfig {
     pub default_cwd: PathBuf,
     pub default_model: String,
     pub approval_timeout: Duration,
+    /// Reviews ACP permission requests when a thread selects automatic review.
+    pub reviewer: Option<crate::auto_review::ReviewerConfig>,
 }
 
 pub enum Event {
@@ -69,6 +71,10 @@ pub enum Event {
         thread_id: String,
         turn_id: String,
         grant: crate::approvals::SessionGrant,
+    },
+    AutoReviewFinished {
+        review_id: String,
+        outcome: crate::auto_review::Outcome,
     },
     Shutdown,
 }
@@ -118,6 +124,7 @@ struct ActiveTurn {
     input_admission: Arc<Mutex<InputAdmission>>,
     translator: Translator,
     agents: crate::subagents::Agents,
+    breaker: crate::auto_review::Breaker,
     interrupting: bool,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
@@ -163,6 +170,14 @@ impl Drop for PendingTimeout {
     }
 }
 
+/// A permission request awaiting its automatic review.
+struct Review {
+    pending: Pending,
+    action: Value,
+    target: Value,
+    started_ms: u64,
+}
+
 struct DynamicPending {
     message_id: Value,
     item: Value,
@@ -183,6 +198,8 @@ pub struct Server {
     connections: HashMap<u64, Connection>,
     active: HashMap<String, ActiveTurn>,
     pending: HashMap<String, Pending>,
+    /// Permission requests under automatic review, by review id.
+    reviews: HashMap<String, Review>,
     commands: crate::commands::CommandManager,
     command_cleanup: tokio::task::JoinSet<()>,
     events: mpsc::Sender<Event>,
@@ -208,6 +225,7 @@ impl Server {
             connections: HashMap::new(),
             active: HashMap::new(),
             pending: HashMap::new(),
+            reviews: HashMap::new(),
             commands: crate::commands::CommandManager::default(),
             command_cleanup: tokio::task::JoinSet::new(),
             events,
@@ -315,6 +333,9 @@ impl Server {
                             }
                         }
                     }
+                }
+                Event::AutoReviewFinished { review_id, outcome } => {
+                    self.finish_review(&review_id, outcome).await
                 }
                 Event::Shutdown => break,
             }
@@ -475,9 +496,9 @@ impl Server {
                 "ACP agents run their own tools, which this facade cannot confine to a workspace sandbox; use danger-full-access",
             ));
         }
-        if settings.approvals_reviewer != "user" {
+        if settings.approvals_reviewer != "user" && self.config.reviewer.is_none() {
             return Err(RpcError::invalid(
-                "Automatic approval review is a Claude feature; ACP agents support approvalsReviewer=user",
+                "Automatic approval review needs a Claude reviewer; start the facade with --claude",
             ));
         }
         Ok(())
@@ -1195,6 +1216,7 @@ impl Server {
                 self.start_turn(client, rpc_id, p, None).await?;
                 Ok(None)
             }
+            "thread/approveGuardianDeniedAction" => self.approve_denied_action(p).map(Some),
             "thread/queue/add"
             | "thread/queue/list"
             | "thread/queue/update"
@@ -1631,7 +1653,11 @@ impl Server {
                 json!({"requirements": {
                     "allowedSandboxModes": ["danger-full-access"],
                     "allowedApprovalPolicies": ["on-request", "never"],
-                    "allowedApprovalsReviewers": ["user"]
+                    "allowedApprovalsReviewers": if self.config.reviewer.is_some() {
+                        json!(["user", "auto_review", "guardian_subagent"])
+                    } else {
+                        json!(["user"])
+                    }
                 }})
             } else {
                 json!({"requirements": {
@@ -2065,6 +2091,13 @@ impl Server {
         let (codex_input, mut claude_input) = translate::user_input(&p["input"]).await?;
         record.tracks_turn_anchors = true;
         append_additional_context(&mut claude_input, &p["additionalContext"]);
+        // Context queued while the thread was idle precedes the new input.
+        for text in std::mem::take(&mut record.pending_context)
+            .into_iter()
+            .rev()
+        {
+            claude_input.insert(0, json!({"type":"text","text":text}));
+        }
         let turn_id = protocol::id();
         let turn = protocol::new_turn(&turn_id);
         let item = json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input});
@@ -2162,6 +2195,7 @@ impl Server {
                 translator: Translator::new(id, &turn_id, &record.settings.cwd)
                     .with_reasoning(record.settings.reasoning_summary.as_deref() != Some("none")),
                 agents: Default::default(),
+                breaker: Default::default(),
                 interrupting: false,
                 worker,
                 cancel,
@@ -2462,6 +2496,20 @@ impl Server {
                     "item/completed",
                     json!({"threadId":id,"turnId":active.id,"item":item,"completedAtMs":now_ms()}),
                 )],
+            );
+        }
+        let reviews: Vec<String> = self
+            .reviews
+            .iter()
+            .filter(|(_, review)| review.pending.thread_id == id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for review_id in reviews {
+            let review = self.reviews.remove(&review_id).unwrap();
+            self.review_completed(
+                &review_id,
+                &review,
+                json!({"status":"aborted","riskLevel":null,"userAuthorization":null,"rationale":null}),
             );
         }
         let pending: Vec<String> = self
@@ -3350,9 +3398,222 @@ impl Server {
                 .await;
             return;
         }
+        if self.acp()
+            && self.records[id].settings.approvals_reviewer == "auto_review"
+            && pending.questions.is_none()
+        {
+            self.start_review(id, pending);
+            return;
+        }
         self.pending.insert(rpc_id.clone(), pending);
         self.update_wait_status(id);
         self.deliver_pending(&rpc_id);
+    }
+
+    /// Review an ACP permission request instead of showing it to the user.
+    fn start_review(&mut self, id: &str, pending: Pending) {
+        // A turn being interrupted (for example by repeated denials) gets no
+        // further reviews; its remaining requests are refused.
+        if self.active[id].interrupting {
+            let _ = self.active[id]
+                .control
+                .try_send(Control::Reply(control_reply(
+                    &pending.claude_request_id,
+                    json!({"behavior":"deny","message":"The turn is being interrupted"}),
+                )));
+            return;
+        }
+        let review_id = format!("review-{}", protocol::id());
+        let record = &self.records[id];
+        let action = crate::auto_review::action(
+            &pending.tool,
+            &pending.input,
+            &record.settings.cwd,
+            &protocol::provider().id,
+        );
+        let target = pending.request["params"]["itemId"].clone();
+        let started_ms = now_ms();
+        self.emit(
+            id,
+            notification(
+                "item/autoApprovalReview/started",
+                json!({"threadId":id,"turnId":pending.turn_id,"reviewId":review_id,
+                    "targetItemId":target,"startedAtMs":started_ms,"action":action,
+                    "review":{"status":"inProgress","riskLevel":null,"userAuthorization":null,"rationale":null}}),
+            ),
+        );
+        let transcript = crate::auto_review::transcript(&record.turns);
+        let approved = record.approved_actions.clone();
+        let cwd = record.settings.cwd.clone();
+        let reviewer = self.config.reviewer.clone();
+        let events = self.events.clone();
+        let reviewed = action.clone();
+        let finished_id = review_id.clone();
+        tokio::spawn(async move {
+            let outcome = match reviewer {
+                Some(reviewer) => {
+                    crate::auto_review::review(&reviewer, &cwd, &transcript, &reviewed, &approved)
+                        .await
+                }
+                None => crate::auto_review::Outcome::Failed("no reviewer is configured".into()),
+            };
+            let _ = events
+                .send(Event::AutoReviewFinished {
+                    review_id: finished_id,
+                    outcome,
+                })
+                .await;
+        });
+        self.reviews.insert(
+            review_id,
+            Review {
+                pending,
+                action,
+                target,
+                started_ms,
+            },
+        );
+    }
+
+    fn review_completed(&self, review_id: &str, review: &Review, result: Value) {
+        let thread = &review.pending.thread_id;
+        self.emit(
+            thread,
+            notification(
+                "item/autoApprovalReview/completed",
+                json!({"threadId":thread,"turnId":review.pending.turn_id,"reviewId":review_id,
+                    "targetItemId":review.target,"startedAtMs":review.started_ms,"completedAtMs":now_ms(),
+                    "decisionSource":"agent","action":review.action,"review":result}),
+            ),
+        );
+    }
+
+    async fn finish_review(&mut self, review_id: &str, outcome: crate::auto_review::Outcome) {
+        let Some(review) = self.reviews.remove(review_id) else {
+            return;
+        };
+        let id = review.pending.thread_id.clone();
+        // A review that outlived its turn was already reported as aborted.
+        if self
+            .active
+            .get(&id)
+            .is_none_or(|active| active.id != review.pending.turn_id)
+        {
+            return;
+        }
+        self.review_completed(review_id, &review, outcome.review());
+        let allowed = outcome.allowed();
+        let data = if allowed {
+            json!({"behavior":"allow","updatedInput":review.pending.input})
+        } else {
+            json!({"behavior":"deny","message":outcome.denial_message()})
+        };
+        let active = self.active.get_mut(&id).unwrap();
+        let trip = active.breaker.record(!allowed);
+        let _ = active.control.try_send(Control::Reply(control_reply(
+            &review.pending.claude_request_id,
+            data,
+        )));
+        if allowed {
+            return;
+        }
+        let mut record = self.records[&id].clone();
+        record
+            .auto_review_denials
+            .push(json!({"reviewId":review_id,"tool":review.pending.tool,
+            "input":review.pending.input,"action":review.action}));
+        let excess = record.auto_review_denials.len().saturating_sub(20);
+        record.auto_review_denials.drain(..excess);
+        match self.store.save(&record) {
+            Ok(()) => {
+                self.records.insert(id.clone(), record);
+            }
+            Err(error) => self.emit(
+                &id,
+                notification(
+                    "warning",
+                    json!({"threadId":id,
+                "message":format!("The denied action cannot be approved later: {error}")}),
+                ),
+            ),
+        }
+        if trip {
+            self.emit(&id, notification("guardianWarning", json!({"threadId":id,
+                "message":"Automatic review denied several actions in a row, so this turn was interrupted. Review the denials, approve an action if you intend it, or give the agent new instructions."})));
+            let active = self.active.get_mut(&id).unwrap();
+            active.interrupting = true;
+            let _ = active.control.try_send(Control::Interrupt);
+        }
+    }
+
+    /// The user approves an action automatic review denied: allow that exact
+    /// action from now on in this thread, and tell the agent so it can retry.
+    fn approve_denied_action(&mut self, p: &Value) -> RpcResult<Value> {
+        supported_fields(p, &["threadId", "event"])?;
+        let id = required_str(p, "threadId")?;
+        if !self.acp() {
+            return Err(RpcError::invalid(
+                "Claude threads use Claude's native auto review; ask Claude to retry the action after approving it in chat",
+            ));
+        }
+        let review_id = required_str(&p["event"], "id")?;
+        if p["event"]["status"]
+            .as_str()
+            .is_some_and(|status| status != "denied")
+        {
+            return Err(RpcError::invalid("Only denied reviews can be approved"));
+        }
+        let mut record = self.record(id)?.clone();
+        let denial = record
+            .auto_review_denials
+            .iter()
+            .find(|denial| denial["reviewId"] == review_id)
+            .cloned()
+            .ok_or_else(|| RpcError::invalid("Denied review not found in this thread"))?;
+        let grant = crate::approvals::SessionGrant::new(
+            denial["tool"].as_str().unwrap_or(""),
+            &denial["input"],
+            &record.settings.cwd.to_string_lossy(),
+        );
+        if !record.session_grants.contains(&grant) {
+            record.session_grants.push(grant);
+        }
+        record
+            .auto_review_denials
+            .retain(|denial| denial["reviewId"] != review_id);
+        record.approved_actions.push(denial["action"].clone());
+        let excess = record.approved_actions.len().saturating_sub(20);
+        record.approved_actions.drain(..excess);
+        // The same instruction Codex gives its own agent.
+        let text = format!(
+            "The user has manually approved a specific action that was previously `Rejected`.\n\nTreat this as approval to perform that exact action in the same context in which it was originally requested.\nDo not assume this also authorizes similar operations with different payloads.\n\nApproved action:\n{}",
+            serde_json::to_string_pretty(&json!({"action":denial["action"],"outcome":"allowed"}))
+                .unwrap_or_default()
+        );
+        // Persist the grant before the agent can act on the approval.
+        self.store.save(&record).map_err(RpcError::internal)?;
+        let delivered = self.active.get(id).is_some_and(|active| {
+            let Ok(permit) = active.control.try_reserve() else {
+                return false;
+            };
+            let mut admission = active.input_admission.lock().unwrap();
+            if admission.closed {
+                return false;
+            }
+            admission.queued += 1;
+            permit.send(Control::UserInput(
+                json!({"type":"user","uuid":protocol::id(),
+                "session_id":record.session_id,"parent_tool_use_id":null,
+                "message":{"role":"user","content":[{"type":"text","text":text}]}}),
+            ));
+            true
+        });
+        if !delivered {
+            record.pending_context.push(text);
+            self.store.save(&record).map_err(RpcError::internal)?;
+        }
+        self.records.insert(id.to_owned(), record);
+        Ok(json!({}))
     }
 
     /// Resolution goes to the thread the request was shown on (a subagent's

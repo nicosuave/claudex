@@ -198,6 +198,15 @@ pub struct Record {
     pub token_usage: Value,
     #[serde(default)]
     pub tracks_request_usage: bool,
+    /// Recent automatic review denials: {reviewId, tool, input, action}.
+    #[serde(default)]
+    pub auto_review_denials: Vec<Value>,
+    /// Denied actions the user then approved; shown to later reviews.
+    #[serde(default)]
+    pub approved_actions: Vec<Value>,
+    /// Text delivered ahead of the next turn's input.
+    #[serde(default)]
+    pub pending_context: Vec<String>,
 }
 
 impl Record {
@@ -237,6 +246,9 @@ impl Record {
             item_times: BTreeMap::new(),
             token_usage: json!({"total": protocol::usage(0,0,0,0), "last": protocol::usage(0,0,0,0), "modelContextWindow": null}),
             tracks_request_usage: true,
+            auto_review_denials: vec![],
+            approved_actions: vec![],
+            pending_context: vec![],
         }
     }
     pub fn id(&self) -> &str {
