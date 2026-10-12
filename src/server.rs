@@ -117,6 +117,7 @@ struct ActiveTurn {
     control: mpsc::Sender<Control>,
     input_admission: Arc<Mutex<InputAdmission>>,
     translator: Translator,
+    agents: crate::subagents::Agents,
     interrupting: bool,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
@@ -882,6 +883,9 @@ impl Server {
                 let source_id = required_str(p, "threadId")?;
                 self.idle(source_id)?;
                 let source = self.record(source_id)?;
+                if crate::subagents::is_child(source) {
+                    return Err(subagent_read_only());
+                }
                 if source.ephemeral() {
                     return Err(RpcError::invalid(
                         "Ephemeral Claude sessions cannot be forked",
@@ -933,6 +937,9 @@ impl Server {
                     return Err(RpcError::invalid(
                         "Unarchive the thread before recovering its history",
                     ));
+                }
+                if crate::subagents::is_child(&record) {
+                    return Err(subagent_read_only());
                 }
                 let boundary = if method == "thread/revert" {
                     if record.thread["historyMode"] != "paginated" {
@@ -1527,8 +1534,19 @@ impl Server {
                 "searchTerm",
                 "useStateDbOnly",
                 "ancestorThreadId",
+                "parentThreadId",
             ],
         )?;
+        let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
+            (Some(_), Some(_)) => {
+                return Err(RpcError::invalid(
+                    "parentThreadId and ancestorThreadId are mutually exclusive",
+                ));
+            }
+            (Some(parent), None) => Some((parent, false)),
+            (None, Some(ancestor)) => Some((ancestor, true)),
+            (None, None) => None,
+        };
         let sort_key = match p["sortKey"].as_str().unwrap_or("created_at") {
             "created_at" => "createdAt",
             "updated_at" => "updatedAt",
@@ -1539,7 +1557,20 @@ impl Server {
             .records
             .values()
             .filter(|r| {
-                p["ancestorThreadId"].is_null()
+                let related = relation
+                    .is_none_or(|(ancestor, any_depth)| self.descends(r, ancestor, any_depth));
+                // As in Codex: a relation filter without sourceKinds spans every
+                // source; otherwise the default is interactive (non-subagent) threads.
+                let source = match (relation, p["sourceKinds"].as_array()) {
+                    (_, Some(kinds)) if !kinds.is_empty() => kinds.iter().any(|kind| {
+                        kind.as_str()
+                            .is_some_and(|kind| crate::subagents::source_matches(r, kind))
+                    }),
+                    (Some(_), None) => true,
+                    _ => !crate::subagents::is_child(r),
+                };
+                related
+                    && source
                     && r.archived == p["archived"].as_bool().unwrap_or(false)
                     && !r.ephemeral()
                     && p.get("projectId")
@@ -1547,9 +1578,6 @@ impl Server {
                     && p["modelProviders"]
                         .as_array()
                         .is_none_or(|v| v.is_empty() || v.iter().any(|p| p == "anthropic"))
-                    && p["sourceKinds"]
-                        .as_array()
-                        .is_none_or(|v| v.is_empty() || v.iter().any(|p| p == "appServer"))
                     && (p["cwd"].is_null()
                         || p["cwd"] == r.thread["cwd"]
                         || p["cwd"]
@@ -1572,6 +1600,24 @@ impl Server {
             )
         });
         page(threads, p, true, "threads")
+    }
+
+    /// Whether `record` is a (transitive, when `any_depth`) child of `ancestor`.
+    fn descends(&self, record: &Record, ancestor: &str, any_depth: bool) -> bool {
+        let mut parent = record.thread["parentThreadId"].as_str();
+        while let Some(id) = parent {
+            if id == ancestor {
+                return true;
+            }
+            if !any_depth {
+                return false;
+            }
+            parent = self
+                .records
+                .get(id)
+                .and_then(|r| r.thread["parentThreadId"].as_str());
+        }
+        false
     }
 
     async fn steer_turn(&mut self, client: u64, rpc_id: &Value, p: &Value) -> RpcResult<()> {
@@ -1843,6 +1889,9 @@ impl Server {
                 "Unarchive the thread before starting a turn",
             ));
         }
+        if crate::subagents::is_child(&record) {
+            return Err(subagent_read_only());
+        }
         // Ephemeral sessions have no transcript to resume; retain their process in a future implementation.
         if record.ephemeral() && !record.turns.is_empty() {
             return Err(RpcError::invalid(
@@ -1949,6 +1998,7 @@ impl Server {
                 input_admission,
                 translator: Translator::new(id, &turn_id, &record.settings.cwd)
                     .with_reasoning(record.settings.reasoning_summary.as_deref() != Some("none")),
+                agents: Default::default(),
                 interrupting: false,
                 worker,
                 cancel,
@@ -2034,9 +2084,13 @@ impl Server {
                     self.permission(id, &message).await;
                     return;
                 }
+                if self.route_agent(id, &message) {
+                    return;
+                }
                 if !message["parent_tool_use_id"].is_null() {
-                    // Subagent frames never anchor the parent session; the translator
-                    // only completes items that a subagent permission request started.
+                    // Subagent frames never anchor the parent session. Without a linked
+                    // child thread, the translator only completes items that a subagent
+                    // permission request started.
                     let translated = self
                         .active
                         .get_mut(id)
@@ -2067,13 +2121,7 @@ impl Server {
                             );
                             continue;
                         }
-                        self.emit(
-                            id,
-                            notification(
-                                "serverRequest/resolved",
-                                json!({"threadId": id, "requestId": request_id}),
-                            ),
-                        );
+                        self.emit_resolved(&pending, json!(request_id));
                     }
                     self.update_wait_status(id);
                     return;
@@ -2100,6 +2148,9 @@ impl Server {
                         },
                     );
                 }
+                if message["type"] == "user" {
+                    self.agent_results(id, None, &message);
+                }
                 let translated = self
                     .active
                     .get_mut(id)
@@ -2113,6 +2164,7 @@ impl Server {
                         return;
                     }
                 }
+                self.link_spawns(id, None);
                 if let Some(last) = self.active.get_mut(id).unwrap().usage.receive(&message) {
                     self.records.get_mut(id).unwrap().tracks_request_usage = true;
                     self.records.get_mut(id).unwrap().token_usage["last"] = last;
@@ -2198,6 +2250,25 @@ impl Server {
     }
 
     async fn finish(&mut self, id: &str, status: &str, error: Option<String>) {
+        // A background agent keeps its root turn open, so a child still running
+        // here was cut short with its root.
+        let open: Vec<String> = self.active.get(id).map_or(vec![], |active| {
+            active
+                .agents
+                .runs
+                .iter()
+                .filter(|(_, run)| run.turn.is_some())
+                .map(|(key, _)| key.clone())
+                .collect()
+        });
+        let child_status = if status == "failed" {
+            "failed"
+        } else {
+            "interrupted"
+        };
+        for key in open {
+            self.finish_agent(id, &key, child_status, None, None);
+        }
         let Some(mut active) = self.active.remove(id) else {
             return;
         };
@@ -2235,13 +2306,7 @@ impl Server {
                 );
                 continue;
             }
-            self.emit(
-                id,
-                notification(
-                    "serverRequest/resolved",
-                    json!({"threadId": id, "requestId": request_id}),
-                ),
-            );
+            self.emit_resolved(&pending, json!(request_id));
         }
         let record = self.records.get_mut(id).unwrap();
         let turn = record.turns.last_mut().unwrap();
@@ -2278,6 +2343,496 @@ impl Server {
                 json!({"threadId": id, "status": {"type": "idle"}}),
             ),
         );
+    }
+
+    /// The translator that owns items for `owner`: the root thread's own, or a
+    /// linked agent's open child turn.
+    fn agent_translator(&mut self, root: &str, owner: Option<&str>) -> Option<&mut Translator> {
+        let active = self.active.get_mut(root)?;
+        match owner {
+            None => Some(&mut active.translator),
+            Some(key) => active
+                .agents
+                .runs
+                .get_mut(key)?
+                .turn
+                .as_mut()
+                .map(|turn| &mut turn.translator),
+        }
+    }
+
+    fn owner_events(&mut self, root: &str, owner: Option<&str>, events: Vec<Value>) {
+        match owner {
+            None => self.translated(root, events),
+            Some(key) => {
+                let Some(run) = self.active.get(root).and_then(|a| a.agents.runs.get(key)) else {
+                    return;
+                };
+                let Some(thread) = run.thread_id.clone() else {
+                    return;
+                };
+                let snapshot = run
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.translator.snapshot().to_vec())
+                    .unwrap_or_default();
+                self.thread_events(&thread, events, snapshot);
+            }
+        }
+    }
+
+    /// Persist item lifecycles on a child thread and publish its events.
+    fn thread_events(&mut self, thread: &str, events: Vec<Value>, snapshot: Vec<Value>) {
+        let Some(record) = self.records.get_mut(thread) else {
+            return;
+        };
+        for event in &events {
+            let method = event["method"].as_str().unwrap_or("");
+            if method == "item/started" || method == "item/completed" {
+                record.update_item(event["params"]["item"].clone(), method == "item/completed");
+            }
+        }
+        for item in snapshot {
+            record.update_item(item, false);
+        }
+        for event in events {
+            self.emit(thread, event);
+        }
+    }
+
+    /// Register Agent calls a translator started since it last reported them.
+    fn link_spawns(&mut self, root: &str, owner: Option<&str>) {
+        let Some(translator) = self.agent_translator(root, owner) else {
+            return;
+        };
+        let sender = translator.thread_id().to_owned();
+        let spawns = translator.take_spawns();
+        let agents = &mut self.active.get_mut(root).unwrap().agents;
+        for (tool_id, input) in spawns {
+            agents.spawned(&tool_id, input, owner.map(str::to_owned), &sender);
+        }
+    }
+
+    /// Agent tool results end a foreground agent, or acknowledge a background one.
+    fn agent_results(&mut self, root: &str, owner: Option<&str>, frame: &Value) {
+        let metadata = &frame["tool_use_result"];
+        let blocks: Vec<Value> = frame["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "tool_result")
+            .cloned()
+            .collect();
+        for block in blocks {
+            let Some(key) = block["tool_use_id"].as_str().filter(|key| {
+                self.active
+                    .get(root)
+                    .and_then(|a| a.agents.runs.get(*key))
+                    .and_then(|run| run.spawn.as_ref())
+                    .is_some_and(|spawn| spawn.owner.as_deref() == owner)
+            }) else {
+                continue;
+            };
+            let report = crate::subagents::report(&block, metadata);
+            if let Some(agent_id) = metadata["agentId"].as_str() {
+                self.alias_agent(root, agent_id, key);
+            }
+            if block["is_error"] == true {
+                self.finish_agent(root, key, "failed", Some(report), None);
+            } else if crate::subagents::launch_ack(metadata) {
+                self.ensure_child(root, key);
+            } else {
+                self.finish_agent(
+                    root,
+                    key,
+                    "completed",
+                    Some(report),
+                    Some(&metadata["usage"]),
+                );
+            }
+        }
+    }
+
+    fn alias_agent(&mut self, root: &str, agent_id: &str, key: &str) {
+        let Some(active) = self.active.get_mut(root) else {
+            return;
+        };
+        active.agents.alias(agent_id, key);
+        if let Some(thread) = active.agents.runs[key].thread_id.clone() {
+            self.remember_agent(root, agent_id, &thread);
+        }
+    }
+
+    fn remember_agent(&mut self, root: &str, agent_id: &str, thread: &str) {
+        let record = self.records.get_mut(root).unwrap();
+        if record.agents.get(agent_id).map(String::as_str) != Some(thread) {
+            record.agents.insert(agent_id.to_owned(), thread.to_owned());
+            self.persist(root);
+        }
+    }
+
+    /// Save a record outside a root turn's own checkpoints. Failure is reported
+    /// rather than ending the root turn, which owns the native session.
+    fn persist(&self, thread: &str) {
+        if let Err(error) = self.store.save(&self.records[thread]) {
+            let message = format!("Subagent state was not saved: {error}");
+            self.emit(
+                thread,
+                notification("warning", json!({"threadId": thread, "message": message})),
+            );
+        }
+    }
+
+    /// The run's child thread, created (with its first turn) on first use.
+    fn ensure_child(&mut self, root: &str, key: &str) -> Option<String> {
+        let run = self.active.get(root)?.agents.runs.get(key)?;
+        if let Some(thread) = &run.thread_id {
+            return Some(thread.clone());
+        }
+        let spawn = run.spawn.as_ref()?;
+        let (tool_id, owner, sender, input) = (
+            spawn.tool_id.clone(),
+            spawn.owner.clone(),
+            spawn.owner_thread.clone(),
+            spawn.input.clone(),
+        );
+        let agent_id = run.agent_id.clone();
+        let record = crate::subagents::child_record(
+            self.records.get(&sender)?,
+            self.store.threads_dir(),
+            &input,
+        );
+        let child = record.id().to_owned();
+        if let Err(error) = self.store.save(&record) {
+            let message = format!("Subagent thread was not created: {error}");
+            self.emit(
+                root,
+                notification("warning", json!({"threadId": root, "message": message})),
+            );
+            return None;
+        }
+        self.records.insert(child.clone(), record);
+        let run = self.active.get_mut(root)?.agents.runs.get_mut(key)?;
+        run.thread_id = Some(child.clone());
+        if let Some(agent_id) = agent_id {
+            self.remember_agent(root, &agent_id, &child);
+        }
+        self.open_child_turn(root, key, input["prompt"].as_str());
+        let mut events = vec![];
+        if let Some(translator) = self.agent_translator(root, owner.as_deref()) {
+            events.extend(translator.end(&tool_id, crate::subagents::spawn_completed(&child)));
+            events.extend(translator.begin(crate::subagents::wait_item(&tool_id, &sender, &child)));
+            self.active
+                .get_mut(root)?
+                .agents
+                .runs
+                .get_mut(key)?
+                .spawn
+                .as_mut()?
+                .waiting = true;
+        }
+        self.owner_events(root, owner.as_deref(), events);
+        Some(child)
+    }
+
+    fn open_child_turn(&mut self, root: &str, key: &str, prompt: Option<&str>) {
+        let Some(thread) = self
+            .active
+            .get(root)
+            .and_then(|a| a.agents.runs.get(key))
+            .and_then(|run| run.thread_id.clone())
+        else {
+            return;
+        };
+        // Codex subscribes every initialized connection to a spawned child; a
+        // continued agent's turn is announced the same way.
+        let clients: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.ready)
+            .map(|(client, _)| *client)
+            .collect();
+        for client in clients {
+            self.subscribe(client, &thread);
+        }
+        self.loaded.insert(thread.clone());
+        let Some(record) = self.records.get_mut(&thread) else {
+            return;
+        };
+        let (turn, item) = crate::subagents::new_turn(record, prompt);
+        let turn_id = turn["id"].as_str().unwrap().to_owned();
+        let child_turn = crate::subagents::child_turn(&thread, &turn_id, record);
+        self.persist(&thread);
+        self.active
+            .get_mut(root)
+            .unwrap()
+            .agents
+            .runs
+            .get_mut(key)
+            .unwrap()
+            .turn = Some(child_turn);
+        self.emit(
+            &thread,
+            notification(
+                "thread/status/changed",
+                json!({"threadId": thread, "status": {"type": "active", "activeFlags": []}}),
+            ),
+        );
+        self.emit(
+            &thread,
+            notification("turn/started", json!({"threadId": thread, "turn": turn})),
+        );
+        if let Some(item) = item {
+            for (method, time) in [
+                ("item/started", "startedAtMs"),
+                ("item/completed", "completedAtMs"),
+            ] {
+                self.emit(&thread, notification(method,
+                    json!({"threadId": thread, "turnId": turn_id, "item": item, time: now_ms()})));
+            }
+        }
+    }
+
+    /// Close the run's child turn and its wait item. Idempotent: a foreground
+    /// agent reports both a tool result and a task notification.
+    fn finish_agent(
+        &mut self,
+        root: &str,
+        key: &str,
+        status: &str,
+        report: Option<String>,
+        usage: Option<&Value>,
+    ) {
+        let Some(run) = self.active.get(root).and_then(|a| a.agents.runs.get(key)) else {
+            return;
+        };
+        if run.thread_id.is_none() {
+            if status == "completed" {
+                self.ensure_child(root, key);
+            } else {
+                // The call failed before Claude started an agent.
+                let Some(spawn) = run.spawn.as_ref() else {
+                    return;
+                };
+                let (tool_id, owner) = (spawn.tool_id.clone(), spawn.owner.clone());
+                let events = self
+                    .agent_translator(root, owner.as_deref())
+                    .map(|t| t.end(&tool_id, json!({"status": "failed"})))
+                    .unwrap_or_default();
+                self.owner_events(root, owner.as_deref(), events);
+                self.active.get_mut(root).unwrap().agents.runs.remove(key);
+                return;
+            }
+        }
+        let run = self
+            .active
+            .get_mut(root)
+            .unwrap()
+            .agents
+            .runs
+            .get_mut(key)
+            .unwrap();
+        let Some(mut turn) = run.turn.take() else {
+            return;
+        };
+        let thread = run.thread_id.clone().unwrap();
+        let wait = run
+            .spawn
+            .as_ref()
+            .filter(|spawn| spawn.waiting)
+            .map(|spawn| (spawn.tool_id.clone(), spawn.owner.clone()));
+        let report = report.filter(|text| !text.is_empty());
+        let mut events = vec![];
+        if status == "completed"
+            && let Some(text) = &report
+            && !turn.translator.has_agent_message()
+        {
+            events.extend(turn.translator.final_message(text));
+        }
+        events.extend(turn.translator.finish());
+        let snapshot = turn.translator.snapshot().to_vec();
+        self.thread_events(&thread, events, snapshot);
+        let record = self.records.get_mut(&thread).unwrap();
+        if let Some(usage) = usage.filter(|u| u.is_object()) {
+            for (field, value) in crate::usage::from_native(usage).as_object().unwrap() {
+                record.token_usage["total"][field] = json!(
+                    record.token_usage["total"][field].as_u64().unwrap_or(0)
+                        + value.as_u64().unwrap_or(0)
+                );
+            }
+        }
+        if let Some(entry) = record.turns.iter_mut().find(|t| t["id"] == turn.turn_id) {
+            entry["status"] = json!(status);
+            entry["completedAt"] = json!(protocol::now());
+            entry["durationMs"] = json!(now_ms().saturating_sub(turn.started_ms));
+            entry["error"] = if status == "failed" {
+                json!({"message": report.clone().unwrap_or_else(|| "Subagent failed".into()),
+                    "codexErrorInfo": null, "additionalDetails": null, "misalignment": null})
+            } else {
+                Value::Null
+            };
+        }
+        record.thread["status"] = json!({"type": "idle"});
+        record.touch();
+        let completed = record
+            .turns
+            .iter()
+            .find(|t| t["id"] == turn.turn_id)
+            .cloned();
+        let token_usage = record.token_usage.clone();
+        self.persist(&thread);
+        self.emit(
+            &thread,
+            notification(
+                "thread/tokenUsage/updated",
+                json!({"threadId": thread, "turnId": turn.turn_id, "tokenUsage": token_usage}),
+            ),
+        );
+        if let Some(completed) = completed {
+            self.emit(
+                &thread,
+                notification(
+                    "turn/completed",
+                    json!({"threadId": thread, "turn": completed}),
+                ),
+            );
+        }
+        self.emit(
+            &thread,
+            notification(
+                "thread/status/changed",
+                json!({"threadId": thread, "status": {"type": "idle"}}),
+            ),
+        );
+        if let Some((tool_id, owner)) = wait {
+            let message = report.as_deref();
+            let events = self
+                .agent_translator(root, owner.as_deref())
+                .map(|t| {
+                    t.end(
+                        &crate::subagents::wait_id(&tool_id),
+                        crate::subagents::agent_finished(&thread, status, message),
+                    )
+                })
+                .unwrap_or_default();
+            self.owner_events(root, owner.as_deref(), events);
+        }
+    }
+
+    /// Subagent frames and task events for linked agents. Returns false for
+    /// messages the root translator should handle.
+    fn route_agent(&mut self, root: &str, message: &Value) -> bool {
+        match (message["type"].as_str(), message["subtype"].as_str()) {
+            (Some("system"), Some("task_started")) => {
+                let (Some(key), Some(task)) =
+                    (message["tool_use_id"].as_str(), message["task_id"].as_str())
+                else {
+                    return false;
+                };
+                if !self.active[root].agents.runs.contains_key(key) {
+                    return false;
+                }
+                let key = key.to_owned();
+                self.alias_agent(root, task, &key);
+                self.ensure_child(root, &key);
+                true
+            }
+            (Some("system"), Some("task_updated")) => {
+                // Claude patches a task's status before its notification, which
+                // carries the report; that notification (or the Agent result) ends it.
+                self.active[root]
+                    .agents
+                    .find(message["task_id"].as_str(), None)
+                    .is_some()
+            }
+            (Some("system"), Some("task_notification")) => {
+                let Some(key) = self.active[root]
+                    .agents
+                    .find(message["task_id"].as_str(), message["tool_use_id"].as_str())
+                else {
+                    return false;
+                };
+                let status = match message["status"].as_str() {
+                    Some("completed") => "completed",
+                    Some("failed") => "failed",
+                    Some("killed" | "stopped") => "interrupted",
+                    _ => return true,
+                };
+                let report = message["summary"].as_str().map(str::to_owned);
+                self.finish_agent(root, &key, status, report, None);
+                true
+            }
+            (Some("assistant" | "user"), _) if !message["parent_tool_use_id"].is_null() => {
+                let agent_id = message["agent_id"].as_str();
+                let key = self.active[root]
+                    .agents
+                    .find(agent_id, message["parent_tool_use_id"].as_str())
+                    .or_else(|| {
+                        // A continued agent from an earlier turn keeps its thread.
+                        let agent_id = agent_id?;
+                        let thread = self.records[root].agents.get(agent_id)?.clone();
+                        Some(
+                            self.active
+                                .get_mut(root)
+                                .unwrap()
+                                .agents
+                                .continued(agent_id, &thread),
+                        )
+                    });
+                let Some(key) = key else {
+                    return false;
+                };
+                if self.ensure_child(root, &key).is_none() {
+                    return false;
+                }
+                let mut frame = message.clone();
+                frame["parent_tool_use_id"] = Value::Null;
+                if self.active[root].agents.runs[&key].turn.is_none() {
+                    let prompt = (message["type"] == "user")
+                        .then(|| user_text(&frame))
+                        .flatten();
+                    self.open_child_turn(root, &key, prompt.as_deref());
+                    if prompt.is_some() {
+                        return true;
+                    }
+                }
+                if frame["type"] == "user" {
+                    self.agent_results(root, Some(&key), &frame);
+                }
+                let Some(turn) = self
+                    .active
+                    .get_mut(root)
+                    .unwrap()
+                    .agents
+                    .runs
+                    .get_mut(&key)
+                    .unwrap()
+                    .turn
+                    .as_mut()
+                else {
+                    return true;
+                };
+                let events = turn.translator.receive(&frame).unwrap_or_default();
+                let usage = turn.usage.receive(&frame);
+                let turn_id = turn.turn_id.clone();
+                self.owner_events(root, Some(&key), events);
+                self.link_spawns(root, Some(&key));
+                let thread = self.active[root].agents.runs[&key]
+                    .thread_id
+                    .clone()
+                    .unwrap();
+                let record = self.records.get_mut(&thread).unwrap();
+                if let Some(last) = usage {
+                    record.token_usage["last"] = last;
+                    let token_usage = record.token_usage.clone();
+                    self.emit(&thread, notification("thread/tokenUsage/updated",
+                        json!({"threadId": thread, "turnId": turn_id, "tokenUsage": token_usage})));
+                }
+                self.persist(&thread);
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn dynamic_tool(&mut self, id: &str, message: &Value) {
@@ -2454,13 +3009,7 @@ impl Server {
         item["durationMs"] = json!(now_ms().saturating_sub(dynamic.started_ms));
         self.translated(&pending.thread_id, vec![notification("item/completed", json!({
             "threadId":pending.thread_id,"turnId":pending.turn_id,"item":item,"completedAtMs":now_ms()}))]);
-        self.emit(
-            &pending.thread_id,
-            notification(
-                "serverRequest/resolved",
-                json!({"threadId":pending.thread_id,"requestId":rpc_id}),
-            ),
-        );
+        self.emit_resolved(&pending, json!(rpc_id));
     }
 
     async fn permission(&mut self, id: &str, message: &Value) {
@@ -2503,13 +3052,33 @@ impl Server {
             .unwrap_or_else(protocol::id);
         let owner = active.owner;
         let turn_id = active.id.clone();
+        // A linked subagent's request belongs to its child thread; the native
+        // control channel stays with the root turn.
+        let agent = request["agent_id"]
+            .as_str()
+            .and_then(|agent| self.active[id].agents.find(Some(agent), None))
+            .filter(|key| self.ensure_child(id, key).is_some());
+        if let Some(key) = &agent
+            && self.active[id].agents.runs[key].turn.is_none()
+        {
+            self.open_child_turn(id, key, None);
+        }
+        let (view_thread, view_turn) = match &agent {
+            Some(key) => {
+                let run = &self.active[id].agents.runs[key];
+                (
+                    run.thread_id.clone().unwrap(),
+                    run.turn.as_ref().unwrap().turn_id.clone(),
+                )
+            }
+            None => (id.to_owned(), turn_id.clone()),
+        };
         let events = self
-            .active
-            .get_mut(id)
+            .agent_translator(id, agent.as_deref())
             .unwrap()
-            .translator
             .tool_start(&item_id, tool, input);
-        self.translated(id, events);
+        self.owner_events(id, agent.as_deref(), events);
+        self.link_spawns(id, agent.as_deref());
         let record = &self.records[id];
         if record.session_grants.iter().any(|grant| {
             grant.permits(
@@ -2581,8 +3150,8 @@ impl Server {
                 "isBlocking": true, "autoResolutionMs": null}),
             ),
         };
-        params["threadId"] = json!(id);
-        params["turnId"] = json!(turn_id);
+        params["threadId"] = json!(view_thread);
+        params["turnId"] = json!(view_turn);
         params["itemId"] = json!(item_id);
         let rpc_id = format!("approval-{}", protocol::id());
         let pending = Pending {
@@ -2612,6 +3181,21 @@ impl Server {
         self.deliver_pending(&rpc_id);
     }
 
+    /// Resolution goes to the thread the request was shown on (a subagent's
+    /// child thread or the root).
+    fn emit_resolved(&self, pending: &Pending, request_id: Value) {
+        let thread = pending.request["params"]["threadId"]
+            .as_str()
+            .unwrap_or(&pending.thread_id);
+        self.emit(
+            thread,
+            notification(
+                "serverRequest/resolved",
+                json!({"threadId": thread, "requestId": request_id}),
+            ),
+        );
+    }
+
     fn update_wait_status(&mut self, id: &str) {
         if !self.active.contains_key(id) {
             return;
@@ -2636,6 +3220,38 @@ impl Server {
                 json!({"threadId": id, "status": status}),
             ),
         );
+        // A subagent's own requests also mark its child thread.
+        let children: Vec<String> = self.active[id]
+            .agents
+            .open_threads()
+            .map(str::to_owned)
+            .collect();
+        for child in children {
+            let flag = self
+                .pending
+                .values()
+                .find(|p| p.thread_id == id && p.request["params"]["threadId"] == child.as_str())
+                .map(|p| {
+                    if p.questions.is_some() {
+                        "waitingOnUserInput"
+                    } else {
+                        "waitingOnApproval"
+                    }
+                });
+            let status =
+                json!({"type": "active", "activeFlags": flag.into_iter().collect::<Vec<_>>()});
+            let record = self.records.get_mut(&child).unwrap();
+            if record.thread["status"] != status {
+                record.thread["status"] = status.clone();
+                self.emit(
+                    &child,
+                    notification(
+                        "thread/status/changed",
+                        json!({"threadId": child, "status": status}),
+                    ),
+                );
+            }
+        }
     }
 
     async fn approval_response(&mut self, client: u64, rpc_id: &Value, message: &Value) {
@@ -2690,8 +3306,8 @@ impl Server {
                 }
                 Ok(None) => {
                     let (method, mut params) = flow.next_request().unwrap();
-                    params["threadId"] = json!(pending.thread_id);
-                    params["turnId"] = json!(pending.turn_id);
+                    params["threadId"] = pending.request["params"]["threadId"].clone();
+                    params["turnId"] = pending.request["params"]["turnId"].clone();
                     params["itemId"] = pending.request["params"]["itemId"].clone();
                     let next_id = format!("approval-{}", protocol::id());
                     pending.request = json!({"id":next_id,"method":method,"params":params});
@@ -2702,13 +3318,7 @@ impl Server {
                         running: None,
                         generation: 0,
                     });
-                    self.emit(
-                        &pending.thread_id,
-                        notification(
-                            "serverRequest/resolved",
-                            json!({"threadId":pending.thread_id,"requestId":rpc_id}),
-                        ),
-                    );
+                    self.emit_resolved(&pending, json!(rpc_id));
                     self.pending.insert(next_id.clone(), pending);
                     self.deliver_pending(&next_id);
                     return;
@@ -2770,13 +3380,7 @@ impl Server {
                 return;
             }
         }
-        self.emit(
-            &pending.thread_id,
-            notification(
-                "serverRequest/resolved",
-                json!({"threadId": pending.thread_id, "requestId": rpc_id}),
-            ),
-        );
+        self.emit_resolved(&pending, json!(rpc_id));
         self.update_wait_status(&pending.thread_id);
     }
     async fn deny_pending(&mut self, rpc_id: &str, pending: Pending, reason: &str) {
@@ -2794,13 +3398,7 @@ impl Server {
                 json!({"behavior": "deny", "message": reason}),
             )));
         }
-        self.emit(
-            &pending.thread_id,
-            notification(
-                "serverRequest/resolved",
-                json!({"threadId": pending.thread_id, "requestId": rpc_id}),
-            ),
-        );
+        self.emit_resolved(&pending, json!(rpc_id));
         self.update_wait_status(&pending.thread_id);
     }
     async fn disconnect(&mut self, client: u64) {
@@ -2833,6 +3431,29 @@ impl Server {
                     .any(|c| c.subscriptions.contains(id))
         });
     }
+}
+
+fn subagent_read_only() -> RpcError {
+    RpcError::invalid(
+        "Claude subagent threads are read-only; continue the agent from its parent thread",
+    )
+}
+
+/// Text of a user frame that carries no tool results (a continued agent's input).
+fn user_text(frame: &Value) -> Option<String> {
+    let content = &frame["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    let blocks = content.as_array()?;
+    if blocks.iter().any(|block| block["type"] == "tool_result") {
+        return None;
+    }
+    let text: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
 }
 
 fn control_reply(request_id: &str, data: Value) -> Value {

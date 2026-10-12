@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod server;
 pub mod shell_env;
 pub mod store;
+pub mod subagents;
 pub mod timeline;
 pub mod translate;
 pub mod transport;

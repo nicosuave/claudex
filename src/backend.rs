@@ -701,7 +701,7 @@ impl Backend {
             initialization: Value::Null,
         };
         let initialized = tokio::select! {
-            result = backend.control(json!({"subtype":"initialize", "hooks":hooks}), config.initialize_timeout) => result,
+            result = backend.control(json!({"subtype":"initialize", "hooks":hooks, "forwardSubagentText":true}), config.initialize_timeout) => result,
             _ = startup_cancel.cancelled() => Err(anyhow!("Claude startup cancelled")),
         };
         match initialized {

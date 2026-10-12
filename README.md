@@ -145,7 +145,7 @@ To also verify a real command approval, add `--exercise-approval`. The example a
 
 ## Design and references
 
-`transport.rs` owns framing and connections; `server.rs` owns RPC ordering, subscriptions, turns, and approvals; `backend.rs` owns Claude subprocess/control I/O; `translate.rs` owns item lifecycles; `store.rs` owns atomic facade persistence. A completed turn is published only after backend cleanup and process reaping. A Claude background-agent continuation is kept within its initiating Codex turn until Claude reports idle.
+`transport.rs` owns framing and connections; `server.rs` owns RPC ordering, subscriptions, turns, and approvals; `backend.rs` owns Claude subprocess/control I/O; `translate.rs` owns item lifecycles; `store.rs` owns atomic facade persistence. A completed turn is published only after backend cleanup and process reaping. A Claude background-agent continuation is kept within its initiating Codex turn until Claude reports idle. `subagents.rs` maps Claude subagents to Codex child threads.
 
 Primary references:
 

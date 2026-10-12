@@ -2050,3 +2050,222 @@ async fn context_usage_is_latest_request_and_replays_after_restart() {
     assert_eq!(replay["params"]["tokenUsage"]["total"], usage["total"]);
     client.close().await;
 }
+
+fn item<'a>(turn: &'a Value, id: &str) -> &'a Value {
+    turn["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == id)
+        .unwrap_or_else(|| panic!("missing item {id} in {turn}"))
+}
+
+fn agent_texts(turn: &Value) -> Vec<String> {
+    turn["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "agentMessage")
+        .map(|item| item["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn ids(list: &Value) -> Vec<String> {
+    list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|thread| thread["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn foreground_subagent_streams_into_a_linked_child_thread() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let turn = client.start(&thread, "subagent").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    let spawn = item(&completed, "agent_call");
+    assert_eq!(spawn["type"], "collabAgentToolCall");
+    assert_eq!(spawn["tool"], "spawnAgent");
+    assert_eq!(spawn["status"], "completed");
+    assert_eq!(spawn["senderThreadId"], thread.as_str());
+    assert_eq!(spawn["prompt"], "Look around");
+    let child = spawn["receiverThreadIds"][0].as_str().unwrap().to_owned();
+    assert_ne!(child, thread);
+    let wait = item(&completed, "agent_call-wait");
+    assert_eq!(wait["tool"], "wait");
+    assert_eq!(wait["status"], "completed");
+    assert_eq!(wait["agentsStates"][&child]["status"], "completed");
+    assert_eq!(wait["agentsStates"][&child]["message"], "Report: all good");
+    assert_eq!(agent_texts(&completed), ["Parent done"]);
+
+    let child_turn = client
+        .until(|v| v["method"] == "turn/completed" && v["params"]["threadId"] == child.as_str())
+        .await["params"]["turn"]
+        .clone();
+    assert_eq!(child_turn["status"], "completed");
+    assert_eq!(child_turn["items"][0]["type"], "userMessage");
+    assert_eq!(child_turn["items"][0]["content"][0]["text"], "Look around");
+    assert_eq!(agent_texts(&child_turn), ["Child working", "Child done"]);
+    let bash = item(&child_turn, "child_bash");
+    assert_eq!(bash["status"], "completed");
+    assert_eq!(bash["aggregatedOutput"], "listing");
+    // The child's events arrive on the child thread, never the parent's.
+    assert!(
+        client
+            .history
+            .iter()
+            .all(|v| v["params"]["item"]["id"] != "child_bash"
+                || v["params"]["threadId"] == child.as_str())
+    );
+
+    let read = client
+        .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+        .await;
+    let view = &read["thread"];
+    assert_eq!(view["parentThreadId"], thread.as_str());
+    assert_eq!(view["threadSource"], "subagent");
+    assert_eq!(view["agentNickname"], "scout");
+    assert_eq!(view["agentRole"], "general-purpose");
+    let spawned = &view["source"]["subAgent"]["thread_spawn"];
+    assert_eq!(spawned["parent_thread_id"], thread.as_str());
+    assert_eq!(spawned["depth"], 1);
+    assert_eq!(view["turns"].as_array().unwrap().len(), 1);
+
+    // The nested agent's thread hangs off the child and shows its report.
+    let nested = item(&child_turn, "nested_call");
+    assert_eq!(nested["tool"], "spawnAgent");
+    let grandchild = nested["receiverThreadIds"][0].as_str().unwrap().to_owned();
+    assert_eq!(
+        item(&child_turn, "nested_call-wait")["agentsStates"][&grandchild]["message"],
+        "Nested report"
+    );
+    let read = client
+        .ok(
+            "thread/read",
+            json!({"threadId":grandchild,"includeTurns":true}),
+        )
+        .await;
+    assert_eq!(read["thread"]["parentThreadId"], child.as_str());
+    assert_eq!(
+        read["thread"]["source"]["subAgent"]["thread_spawn"]["depth"],
+        2
+    );
+    assert_eq!(read["thread"]["turns"][0]["status"], "completed");
+    assert_eq!(agent_texts(&read["thread"]["turns"][0]), ["Nested report"]);
+
+    let sorted = |mut ids: Vec<String>| {
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ids(&client.ok("thread/list", json!({})).await),
+        [thread.as_str()]
+    );
+    assert_eq!(
+        ids(&client
+            .ok("thread/list", json!({"parentThreadId": thread}))
+            .await),
+        [child.as_str()]
+    );
+    let descendants = sorted(vec![child.clone(), grandchild.clone()]);
+    for filter in [
+        json!({"ancestorThreadId": thread}),
+        json!({"sourceKinds": ["subAgentThreadSpawn"]}),
+        json!({"sourceKinds": ["subAgent"]}),
+    ] {
+        assert_eq!(
+            sorted(ids(&client.ok("thread/list", filter).await)),
+            descendants
+        );
+    }
+    let rejected = client
+        .request(
+            "turn/start",
+            json!({"threadId":child,"input":[{"type":"text","text":"more","text_elements":[]}]}),
+        )
+        .await;
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "{rejected}"
+    );
+    client.close().await;
+
+    // After a restart, a continued agent resumes the same child thread.
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    client.ok("thread/resume", json!({"threadId":thread})).await;
+    let read = client
+        .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+        .await;
+    assert_eq!(read["thread"]["parentThreadId"], thread.as_str());
+    assert_eq!(read["thread"]["turns"][0]["status"], "completed");
+    let turn = client.start(&thread, "subagent-continue").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(agent_texts(&completed), ["Parent continued"]);
+    let continued = client
+        .until(|v| v["method"] == "turn/completed" && v["params"]["threadId"] == child.as_str())
+        .await["params"]["turn"]
+        .clone();
+    assert_eq!(continued["status"], "completed");
+    assert_eq!(continued["items"][0]["content"][0]["text"], "More please");
+    assert_eq!(agent_texts(&continued), ["Continued"]);
+    let read = client
+        .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
+        .await;
+    assert_eq!(read["thread"]["turns"].as_array().unwrap().len(), 2);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn background_subagent_keeps_its_child_turn_open_past_the_launch_ack() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let turn = client.start(&thread, "subagent-background").await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(
+        agent_texts(&completed),
+        ["Parent waiting", "Parent saw report"]
+    );
+    let spawn = item(&completed, "agent_bg");
+    assert_eq!(spawn["status"], "completed");
+    let child = spawn["receiverThreadIds"][0].as_str().unwrap().to_owned();
+    let wait = item(&completed, "agent_bg-wait");
+    assert_eq!(wait["status"], "completed");
+    assert_eq!(wait["agentsStates"][&child]["message"], "Background report");
+    assert!(
+        completed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "dynamicToolCall"),
+        "linked agents need no placeholder: {completed}"
+    );
+    let child_turn = client
+        .until(|v| v["method"] == "turn/completed" && v["params"]["threadId"] == child.as_str())
+        .await["params"]["turn"]
+        .clone();
+    assert_eq!(child_turn["status"], "completed");
+    assert_eq!(agent_texts(&child_turn), ["Background report"]);
+    // The child turn ends with the task notification, after the parent's first
+    // result answered the launch acknowledgement.
+    let position =
+        |predicate: &dyn Fn(&Value) -> bool| client.history.iter().position(predicate).unwrap();
+    let parent_waiting = position(&|v| {
+        v["method"] == "item/completed" && v["params"]["item"]["text"] == "Parent waiting"
+    });
+    let child_done =
+        position(&|v| v["method"] == "turn/completed" && v["params"]["threadId"] == child.as_str());
+    assert!(parent_waiting < child_done);
+    client.close().await;
+}

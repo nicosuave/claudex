@@ -21,6 +21,7 @@ pub struct Translator {
     started_at: HashMap<String, u64>,
     final_messages: HashSet<String>,
     native_tasks: HashMap<String, String>,
+    spawns: Vec<(String, Value)>,
     include_reasoning: bool,
 }
 
@@ -42,12 +43,53 @@ impl Translator {
             started_at: HashMap::new(),
             final_messages: HashSet::new(),
             native_tasks: HashMap::new(),
+            spawns: Vec::new(),
             include_reasoning: true,
         }
     }
     pub fn with_reasoning(mut self, include: bool) -> Self {
         self.include_reasoning = include;
         self
+    }
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+    /// Agent calls started since the last call, as (tool_use_id, input). The
+    /// server links each to a child thread when Claude reports the task.
+    pub fn take_spawns(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.spawns)
+    }
+    /// Start an item the server built (collab items for child agents).
+    pub fn begin(&mut self, item: Value) -> Vec<Value> {
+        let mut events = vec![];
+        self.start(item, &mut events);
+        events
+    }
+    /// Apply final fields to an open item and complete it.
+    pub fn end(&mut self, id: &str, fields: Value) -> Vec<Value> {
+        let mut events = vec![];
+        if self.completed.contains(id) {
+            return events;
+        }
+        if let Some(item) = self.items.iter_mut().find(|v| v["id"] == id) {
+            for (key, value) in fields.as_object().into_iter().flatten() {
+                item[key] = value.clone();
+            }
+        }
+        self.complete(id, &mut events);
+        events
+    }
+    pub fn has_agent_message(&self) -> bool {
+        self.items.iter().any(|v| v["type"] == "agentMessage")
+    }
+    /// A final report for a child whose own text Claude did not forward.
+    pub fn final_message(&mut self, text: &str) -> Vec<Value> {
+        let mut events = vec![];
+        let id = protocol::id();
+        self.start(agent_message(&id), &mut events);
+        self.text_delta(&id, text, false, &mut events);
+        self.complete(&id, &mut events);
+        events
     }
     fn event(&self, method: &str, mut p: Value) -> Value {
         p["threadId"] = json!(self.thread_id);
@@ -149,6 +191,14 @@ impl Translator {
             }
             "Write" | "Edit" | "MultiEdit" => json!({"type": "fileChange", "id": tool_id,
                 "changes": file_changes(&self.cwd, name, input), "status": "inProgress"}),
+            // Claude lists the tool as Task but calls it Agent.
+            "Agent" | "Task" => {
+                self.spawns.push((tool_id.to_owned(), input.clone()));
+                json!({"type": "collabAgentToolCall", "id": tool_id, "tool": "spawnAgent",
+                    "status": "inProgress", "senderThreadId": self.thread_id, "receiverThreadIds": [],
+                    "prompt": input["prompt"].as_str(), "model": input["model"].as_str(),
+                    "reasoningEffort": null, "agentsStates": {}})
+            }
             _ if name.starts_with("mcp__") => {
                 let mut parts = name.splitn(3, "__");
                 parts.next();

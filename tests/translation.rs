@@ -387,3 +387,36 @@ fn subagent_results_complete_only_items_started_by_permission_requests() {
     assert!(translator.finish().is_empty());
     contracts(&events);
 }
+
+#[test]
+fn agent_calls_start_spawn_items_and_are_reported_for_linking() {
+    let mut translator = Translator::new("parent", "turn", Path::new("/tmp"));
+    let input = json!({"description":"Inspect","prompt":"Look around","model":"haiku"});
+    let mut events = translator.tool_start("call", "Agent", &input);
+    assert_eq!(translator.take_spawns(), [("call".to_owned(), input)]);
+    assert!(translator.take_spawns().is_empty());
+    let item = &translator.snapshot()[0];
+    assert_eq!(item["type"], "collabAgentToolCall");
+    assert_eq!(item["tool"], "spawnAgent");
+    assert_eq!(item["senderThreadId"], "parent");
+    assert_eq!(item["prompt"], "Look around");
+    assert_eq!(item["model"], "haiku");
+    events.extend(translator.end(
+        "call",
+        json!({"status":"completed","receiverThreadIds":["child"],
+            "agentsStates":{"child":{"status":"running","message":null}}}),
+    ));
+    // A later tool result cannot reopen or overwrite the linked spawn.
+    events.extend(
+        translator
+            .receive(&json!({"type":"user","message":{"content":[
+        {"type":"tool_result","tool_use_id":"call","content":"report","is_error":true}]}}))
+            .unwrap(),
+    );
+    assert_eq!(translator.snapshot()[0]["status"], "completed");
+    assert_eq!(
+        translator.snapshot()[0]["receiverThreadIds"],
+        json!(["child"])
+    );
+    contracts(&events);
+}

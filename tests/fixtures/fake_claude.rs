@@ -184,6 +184,77 @@ fn main() {
                         finish(session, "Parent waiting", false);
                         emit(json!({"type":"control_request","request_id":"permission_fake","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"printf fake"},"tool_use_id":"tool_fake"}}));
                     }
+                    "subagent" => {
+                        // Foreground Agent call, frames shaped like Claude Code 2.1.294.
+                        let child = |kind: &str, content: Value| json!({"type":kind,"session_id":session,
+                            "uuid":uuid::Uuid::new_v4().to_string(),"parent_tool_use_id":"agent_call","agent_id":"agent-1",
+                            "message":{"id":format!("msg_{}", uuid::Uuid::new_v4()),"role":if kind == "user" {"user"} else {"assistant"},
+                                "model":"fake-child","content":content,"usage":{"input_tokens":7,"output_tokens":2}}});
+                        emit(json!({"type":"assistant","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),"parent_tool_use_id":null,
+                            "message":{"id":"msg_agent","role":"assistant","content":[{"type":"tool_use","id":"agent_call","name":"Agent",
+                                "input":{"description":"Inspect","prompt":"Look around","subagent_type":"general-purpose","name":"scout"}}]}}));
+                        emit(json!({"type":"system","subtype":"task_started","task_id":"agent-1","tool_use_id":"agent_call",
+                            "task_type":"local_agent","is_backgrounded":false,"description":"Inspect"}));
+                        emit(child("user", json!([{"type":"text","text":"Look around"}])));
+                        emit(child("assistant", json!([{"type":"text","text":"Child working"},
+                            {"type":"tool_use","id":"child_bash","name":"Bash","input":{"command":"ls"}}])));
+                        emit(child("user", json!([{"type":"tool_result","tool_use_id":"child_bash","content":"listing"}])));
+                        // A nested agent emits no frames of its own, only task events.
+                        emit(child("assistant", json!([{"type":"tool_use","id":"nested_call","name":"Agent",
+                            "input":{"description":"Nested","prompt":"Go deeper","subagent_type":"Explore"}}])));
+                        emit(json!({"type":"system","subtype":"task_started","task_id":"agent-1b","tool_use_id":"nested_call",
+                            "task_type":"local_agent","is_backgrounded":false,"spawn_depth":2,"parent_task_id":"agent-1"}));
+                        let mut nested = child("user", json!([{"type":"tool_result","tool_use_id":"nested_call","content":"Nested report"}]));
+                        nested["tool_use_result"] = json!({"status":"completed","agentId":"agent-1b","content":[{"type":"text","text":"Nested report"}]});
+                        emit(nested);
+                        emit(json!({"type":"system","subtype":"task_notification","task_id":"agent-1b","tool_use_id":"nested_call",
+                            "status":"completed","summary":"Nested report"}));
+                        emit(child("assistant", json!([{"type":"text","text":"Child done"}])));
+                        emit(json!({"type":"user","session_id":session,"parent_tool_use_id":null,
+                            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent_call","content":"Report: all good"}]},
+                            "tool_use_result":{"status":"completed","agentId":"agent-1","content":[{"type":"text","text":"Report: all good"}],
+                                "usage":{"input_tokens":10,"output_tokens":5}}}));
+                        emit(json!({"type":"system","subtype":"task_updated","task_id":"agent-1","patch":{"status":"completed"}}));
+                        emit(json!({"type":"system","subtype":"task_notification","task_id":"agent-1","tool_use_id":"agent_call",
+                            "status":"completed","summary":"Report: all good"}));
+                        finish(session, "Parent done", false);
+                    }
+                    "subagent-continue" => {
+                        // SendMessage resumes agent-1 from an earlier turn.
+                        emit(json!({"type":"assistant","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),"parent_tool_use_id":null,
+                            "message":{"id":"msg_send","role":"assistant","content":[{"type":"tool_use","id":"send_call","name":"SendMessage",
+                                "input":{"to":"agent-1","summary":"More","message":"More please"}}]}}));
+                        emit(json!({"type":"user","session_id":session,"parent_tool_use_id":null,
+                            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"send_call","content":"{\"success\":true}"}]}}));
+                        emit(json!({"type":"user","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),
+                            "parent_tool_use_id":"send_call","agent_id":"agent-1","message":{"role":"user","content":[{"type":"text","text":"More please"}]}}));
+                        emit(json!({"type":"assistant","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),
+                            "parent_tool_use_id":"send_call","agent_id":"agent-1",
+                            "message":{"id":"msg_continued","role":"assistant","content":[{"type":"text","text":"Continued"}]}}));
+                        emit(json!({"type":"system","subtype":"task_notification","task_id":"agent-1","tool_use_id":"send_call",
+                            "status":"completed","summary":"Continued"}));
+                        finish(session, "Parent continued", false);
+                    }
+                    "subagent-background" => {
+                        emit(json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+                        emit(json!({"type":"assistant","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),"parent_tool_use_id":null,
+                            "message":{"id":"msg_bg","role":"assistant","content":[{"type":"tool_use","id":"agent_bg","name":"Agent",
+                                "input":{"description":"Research","prompt":"Dig in","run_in_background":true}}]}}));
+                        emit(json!({"type":"system","subtype":"task_started","task_id":"agent-2","tool_use_id":"agent_bg",
+                            "task_type":"local_agent","is_backgrounded":true,"description":"Research"}));
+                        emit(json!({"type":"user","session_id":session,"parent_tool_use_id":null,
+                            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent_bg","content":"Async agent launched successfully"}]},
+                            "tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"agent-2"}}));
+                        finish(session, "Parent waiting", false);
+                        emit(json!({"type":"assistant","session_id":session,"uuid":uuid::Uuid::new_v4().to_string(),
+                            "parent_tool_use_id":"agent_bg","agent_id":"agent-2",
+                            "message":{"id":"msg_bg_child","role":"assistant","content":[{"type":"text","text":"Background report"}]}}));
+                        emit(json!({"type":"system","subtype":"task_updated","task_id":"agent-2","patch":{"status":"completed"}}));
+                        emit(json!({"type":"system","subtype":"task_notification","task_id":"agent-2","tool_use_id":"agent_bg",
+                            "status":"completed","summary":"Background report"}));
+                        finish(session, "Parent saw report", false);
+                        emit(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+                    }
                     "crash" => {
                         eprintln!("fake backend crashed deliberately");
                         std::process::exit(17);
