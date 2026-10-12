@@ -191,13 +191,7 @@ impl Installation {
         atomic_write(&self.root.join("bin/codex"), launcher.as_bytes(), 0o700)?;
         // The desktop runs this in place of its bundled Codex. It deliberately
         // keeps the desktop's own environment (CODEX_HOME included) for Codex.
-        let router = format!(
-            "#!/bin/bash\n{GENERATED}\nexec {} --sock {} route --log {} --codex \"${{CLAUDE_CODEX_ROUTER_CODEX:-{}}}\" -- \"$@\"\n",
-            shell_quote(&installed_binary)?,
-            shell_quote(&self.socket())?,
-            shell_quote(&self.root.join("logs/router.log"))?,
-            shell_quote(&desktop_codex)?
-        );
+        let router = self.router_launcher(&installed_binary, &desktop_codex)?;
         atomic_write(&self.router_codex(), router.as_bytes(), 0o700)?;
         if let Some(setup) = &ssh_setup {
             let session = format!(
@@ -241,6 +235,18 @@ impl Installation {
 
     fn router_codex(&self) -> PathBuf {
         self.root.join("router/codex")
+    }
+
+    fn router_launcher(&self, binary: &Path, codex: &Path) -> Result<String> {
+        // Assign the quoted path outside parameter expansion: single quotes
+        // inside a double-quoted ${VAR:-default} become literal path bytes.
+        Ok(format!(
+            "#!/bin/bash\n{GENERATED}\ncodex={}\nexec {} --sock {} route --log {} --codex \"${{CLAUDE_CODEX_ROUTER_CODEX:-$codex}}\" -- \"$@\"\n",
+            shell_quote(codex)?,
+            shell_quote(binary)?,
+            shell_quote(&self.socket())?,
+            shell_quote(&self.root.join("logs/router.log"))?,
+        ))
     }
 
     async fn prepare_ssh(&self) -> Result<SshSetup> {
@@ -1197,6 +1203,46 @@ mod tests {
             value.to_str().unwrap()
         );
         assert!(shell_quote(Path::new("/tmp/new\nline")).is_err());
+    }
+
+    #[test]
+    fn router_launcher_preserves_default_and_override_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = Installation::at_home(temp.path().to_path_buf(), None);
+        let codex = "/Applications/space 'quote' $(printf unsafe) `printf unsafe`/codex";
+        let script = temp.path().join("router");
+        let binary = temp.path().join("record arguments");
+        fs::write(&binary, "#!/bin/bash\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            &script,
+            install.router_launcher(&binary, Path::new(codex)).unwrap(),
+        )
+        .unwrap();
+        // The stand-in prints one argument per line, so spaces and shell
+        // syntax cannot hide argument splitting in the generated launcher.
+        for override_path in [None, Some(""), Some("/tmp/other 'codex' $HOME")] {
+            let mut command = std::process::Command::new("/bin/bash");
+            command
+                .arg(&script)
+                .args(["app-server", "-c", "setting=space value"])
+                .env_remove("CLAUDE_CODEX_ROUTER_CODEX");
+            if let Some(value) = override_path {
+                command.env("CLAUDE_CODEX_ROUTER_CODEX", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let args: Vec<_> = stdout.lines().collect();
+            assert_eq!(
+                args[6],
+                override_path.filter(|p| !p.is_empty()).unwrap_or(codex)
+            );
+            assert_eq!(
+                &args[7..],
+                &["--", "app-server", "-c", "setting=space value"]
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
