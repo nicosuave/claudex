@@ -65,7 +65,12 @@ enum Command {
     },
     /// Install this binary and its isolated macOS desktop connection.
     #[cfg(unix)]
-    Install,
+    Install {
+        /// Skip the dedicated localhost SSH connection; the local desktop
+        /// router then reaches Claude without Remote Login.
+        #[arg(long)]
+        no_ssh: bool,
+    },
     /// Check executables, service, local SSH, and native Claude authentication.
     #[cfg(unix)]
     Doctor,
@@ -77,6 +82,21 @@ enum Command {
         /// Explicitly allow stopping active conversations.
         #[arg(long)]
         force: bool,
+    },
+    /// Stand in for genuine Codex as the desktop's local CLI. The desktop's
+    /// app-server launch is routed between Codex and the Claude facade
+    /// (reached through --sock); every other invocation runs Codex unchanged.
+    #[cfg(unix)]
+    Route {
+        /// The genuine Codex executable the desktop would otherwise run.
+        #[arg(long, env = "CLAUDE_CODEX_ROUTER_CODEX")]
+        codex: PathBuf,
+        /// Also append router diagnostics to this file.
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Codex command-line arguments exactly as the desktop passed them.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Remove the service and managed SSH entries, keeping conversations and keys.
     #[cfg(unix)]
@@ -94,6 +114,19 @@ enum AppServerAction {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(unix)]
+    if let Some(Command::Route {
+        codex,
+        args: codex_args,
+        ..
+    }) = &args.command
+        && !claude_codex_server::router::is_app_server_launch(codex_args)
+    {
+        use std::os::unix::process::CommandExt;
+        // Replace this process so exit status, signals, and stdio are Codex's own.
+        let error = std::process::Command::new(codex).args(codex_args).exec();
+        return Err(error).with_context(|| format!("Cannot run {}", codex.display()));
+    }
     // Children inherit PATH, so set it before the runtime starts other threads.
     if args.login_shell_path {
         match claude_codex_server::shell_env::login_shell()
@@ -117,9 +150,9 @@ async fn run(args: Args) -> Result<()> {
     }
     #[cfg(unix)]
     match &args.command {
-        Some(Command::Install) => {
+        Some(Command::Install { no_ssh }) => {
             return claude_codex_server::install::Installation::current()?
-                .install(&args.claude)
+                .install(&args.claude, !no_ssh)
                 .await;
         }
         Some(Command::Doctor) => {
@@ -131,6 +164,17 @@ async fn run(args: Args) -> Result<()> {
             return claude_codex_server::install::Installation::current()?
                 .service(*action, *force)
                 .await;
+        }
+        Some(Command::Route {
+            codex,
+            log,
+            args: codex_args,
+        }) => {
+            let socket = match &args.sock {
+                Some(path) => Some(path.clone()),
+                None => default_socket().ok(),
+            };
+            return claude_codex_server::router::run(codex, codex_args, socket, log.clone()).await;
         }
         Some(Command::Uninstall { force }) => {
             return claude_codex_server::install::Installation::current()?

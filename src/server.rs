@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     backend::{Backend, BackendConfig, BackendEvent, SessionOptions},
     protocol::{
-        self, RpcError, RpcResult, Schemas, notification, now_ms, required_str, response,
-        supported_fields,
+        self, ADOPT_THREAD_METHOD, RpcError, RpcResult, Schemas, notification, now_ms,
+        required_str, response, supported_fields,
     },
     store::{ModelDefaults, Record, Settings, Store},
     translate::{self, Translator},
@@ -516,9 +516,14 @@ impl Server {
             Err(RpcError::new(-32000, "Not initialized"))
         } else if method == "initialize" && self.connections[&client].initialized {
             Err(RpcError::new(-32600, "Already initialized"))
+        } else if method == ADOPT_THREAD_METHOD {
+            self.adopt_thread(client, &id, &message["params"]).await
         } else {
             match Schemas::get().validate(method, &message) {
-                Ok(()) => self.request(client, &id, method, &message["params"]).await,
+                Ok(()) => {
+                    self.request(client, &id, method, &message["params"], None)
+                        .await
+                }
                 Err(error) => Err(error),
             }
         };
@@ -530,12 +535,37 @@ impl Server {
         }
     }
 
+    /// Start a Claude thread under an identifier the client already holds. The
+    /// local router uses this when the desktop's prewarmed (still empty) Codex
+    /// thread receives its first turn for a Claude model.
+    async fn adopt_thread(
+        &mut self,
+        client: u64,
+        rpc_id: &Value,
+        p: &Value,
+    ) -> RpcResult<Option<Value>> {
+        supported_fields(p, &["threadId", "params"])?;
+        let thread_id = required_str(p, "threadId")?;
+        if uuid::Uuid::parse_str(thread_id).is_err() {
+            return Err(RpcError::invalid("threadId must be a UUID"));
+        }
+        if self.records.contains_key(thread_id) {
+            return Err(RpcError::invalid("Thread already exists"));
+        }
+        let params = p.get("params").cloned().unwrap_or_else(|| json!({}));
+        let start = json!({"id": rpc_id, "method": "thread/start", "params": params});
+        Schemas::get().validate("thread/start", &start)?;
+        self.request(client, rpc_id, "thread/start", &params, Some(thread_id))
+            .await
+    }
+
     async fn request(
         &mut self,
         client: u64,
         rpc_id: &Value,
         method: &str,
         p: &Value,
+        adopted_id: Option<&str>,
     ) -> RpcResult<Option<Value>> {
         let (mut params, warnings) = crate::desktop::normalize(method, p)?;
         // Named workspace presets use the host defaults. Never override an
@@ -744,12 +774,17 @@ impl Server {
                 settings.effort = self.defaults.effort.clone();
                 settings.sandbox = self.workspace_defaults.policy();
                 settings.apply(p)?;
-                let record = Record::new(
-                    settings,
-                    self.store.threads_dir(),
-                    p,
-                    &self.connections[&client].originator,
-                );
+                let originator = &self.connections[&client].originator;
+                let record = match adopted_id {
+                    Some(id) => Record::with_id(
+                        id.to_owned(),
+                        settings,
+                        self.store.threads_dir(),
+                        p,
+                        originator,
+                    ),
+                    None => Record::new(settings, self.store.threads_dir(), p, originator),
+                };
                 self.store.save(&record).map_err(RpcError::internal)?;
                 let thread_id = record.id().to_owned();
                 let result = record.response(false, false);
