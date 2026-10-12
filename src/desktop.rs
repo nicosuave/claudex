@@ -99,11 +99,6 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
     {
         object.remove("environments");
     }
-    for field in ["serviceTier", "serviceTierForTurn"] {
-        if object.get(field).is_some_and(|v| v == "default") {
-            object.remove(field);
-        }
-    }
     if let Some(config) = object.remove("config").filter(|v| !v.is_null()) {
         let config = config
             .as_object()

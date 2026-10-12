@@ -304,6 +304,12 @@ pub fn claude_model_entry(model: &Value, default: &str) -> RpcResult<Value> {
             .map(|e| e["reasoningEffort"].clone())
             .unwrap_or(json!("none"))
     };
+    // Codex's Fast tier id, so the desktop speed control works unchanged.
+    if model["supportsFastMode"] == true {
+        entry["serviceTiers"] = json!([{"id": "priority", "name": "Fast",
+            "description": "Claude fast mode: faster output, increased usage"}]);
+        entry["additionalSpeedTiers"] = json!(["fast"]);
+    }
     entry["supportedReasoningEfforts"] = if efforts.is_empty() {
         json!([{"reasoningEffort":"none", "description":"Model default"}])
     } else {

@@ -141,6 +141,8 @@ struct ActiveTurn {
     agents: crate::subagents::Agents,
     breaker: crate::auto_review::Breaker,
     interrupting: bool,
+    /// Whether this turn asked Claude for fast mode.
+    fast_mode: bool,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
 }
@@ -579,6 +581,9 @@ impl Server {
                 "ACP agents run their own tools, which this facade cannot confine to a workspace sandbox; use danger-full-access",
             ));
         }
+        if settings.service_tier.is_some() {
+            return Err(acp_fast_mode());
+        }
         if settings.approvals_reviewer != "user" && self.config.reviewer.is_none() {
             return Err(RpcError::invalid(
                 "Automatic approval review needs a Claude reviewer; start the facade with --claude",
@@ -952,6 +957,7 @@ impl Server {
                         "cwd",
                         "model",
                         "effort",
+                        "serviceTier",
                         "modelProvider",
                         "approvalPolicy",
                         "approvalsReviewer",
@@ -971,6 +977,7 @@ impl Server {
                 let mut settings =
                     Settings::new(self.config.default_cwd.clone(), self.defaults.model.clone());
                 settings.effort = self.defaults.effort.clone();
+                settings.service_tier = self.defaults.service_tier.clone();
                 settings.sandbox = if self.acp() {
                     crate::sandbox::Policy::DangerFullAccess
                 } else {
@@ -1013,6 +1020,7 @@ impl Server {
                         "cwd",
                         "model",
                         "effort",
+                        "serviceTier",
                         "modelProvider",
                         "approvalPolicy",
                         "approvalsReviewer",
@@ -1110,6 +1118,7 @@ impl Server {
                         "threadId",
                         "cwd",
                         "model",
+                        "serviceTier",
                         "modelProvider",
                         "approvalPolicy",
                         "approvalsReviewer",
@@ -1349,6 +1358,7 @@ impl Server {
                         "threadId",
                         "model",
                         "effort",
+                        "serviceTier",
                         "summary",
                         "cwd",
                         "approvalPolicy",
@@ -1779,9 +1789,15 @@ impl Server {
                             settings.apply(&json!({"effort": edit["value"]}))?;
                             next.effort = settings.effort;
                         }
+                        Some("service_tier") => {
+                            next.service_tier = crate::store::service_tier(&edit["value"])?;
+                            if self.acp() && next.service_tier.is_some() {
+                                return Err(acp_fast_mode());
+                            }
+                        }
                         _ => {
                             return Err(RpcError::invalid(
-                                "Only model and model_reasoning_effort defaults are supported",
+                                "Only model, model_reasoning_effort and service_tier defaults are supported",
                             ));
                         }
                     }
@@ -1811,6 +1827,7 @@ impl Server {
                 }
                 config.insert("model".into(), json!(self.defaults.model));
                 config.insert("model_reasoning_effort".into(), json!(self.defaults.effort));
+                config.insert("service_tier".into(), json!(self.defaults.service_tier));
                 let provider = protocol::provider();
                 config.insert("model_provider".into(), json!(provider.id));
                 config.insert(
@@ -2278,6 +2295,8 @@ impl Server {
                 "approvalsReviewer",
                 "sandboxPolicy",
                 "effort",
+                "serviceTier",
+                "serviceTierForTurn",
                 "summary",
                 "outputSchema",
                 "developerInstructions",
@@ -2310,7 +2329,15 @@ impl Server {
         }
         record.settings.apply(p)?;
         self.check_backend_settings(&record.settings)?;
+        // A per-turn tier, including "default", leaves the thread's tier unchanged.
+        let fast_mode = match p.get("serviceTierForTurn").filter(|v| !v.is_null()) {
+            Some(tier) => crate::store::service_tier(tier)?.is_some(),
+            None => record.settings.service_tier.is_some(),
+        };
         if self.acp() {
+            if fast_mode {
+                return Err(acp_fast_mode());
+            }
             if p.get("outputSchema")
                 .is_some_and(|schema| !schema.is_null())
             {
@@ -2400,6 +2427,10 @@ impl Server {
                 let mut settings =
                     crate::plugins::disabled_settings(&record.settings.disabled_plugin_ids)?;
                 settings["env"] = json!(record.settings.environment_overrides);
+                // Claude honors fast mode from SDK clients only as a flag setting.
+                if fast_mode {
+                    settings["fastMode"] = json!(true);
+                }
                 settings
             },
             dynamic_tools: record
@@ -2453,6 +2484,7 @@ impl Server {
                 agents: Default::default(),
                 breaker: Default::default(),
                 interrupting: false,
+                fast_mode,
                 worker,
                 cancel,
             },
@@ -2636,6 +2668,19 @@ impl Server {
                 }
                 if message["type"] == "result" {
                     self.record_usage(id, turn_id, &message);
+                    // Claude falls back to standard speed instead of failing,
+                    // for example when the account has no extra usage.
+                    if self.active[id].fast_mode
+                        && let Some(state) = message["fast_mode_state"]
+                            .as_str()
+                            .filter(|state| *state != "on")
+                    {
+                        let reason = message["fast_mode_disabled_reason"]
+                            .as_str()
+                            .unwrap_or(state);
+                        self.emit(id, notification("warning", json!({"threadId":id,
+                            "message":format!("Claude fast mode was requested but this turn ran at standard speed ({reason}).")})));
+                    }
                     let interrupted = self.active[id].interrupting;
                     let failed = message["is_error"] == true
                         || message["subtype"].as_str().is_some_and(|s| s != "success");
@@ -4122,6 +4167,10 @@ impl Server {
                     .any(|c| c.subscriptions.contains(id))
         });
     }
+}
+
+fn acp_fast_mode() -> RpcError {
+    RpcError::invalid("Fast mode is available only with Claude, not ACP agents")
 }
 
 fn subagent_read_only() -> RpcError {

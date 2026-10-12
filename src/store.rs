@@ -24,6 +24,9 @@ pub struct Settings {
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub effort: Option<String>,
+    /// Codex service tier id; any value selects Claude fast mode.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     #[serde(default)]
     pub dynamic_tools: Vec<crate::dynamic_tools::Tool>,
     #[serde(default)]
@@ -45,6 +48,7 @@ impl Settings {
             base_instructions: None,
             developer_instructions: None,
             effort: None,
+            service_tier: None,
             dynamic_tools: vec![],
             reasoning_summary: None,
             environment_overrides: BTreeMap::new(),
@@ -135,6 +139,10 @@ impl Settings {
             }
             self.effort = (effort != "none").then(|| effort.to_owned());
         }
+        // Present-but-null clears the tier, matching Codex settings updates.
+        if let Some(tier) = p.get("serviceTier") {
+            self.service_tier = service_tier(tier)?;
+        }
         if let Some(instructions) = p["baseInstructions"].as_str() {
             self.base_instructions = Some(instructions.to_owned());
         }
@@ -156,6 +164,19 @@ impl Settings {
         } else {
             "manual"
         }
+    }
+}
+
+/// Codex advertises fast mode as the `priority` tier; `fast` is its legacy
+/// name. Claude has one fast mode, so either selects it and `default` clears it.
+pub fn service_tier(value: &Value) -> RpcResult<Option<String>> {
+    match value.as_str() {
+        None if value.is_null() => Ok(None),
+        Some("default") => Ok(None),
+        Some(tier @ ("priority" | "fast")) => Ok(Some(tier.to_owned())),
+        _ => Err(RpcError::invalid(
+            "Claude supports only the priority (fast) and default service tiers",
+        )),
     }
 }
 
@@ -388,7 +409,7 @@ impl Record {
             "approvalsReviewer":self.settings.approvals_reviewer,
             "sandboxPolicy":self.settings.sandbox, "activePermissionProfile":null,
             "disabledPluginIds":self.settings.disabled_plugin_ids, "effort":self.settings.effort,
-            "summary":self.settings.reasoning_summary, "serviceTier":null, "personality":null,
+            "summary":self.settings.reasoning_summary, "serviceTier":self.settings.service_tier, "personality":null,
             "multiAgentMode":"explicitRequestOnly",
             "collaborationMode":{"mode":"default","settings":{
                 "model":self.settings.model,"reasoning_effort":self.settings.effort,
@@ -398,7 +419,7 @@ impl Record {
     }
     pub fn response(&self, include_turns: bool, resume: bool) -> Value {
         let mut response = json!({"thread": self.view(include_turns, true), "model": self.settings.model,
-            "modelProvider": protocol::provider().id, "serviceTier": null, "disabledPluginIds": self.settings.disabled_plugin_ids,
+            "modelProvider": protocol::provider().id, "serviceTier": self.settings.service_tier, "disabledPluginIds": self.settings.disabled_plugin_ids,
             "cwd": self.settings.cwd, "runtimeWorkspaceRoots": [self.settings.cwd], "instructionSources": [],
             "approvalPolicy": self.settings.approval_policy, "approvalsReviewer": self.settings.approvals_reviewer,
             "sandbox": self.settings.sandbox, "activePermissionProfile": null,
@@ -441,6 +462,8 @@ pub struct Store {
 pub struct ModelDefaults {
     pub model: String,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
     pub version: String,
 }
 
@@ -474,6 +497,7 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ModelDefaults {
                 model,
                 effort: None,
+                service_tier: None,
                 version: "0".into(),
             }),
             Err(error) => Err(error.into()),

@@ -1505,7 +1505,7 @@ async fn unsupported_sandbox_options_and_invalid_inputs_are_rejected() {
         json!({"sandbox":"external-sandbox"}),
         json!({"approvalPolicy":"untrusted"}),
         json!({"modelProvider":"openai"}),
-        json!({"serviceTier":"fast"}),
+        json!({"serviceTier":"flex"}),
         json!({"config":{"model":"other"}}),
     ] {
         let error = client.request("thread/start", params).await;
@@ -1515,7 +1515,8 @@ async fn unsupported_sandbox_options_and_invalid_inputs_are_rejected() {
     let invalid = [
         json!({"threadId":thread,"input":[]}),
         json!({"threadId":thread,"input":[{"type":"text","text":"hello","text_elements":[]}],"sandboxPolicy":{"type":"readOnly"}}),
-        json!({"threadId":thread,"input":[{"type":"text","text":"hello","text_elements":[]}],"serviceTier":"fast"}),
+        json!({"threadId":thread,"input":[{"type":"text","text":"hello","text_elements":[]}],"serviceTier":"flex"}),
+        json!({"threadId":thread,"input":[{"type":"text","text":"hello","text_elements":[]}],"serviceTierForTurn":"flex"}),
     ];
     for params in invalid {
         assert_eq!(
@@ -2390,6 +2391,102 @@ async fn idle_claude_process_serves_later_turns_until_its_launch_changes() {
     let (second, prompts) = probe(&mut client, &thread, json!({})).await;
     assert_ne!(second, first);
     assert_eq!(prompts, 1);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn fast_service_tier_selects_claude_fast_mode() {
+    async fn probe(client: &mut Client, thread: &str, options: Value) -> String {
+        let mut params = json!({"threadId":thread,
+            "input":[{"type":"text","text":"fast-info","text_elements":[]}]});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let turn = client.ok("turn/start", params).await["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        agent_texts(&client.completed(&turn).await).pop().unwrap()
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let models = client.ok("model/list", json!({})).await["data"].clone();
+    let tiers = |id: &str| {
+        models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == id)
+            .unwrap()["serviceTiers"]
+            .clone()
+    };
+    assert_eq!(tiers("opus")[0]["id"], "priority");
+    assert_eq!(tiers("sonnet"), json!([]));
+
+    let started = client
+        .ok(
+            "thread/start",
+            json!({"sandbox":"danger-full-access","model":"opus","serviceTier":"priority"}),
+        )
+        .await;
+    assert_eq!(started["serviceTier"], "priority");
+    let thread = started["thread"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        probe(&mut client, &thread, json!({})).await,
+        "fast mode true"
+    );
+    // Claude ran at standard speed despite the request, so the client is told why.
+    let warning = client.until(|v| v["method"] == "warning").await;
+    assert!(
+        warning["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("extra_usage_disabled"),
+        "{warning}"
+    );
+    // A per-turn tier does not change the thread's tier.
+    assert_eq!(
+        probe(
+            &mut client,
+            &thread,
+            json!({"serviceTierForTurn":"default"})
+        )
+        .await,
+        "fast mode false"
+    );
+    assert_eq!(
+        probe(&mut client, &thread, json!({})).await,
+        "fast mode true"
+    );
+    // Desktop sends null for standard speed.
+    assert_eq!(
+        probe(&mut client, &thread, json!({"serviceTier":null})).await,
+        "fast mode false"
+    );
+    assert_eq!(
+        probe(&mut client, &thread, json!({"serviceTierForTurn":"fast"})).await,
+        "fast mode true"
+    );
+    client
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"serviceTier":"priority"}),
+        )
+        .await;
+    let settings = client
+        .until(|v| v["method"] == "thread/settings/updated")
+        .await;
+    assert_eq!(
+        settings["params"]["threadSettings"]["serviceTier"],
+        "priority"
+    );
+    assert_eq!(
+        probe(&mut client, &thread, json!({})).await,
+        "fast mode true"
+    );
     client.close().await;
 }
 
