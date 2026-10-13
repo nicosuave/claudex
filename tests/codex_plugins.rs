@@ -196,6 +196,11 @@ async fn backpressure_and_last_clone_drop_clean_up_child() {
         .await
         .unwrap_err();
     assert!(error.message.contains("queue is full"), "{error}");
+    assert!(!client.is_alive());
+    assert_eq!(
+        client.request("echo", json!({})).await.unwrap_err().message,
+        error.message
+    );
     client.shutdown().await;
     wait_dead(fixture.pid()).await;
     let fixture = Fixture::new();
