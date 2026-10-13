@@ -1042,34 +1042,10 @@ pub async fn user_input(input: &Value) -> RpcResult<(Vec<Value>, Vec<Value>)> {
                         "Claude images do not support Codex detail selection",
                     ));
                 }
-                let path = Path::new(
-                    item["path"]
-                        .as_str()
-                        .ok_or_else(|| RpcError::invalid("localImage requires path"))?,
-                );
-                if !path.is_absolute() {
-                    return Err(RpcError::invalid("localImage path must be absolute"));
-                }
-                let metadata = tokio::fs::metadata(path)
-                    .await
-                    .map_err(RpcError::internal)?;
-                if !metadata.is_file() || metadata.len() > 20 * 1024 * 1024 {
-                    return Err(RpcError::invalid(
-                        "localImage must be a regular file of at most 20 MiB",
-                    ));
-                }
-                let bytes = tokio::fs::read(path).await.map_err(RpcError::internal)?;
-                let mime = if bytes.starts_with(b"\x89PNG") {
-                    "image/png"
-                } else if bytes.starts_with(b"\xff\xd8\xff") {
-                    "image/jpeg"
-                } else if bytes.starts_with(b"GIF8") {
-                    "image/gif"
-                } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-                    "image/webp"
-                } else {
-                    return Err(RpcError::invalid("Unsupported image file type"));
-                };
+                let path = item["path"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::invalid("localImage requires path"))?;
+                let (mime, bytes) = read_local_image(Path::new(path))?;
                 claude.push(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": STANDARD.encode(bytes)}}));
             }
             _ => {
@@ -1082,6 +1058,45 @@ pub async fn user_input(input: &Value) -> RpcResult<(Vec<Value>, Vec<Value>)> {
     }
     Ok((codex, claude))
 }
+
+/// Read a `localImage` attachment, returning its sniffed media type and bytes.
+///
+/// macOS can refuse a file the desktop itself can read: a screenshot dragged
+/// from the capture thumbnail lives under `TemporaryItems`, which only the
+/// drop target's process tree may open. The router inlines attachments for
+/// that reason; a refusal here names the file rather than surfacing a bare
+/// OS error.
+pub fn read_local_image(path: &Path) -> RpcResult<(&'static str, Vec<u8>)> {
+    if !path.is_absolute() {
+        return Err(RpcError::invalid("localImage path must be absolute"));
+    }
+    let unreadable = |error: std::io::Error| {
+        RpcError::invalid(format!(
+            "Cannot read attached image {}: {error}",
+            path.display()
+        ))
+    };
+    let metadata = std::fs::metadata(path).map_err(unreadable)?;
+    if !metadata.is_file() || metadata.len() > 20 * 1024 * 1024 {
+        return Err(RpcError::invalid(
+            "localImage must be a regular file of at most 20 MiB",
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(unreadable)?;
+    let mime = if bytes.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        return Err(RpcError::invalid("Unsupported image file type"));
+    };
+    Ok((mime, bytes))
+}
+
 fn validate_image_type(mime: &str) -> RpcResult<()> {
     if ["image/png", "image/jpeg", "image/webp", "image/gif"].contains(&mime) {
         Ok(())
