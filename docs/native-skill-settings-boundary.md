@@ -3,7 +3,8 @@
 Workspace sessions retain Claude's native `user,project,local` discovery and the
 existing reviewer modes: `acceptEdits` for user review, `auto` for **Approve for
 me**, and `dontAsk` for **never ask**. An explicitly supplied setting-source list
-still limits discovery. Full-access sessions retain their ordinary native launch.
+still limits discovery. Full-access sessions retain their ordinary native launch;
+with **never ask** they run in `bypassPermissions`.
 
 ## Native loading
 

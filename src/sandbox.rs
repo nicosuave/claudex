@@ -83,6 +83,45 @@ impl Policy {
         matches!(self, Self::WorkspaceWrite { .. })
     }
 
+    /// The policy Claude enforces, in one canonical form. Clients spell the same
+    /// policy differently from turn to turn: the desktop repeats roots, may name
+    /// the working directory, and lists the temporary directories only on a
+    /// chat's first turn. A different spelling would relaunch Claude and change
+    /// its tool descriptions, invalidating the prompt cache. Roots that cannot
+    /// be resolved are kept as given, so launching still reports them.
+    pub fn effective(&self, cwd: &Path) -> Self {
+        let Self::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            exclude_slash_tmp,
+            exclude_tmpdir_env_var,
+        } = self
+        else {
+            return self.clone();
+        };
+        let canonical = |root: &Path| root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut roots: Vec<PathBuf> = writable_roots.iter().map(|root| canonical(root)).collect();
+        // As in Codex, workspace-write keeps both temporary directories
+        // writable unless the policy excludes them.
+        if !exclude_slash_tmp && let Ok(tmp) = Path::new("/tmp").canonicalize() {
+            roots.push(tmp);
+        }
+        if !exclude_tmpdir_env_var && let Ok(tmp) = std::env::temp_dir().canonicalize() {
+            roots.push(tmp);
+        }
+        // The working directory is always writable; the native policy adds it.
+        let cwd = canonical(cwd);
+        roots.retain(|root| *root != cwd);
+        roots.sort();
+        roots.dedup();
+        Self::WorkspaceWrite {
+            writable_roots: roots,
+            network_access: *network_access,
+            exclude_slash_tmp: *exclude_slash_tmp,
+            exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Self::WorkspaceWrite {
             writable_roots,

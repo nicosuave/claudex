@@ -22,6 +22,9 @@ use crate::{
 
 /// How long a new Claude process may wait for MCP servers before its first prompt.
 const MCP_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+/// Streamed progress is saved this long after it arrives, so a burst of
+/// frames becomes one write rather than one per frame.
+const PERSIST_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -95,6 +98,13 @@ pub enum Event {
         review_id: String,
         outcome: crate::auto_review::Outcome,
     },
+    /// Save a thread's streamed progress.
+    Persist {
+        thread_id: String,
+    },
+    WriteFailed(crate::store::WriteFailure),
+    /// The model catalog probe finished with Claude's initialization response.
+    ModelCatalog(Result<Value, String>),
     Shutdown,
 }
 
@@ -226,11 +236,23 @@ pub struct Server {
     reviews: HashMap<String, Review>,
     commands: crate::commands::CommandManager,
     command_cleanup: tokio::task::JoinSet<()>,
+    /// Threads whose streamed progress has not been saved yet.
+    unsaved: HashSet<String>,
+    write_failures: Option<mpsc::UnboundedReceiver<crate::store::WriteFailure>>,
+    /// Claude processes still closing, by thread.
+    closing: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// model/list requests waiting for the catalog probe.
+    catalog_waiters: Vec<(u64, Value, Value)>,
     events: mpsc::Sender<Event>,
 }
 
 impl Server {
-    pub fn new(config: ServerConfig, store: Store, events: mpsc::Sender<Event>) -> Result<Self> {
+    pub fn new(
+        config: ServerConfig,
+        mut store: Store,
+        events: mpsc::Sender<Event>,
+    ) -> Result<Self> {
+        let write_failures = store.take_write_failures();
         let records = store.load()?;
         let defaults = store.load_defaults(config.default_model.clone())?;
         let workspace_defaults = crate::sandbox::WorkspaceDefaults::load(store.root())?;
@@ -253,12 +275,29 @@ impl Server {
             reviews: HashMap::new(),
             commands: crate::commands::CommandManager::default(),
             command_cleanup: tokio::task::JoinSet::new(),
+            unsaved: HashSet::new(),
+            write_failures,
+            closing: HashMap::new(),
+            catalog_waiters: Vec::new(),
             events,
         })
     }
 
     pub async fn run(mut self, mut events: mpsc::Receiver<Event>) {
-        while let Some(event) = events.recv().await {
+        let mut write_failures = self.write_failures.take();
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                Some(failure) = async {
+                    match &mut write_failures {
+                        Some(failures) => failures.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => Event::WriteFailed(failure),
+            };
             match event {
                 Event::PluginsReady {
                     thread_id,
@@ -272,7 +311,7 @@ impl Server {
                     {
                         active.plugins = Some(runtime);
                     } else {
-                        runtime.client.shutdown().await;
+                        tokio::spawn(async move { runtime.client.shutdown().await });
                     }
                 }
                 Event::Parked {
@@ -293,15 +332,15 @@ impl Server {
                                 })
                             });
                     match key {
-                        Some(key) => self.park(thread_id, key, session).await,
-                        None => session.close().await,
+                        Some(key) => self.park(thread_id, key, session),
+                        None => self.close_in_background(&thread_id, session.close()),
                     }
                 }
                 Event::Woke {
                     thread_id,
                     key,
                     session,
-                } => self.wake(thread_id, key, session).await,
+                } => self.wake(thread_id, key, session),
                 Event::PluginToolFinished {
                     thread_id,
                     turn_id,
@@ -389,6 +428,18 @@ impl Server {
                 Event::AutoReviewFinished { review_id, outcome } => {
                     self.finish_review(&review_id, outcome).await
                 }
+                Event::Persist { thread_id } => {
+                    if self.unsaved.remove(&thread_id)
+                        && let Some(record) = self.records.get(&thread_id)
+                        && let Err(error) = self.store.save_deferred(record)
+                    {
+                        self.write_failed(&thread_id, &format!("{error:#}"));
+                    }
+                }
+                Event::WriteFailed(failure) => {
+                    self.write_failed(&failure.thread_id, &failure.error)
+                }
+                Event::ModelCatalog(result) => self.catalog_ready(result),
                 Event::Shutdown => break,
             }
         }
@@ -399,6 +450,16 @@ impl Server {
         }
         for (_, parked) in self.idle_sessions.drain() {
             parked.close().await;
+        }
+        for (_, closing) in self.closing.drain() {
+            let _ = closing.await;
+        }
+        for id in std::mem::take(&mut self.unsaved) {
+            if let Some(record) = self.records.get(&id)
+                && let Err(error) = self.store.save(record)
+            {
+                eprintln!("Cannot save thread {id}: {error:#}");
+            }
         }
         for (&client, connection) in &self.connections {
             connection.cancel.cancel();
@@ -540,7 +601,7 @@ impl Server {
         }
         Ok(())
     }
-    async fn park(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
+    fn park(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
         self.idle_sessions.retain(|_, parked| parked.is_open());
         // Processes running background work are not idle caches; evicting one
         // would kill that work.
@@ -557,7 +618,8 @@ impl Server {
             else {
                 break;
             };
-            self.idle_sessions.remove(&oldest).unwrap().close().await;
+            let parked = self.idle_sessions.remove(&oldest).unwrap();
+            self.close_in_background(&oldest, parked.close());
         }
         let session_id = self.records[&id].session_id.clone();
         let wake = crate::warm::Wake {
@@ -588,9 +650,157 @@ impl Server {
             Some(reason) => {
                 eprintln!("Restarting Claude for thread {id}: {reason}");
                 self.warn_stopped_background(id, &parked, "This turn needs a new Claude process");
-                parked.close().await;
+                self.close_in_background(id, parked.close());
                 None
             }
+        }
+    }
+
+    /// Read the model catalog from a short-lived Claude process.
+    fn probe_models(&self) {
+        let options = SessionOptions {
+            state_dir: self.store.root().to_path_buf(),
+            sandbox: Default::default(),
+            cwd: self.config.default_cwd.clone(),
+            session_id: protocol::id(),
+            resume: false,
+            fork_from: None,
+            resume_at: None,
+            // An ACP probe keeps the agent default, so an unavailable
+            // configured default cannot hide the catalog.
+            model: if self.acp() {
+                crate::acp::DEFAULT_MODEL.into()
+            } else {
+                self.defaults.model.clone()
+            },
+            permission_mode: "dontAsk".into(),
+            system_prompt: None,
+            append_system_prompt: None,
+            effort: None,
+            output_schema: None,
+            ephemeral: true,
+            dynamic_tools: vec![],
+            native_settings: json!({}),
+        };
+        let config = self.config.backend.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let initialization = async {
+                let (mut backend, _events) = Backend::spawn(&config, &options).await?;
+                let initialization = backend.initialization().clone();
+                backend.terminate().await?;
+                anyhow::Ok(initialization)
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = events.send(Event::ModelCatalog(initialization)).await;
+        });
+    }
+
+    fn catalog_ready(&mut self, initialization: Result<Value, String>) {
+        let catalog = initialization
+            .map_err(RpcError::internal)
+            .and_then(|initialization| {
+                if self.acp() {
+                    self.acp_agent = Some(initialization["agent"].clone());
+                }
+                // An agent without model selection still serves its own default.
+                initialization["models"]
+                    .as_array()
+                    .cloned()
+                    .filter(|models| self.acp() || !models.is_empty())
+                    .ok_or_else(|| RpcError::internal("Claude returned no model catalog"))
+            });
+        if let Ok(models) = &catalog {
+            self.model_catalog = Some(models.clone());
+        }
+        // A failed probe answers its waiters; the next request probes again.
+        for (client, rpc_id, params) in std::mem::take(&mut self.catalog_waiters) {
+            let page = match &catalog {
+                Ok(_) => self.model_page(&params),
+                Err(error) => Err(error.clone()),
+            };
+            self.send(
+                client,
+                match page {
+                    Ok(page) => response(rpc_id, page),
+                    Err(error) => error.response(rpc_id),
+                },
+            );
+        }
+    }
+
+    fn model_page(&self, p: &Value) -> RpcResult<Value> {
+        let mut models = self
+            .model_catalog
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|model| protocol::claude_model_entry(model, &self.defaults.model))
+            .collect::<RpcResult<Vec<_>>>()?;
+        if !models.iter().any(|m| m["isDefault"] == true) {
+            let mut entry = protocol::model_entry(&self.defaults.model, true);
+            if self.acp() && self.defaults.model == crate::acp::DEFAULT_MODEL {
+                entry["displayName"] = json!("Agent default");
+                entry["description"] = json!("The model the agent selects by default");
+            }
+            models.insert(0, entry);
+        }
+        if let Some(agent) = self.acp_agent.as_ref().filter(|_| self.acp())
+            && agent["agentCapabilities"]["promptCapabilities"]["image"] != true
+        {
+            for model in &mut models {
+                model["inputModalities"] = json!(["text"]);
+            }
+        }
+        let mut page = page(models, p, false, "models")?;
+        page.as_object_mut().unwrap().remove("backwardsCursor");
+        Ok(page)
+    }
+
+    /// Close a thread's Claude process without holding up other threads. The
+    /// thread's next process waits for it: two processes must never share a session.
+    fn close_in_background(&mut self, id: &str, close: impl Future<Output = ()> + Send + 'static) {
+        self.closing.retain(|_, task| !task.is_finished());
+        let previous = self.closing.remove(id);
+        let task = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            close.await;
+        });
+        self.closing.insert(id.to_owned(), task);
+    }
+
+    /// Save a thread's streamed progress shortly, coalescing a burst of frames.
+    fn persist_soon(&mut self, id: &str) {
+        if self.unsaved.insert(id.to_owned()) {
+            let events = self.events.clone();
+            let thread_id = id.to_owned();
+            tokio::spawn(async move {
+                tokio::time::sleep(PERSIST_DELAY).await;
+                let _ = events.send(Event::Persist { thread_id }).await;
+            });
+        }
+    }
+
+    /// Queue a save of the thread's current state right away.
+    fn persist_now(&mut self, id: &str) {
+        self.unsaved.remove(id);
+        if let Err(error) = self.store.save_deferred(&self.records[id]) {
+            self.write_failed(id, &format!("{error:#}"));
+        }
+    }
+
+    /// A deferred save failed. The turn continues; its completion is saved
+    /// synchronously and fails the turn if the state still cannot be written.
+    fn write_failed(&self, id: &str, error: &str) {
+        if self.records.contains_key(id) {
+            let message = format!("Thread state was not saved: {error}");
+            self.emit(
+                id,
+                notification("warning", json!({"threadId": id, "message": message})),
+            );
         }
     }
 
@@ -602,7 +812,7 @@ impl Server {
     ) -> RpcResult<SessionOptions> {
         Ok(SessionOptions {
             state_dir: self.store.root().to_path_buf(),
-            sandbox: record.settings.sandbox.clone(),
+            sandbox: record.settings.sandbox.effective(&record.settings.cwd),
             cwd: record.settings.cwd.clone(),
             session_id: record.session_id.clone(),
             resume: record.has_session,
@@ -649,6 +859,7 @@ impl Server {
         let input_admission = Arc::new(Mutex::new(InputAdmission::default()));
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(run_backend(BackendTurn {
+            previous_process: self.closing.remove(&id),
             config: self.config.backend.clone(),
             plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
                 (
@@ -695,14 +906,14 @@ impl Server {
     /// Claude started work in an idle process, for example to answer a
     /// background task that finished after its turn. Codex has no equivalent,
     /// so the work becomes a new turn on the thread instead of being discarded.
-    async fn wake(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
+    fn wake(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
         self.idle_sessions.retain(|_, parked| parked.is_open());
         let available = self
             .records
             .get(&id)
             .is_some_and(|record| !record.archived && !self.active.contains_key(&id));
         if !available {
-            session.close().await;
+            self.close_in_background(&id, session.close());
             return;
         }
         let mut record = self.records[&id].clone();
@@ -712,7 +923,7 @@ impl Server {
             Ok(options) => options,
             Err(error) => {
                 eprintln!("Cannot resume Claude's background work for thread {id}: {error}");
-                session.close().await;
+                self.close_in_background(&id, session.close());
                 return;
             }
         };
@@ -723,7 +934,7 @@ impl Server {
         record.touch();
         if let Err(error) = self.store.save(&record) {
             eprintln!("Cannot record Claude's background work for thread {id}: {error}");
-            session.close().await;
+            self.close_in_background(&id, session.close());
             return;
         }
         // Approvals go to a client showing the thread; otherwise the turn is
@@ -760,10 +971,10 @@ impl Server {
         );
     }
 
-    async fn close_idle_session(&mut self, id: &str) {
+    fn close_idle_session(&mut self, id: &str) {
         if let Some(parked) = self.idle_sessions.remove(id) {
             self.warn_stopped_background(id, &parked, "Closing this chat's Claude process");
-            parked.close().await;
+            self.close_in_background(id, parked.close());
         }
     }
 
@@ -779,12 +990,6 @@ impl Server {
                 notification("warning", json!({"threadId": id, "message": message})),
             );
         }
-    }
-
-    fn save(&self, id: &str) -> RpcResult<()> {
-        self.store
-            .save(self.record(id)?)
-            .map_err(RpcError::internal)
     }
 
     fn acp(&self) -> bool {
@@ -1284,15 +1489,25 @@ impl Server {
                 if record.archived {
                     return Err(RpcError::invalid("Unarchive the thread before resuming it"));
                 }
-                let previous =
-                    serde_json::to_value(&record.settings).map_err(RpcError::internal)?;
-                record.settings.apply(p)?;
-                self.check_backend_settings(&record.settings)?;
-                if self.active.contains_key(id)
-                    && previous
-                        != serde_json::to_value(&record.settings).map_err(RpcError::internal)?
-                {
-                    return Err(RpcError::invalid("Cannot reconfigure an active thread"));
+                if self.active.contains_key(id) {
+                    // As in Codex, resuming a running thread attaches to it as it
+                    // is. A client opening the chat sends its own launch settings
+                    // (such as a sandbox preset instead of the turn's explicit
+                    // policy); rejecting them would leave the chat unhydrated
+                    // until the turn ends.
+                    let mut requested = record.settings.clone();
+                    let ignored = match requested.apply(p) {
+                        Ok(()) => changed_settings(&record.settings, &requested)?.join(", "),
+                        Err(error) => error.message,
+                    };
+                    if !ignored.is_empty() {
+                        eprintln!(
+                            "thread/resume overrides ignored for running thread {id}: {ignored}"
+                        );
+                    }
+                } else {
+                    record.settings.apply(p)?;
+                    self.check_backend_settings(&record.settings)?;
                 }
                 // The next turn reuses the thread's idle Claude process only if
                 // these settings leave its launch unchanged; otherwise it starts
@@ -1632,7 +1847,7 @@ impl Server {
                 let id = required_str(p, "threadId")?;
                 self.idle(id)?;
                 if method == "thread/archive" {
-                    self.close_idle_session(id).await;
+                    self.close_idle_session(id);
                 }
                 let mut record = self.record(id)?.clone();
                 record.archived = method == "thread/archive";
@@ -1816,73 +2031,16 @@ impl Server {
             }
             "model/list" => {
                 supported_fields(p, &["cursor", "limit", "includeHidden"])?;
-                if self.model_catalog.is_none() {
-                    let options = SessionOptions {
-                        state_dir: self.store.root().to_path_buf(),
-                        sandbox: Default::default(),
-                        cwd: self.config.default_cwd.clone(),
-                        session_id: protocol::id(),
-                        resume: false,
-                        fork_from: None,
-                        resume_at: None,
-                        // An ACP probe keeps the agent default, so an unavailable
-                        // configured default cannot hide the catalog.
-                        model: if self.acp() {
-                            crate::acp::DEFAULT_MODEL.into()
-                        } else {
-                            self.defaults.model.clone()
-                        },
-                        permission_mode: "dontAsk".into(),
-                        system_prompt: None,
-                        append_system_prompt: None,
-                        effort: None,
-                        output_schema: None,
-                        ephemeral: true,
-                        dynamic_tools: vec![],
-                        native_settings: json!({}),
-                    };
-                    let (mut backend, _events) = Backend::spawn(&self.config.backend, &options)
-                        .await
-                        .map_err(RpcError::internal)?;
-                    let models = backend.initialization()["models"].as_array().cloned();
-                    if self.acp() {
-                        self.acp_agent = Some(backend.initialization()["agent"].clone());
-                    }
-                    backend.terminate().await.map_err(RpcError::internal)?;
-                    // An agent without model selection still serves its own default.
-                    self.model_catalog = Some(
-                        models
-                            .filter(|m| self.acp() || !m.is_empty())
-                            .ok_or_else(|| {
-                                RpcError::internal("Claude returned no model catalog")
-                            })?,
-                    );
+                if self.model_catalog.is_some() {
+                    return self.model_page(p).map(Some);
                 }
-                let mut models = self
-                    .model_catalog
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .map(|model| protocol::claude_model_entry(model, &self.defaults.model))
-                    .collect::<RpcResult<Vec<_>>>()?;
-                if !models.iter().any(|m| m["isDefault"] == true) {
-                    let mut entry = protocol::model_entry(&self.defaults.model, true);
-                    if self.acp() && self.defaults.model == crate::acp::DEFAULT_MODEL {
-                        entry["displayName"] = json!("Agent default");
-                        entry["description"] = json!("The model the agent selects by default");
-                    }
-                    models.insert(0, entry);
+                // Probing starts a Claude process; other threads must not wait for it.
+                self.catalog_waiters
+                    .push((client, rpc_id.clone(), p.clone()));
+                if self.catalog_waiters.len() == 1 {
+                    self.probe_models();
                 }
-                if let Some(agent) = self.acp_agent.as_ref().filter(|_| self.acp())
-                    && agent["agentCapabilities"]["promptCapabilities"]["image"] != true
-                {
-                    for model in &mut models {
-                        model["inputModalities"] = json!(["text"]);
-                    }
-                }
-                let mut page = page(models, p, false, "models")?;
-                page.as_object_mut().unwrap().remove("backwardsCursor");
-                Ok(Some(page))
+                Ok(None)
             }
             "getAuthStatus" => {
                 // OpenAI credentials do not apply to this provider. Claude
@@ -2764,6 +2922,8 @@ impl Server {
                     self.update_wait_status(id);
                     return;
                 }
+                let record = &self.records[id];
+                let identity = (record.session_id.clone(), record.has_session);
                 if let Some(session_id) = message["session_id"].as_str() {
                     // A fork can receive a fresh backend id; facade thread ids remain stable.
                     self.records.get_mut(id).unwrap().session_id = session_id.to_owned();
@@ -2868,15 +3028,14 @@ impl Server {
                         error,
                     )
                     .await;
-                } else if (message["type"] == "assistant" || message["type"] == "user")
-                    && let Err(error) = self.save(id)
-                {
-                    self.finish(
-                        id,
-                        "failed",
-                        Some(format!("Cannot persist thread: {error}")),
-                    )
-                    .await;
+                } else if message["type"] == "assistant" || message["type"] == "user" {
+                    // Which native session to resume must survive a crash at once.
+                    let record = &self.records[id];
+                    if identity != (record.session_id.clone(), record.has_session) {
+                        self.persist_now(id);
+                    } else {
+                        self.persist_soon(id);
+                    }
                 }
             }
         }
@@ -2935,9 +3094,11 @@ impl Server {
             return;
         };
         active.cancel.cancel();
-        if let Some(runtime) = &active.plugins {
-            runtime.client.shutdown().await;
+        if let Some(runtime) = active.plugins.take() {
+            tokio::spawn(async move { runtime.client.shutdown().await });
         }
+        // A finished worker has already released its process; a cancelled one
+        // only has to kill it.
         let _ = active.worker.await;
         let events = active.translator.finish();
         self.translated(id, events);
@@ -2984,6 +3145,8 @@ impl Server {
             }
             self.emit_resolved(&pending, json!(request_id));
         }
+        // The completed turn is saved below, with everything streamed before it.
+        self.unsaved.remove(id);
         let record = self.records.get_mut(id).unwrap();
         let turn = record.turns.last_mut().unwrap();
         turn["status"] = json!(status);
@@ -3504,7 +3667,7 @@ impl Server {
                     self.emit(&thread, notification("thread/tokenUsage/updated",
                         json!({"threadId": thread, "turnId": turn_id, "tokenUsage": token_usage})));
                 }
-                self.persist(&thread);
+                self.persist_soon(&thread);
                 true
             }
             _ => false,
@@ -4332,6 +4495,19 @@ fn subagent_read_only() -> RpcError {
     )
 }
 
+/// Names of the settings fields that differ between two thread configurations.
+fn changed_settings(current: &Settings, requested: &Settings) -> RpcResult<Vec<String>> {
+    let current = serde_json::to_value(current).map_err(RpcError::internal)?;
+    let requested = serde_json::to_value(requested).map_err(RpcError::internal)?;
+    Ok(current
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, value)| requested.get(name.as_str()) != Some(*value))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
 /// Text of a user frame that carries no tool results (a continued agent's input).
 fn user_text(frame: &Value) -> Option<String> {
     let content = &frame["message"]["content"];
@@ -4509,6 +4685,8 @@ struct LaunchedTurn {
 }
 
 struct BackendTurn {
+    /// The thread's previous Claude process, still closing.
+    previous_process: Option<tokio::task::JoinHandle<()>>,
     config: BackendConfig,
     plugins: Option<(
         crate::codex_plugins::Config,
@@ -4532,6 +4710,7 @@ struct BackendTurn {
 
 async fn run_backend(turn: BackendTurn) {
     let BackendTurn {
+        mut previous_process,
         config,
         plugins,
         mut options,
@@ -4578,6 +4757,10 @@ async fn run_backend(turn: BackendTurn) {
     let mut queued_input = Vec::new();
     let spawned = {
         let future = async {
+            // Two processes must never share a session.
+            if let Some(previous) = &mut previous_process {
+                let _ = previous.await;
+            }
             if let Some(warm) = warm {
                 if let Some(runtime) = &warm.plugins {
                     events
