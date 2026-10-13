@@ -56,8 +56,8 @@ pub struct RecoveryPlan {
     pub anchor: Option<NativeAnchor>,
 }
 
-/// Call only after confirming the thread has no active backend turn. The caller
-/// must apply both the facade prefix and the native fork atomically to its record.
+/// Recover an idle thread or initialize a fork from a completed parent prefix.
+/// The caller must apply the facade prefix and native fork atomically to its record.
 /// `latest_anchor` allows full snapshots of records written before per-turn
 /// anchors existed; it must never stand in for a missing earlier boundary.
 pub fn plan_prefix(

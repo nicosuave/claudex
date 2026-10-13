@@ -299,6 +299,9 @@ fn main() {
                         "resume":args.iter().find_map(|a| a.strip_prefix("--resume=")),
                         "resumeAt":args.iter().find_map(|a| a.strip_prefix("--resume-session-at=")),
                         "fork":args.iter().any(|a| a=="--fork-session"),
+                        "systemPrompt":args.iter().find_map(|a| a.strip_prefix("--system-prompt=")),
+                        "appendSystemPrompt":args.iter().find_map(|a| a.strip_prefix("--append-system-prompt=")),
+                        "ephemeral":args.iter().any(|a| a=="--no-session-persistence"),
                         "session":session
                     }).to_string(), false),
                     text if text.starts_with("background-bash") => {

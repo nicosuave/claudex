@@ -35,6 +35,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/start",
     "thread/resume",
     "thread/fork",
+    "thread/inject_items",
     "thread/revert",
     "thread/rollback",
     "thread/approveGuardianDeniedAction",

@@ -174,59 +174,77 @@ impl Client {
         }));
 
         let read_pending = pending.clone();
+        let read_state = state.clone();
         let mut reader = tokio::spawn(async move {
             let mut lines = FramedRead::new(output, LinesCodec::new_with_max_length(MAX_FRAME));
-            while let Some(line) = lines.next().await {
-                let line = line.map_err(|_| {
-                    "Codex plugin service emitted an invalid or oversized frame".to_owned()
-                })?;
-                let envelope: Value = serde_json::from_str(&line)
-                    .map_err(|_| "Codex plugin service emitted invalid JSON".to_owned())?;
-                if !envelope.is_object() {
-                    return Err("Codex plugin service emitted a non-object envelope".to_owned());
-                }
-                if envelope.get("method").is_some() {
-                    // Never drop an approval/elicitation silently. Queue overflow
-                    // closes the sidecar and fails its pending callers explicitly.
-                    events.try_send(envelope).map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            "Codex plugin event queue is full".to_owned()
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            "Codex plugin event receiver is closed".to_owned()
-                        }
+            let result = async {
+                while let Some(line) = lines.next().await {
+                    let line = line.map_err(|_| {
+                        "Codex plugin service emitted an invalid or oversized frame".to_owned()
                     })?;
-                    continue;
-                }
-                let Some(id) = envelope["id"].as_str() else {
-                    return Err("Codex plugin response has no string request id".to_owned());
-                };
-                let sender = read_pending.lock().unwrap().remove(id);
-                // A reply may arrive after its caller timed out or was cancelled.
-                if let Some(sender) = sender {
-                    let response = if let Some(error) = envelope.get("error") {
-                        Err(RpcError {
-                            code: error["code"]
-                                .as_i64()
-                                .and_then(|n| i32::try_from(n).ok())
-                                .unwrap_or(-32603),
-                            message: error["message"]
-                                .as_str()
-                                .unwrap_or("Codex plugin request failed")
-                                .to_owned(),
-                            data: error.get("data").cloned(),
-                        })
-                    } else if let Some(result) = envelope.get("result") {
-                        Ok(result.clone())
-                    } else {
-                        Err(RpcError::internal(
-                            "Codex plugin response has neither result nor error",
-                        ))
+                    let envelope: Value = serde_json::from_str(&line)
+                        .map_err(|_| "Codex plugin service emitted invalid JSON".to_owned())?;
+                    if !envelope.is_object() {
+                        return Err("Codex plugin service emitted a non-object envelope".to_owned());
+                    }
+                    if envelope.get("method").is_some() {
+                        // Never drop an approval/elicitation silently. Queue overflow
+                        // closes the sidecar and fails its pending callers explicitly.
+                        events.try_send(envelope).map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                "Codex plugin event queue is full".to_owned()
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                "Codex plugin event receiver is closed".to_owned()
+                            }
+                        })?;
+                        continue;
+                    }
+                    let Some(id) = envelope["id"].as_str() else {
+                        return Err("Codex plugin response has no string request id".to_owned());
                     };
-                    let _ = sender.send(response);
+                    let sender = read_pending.lock().unwrap().remove(id);
+                    // A reply may arrive after its caller timed out or was cancelled.
+                    if let Some(sender) = sender {
+                        let response = if let Some(error) = envelope.get("error") {
+                            Err(RpcError {
+                                code: error["code"]
+                                    .as_i64()
+                                    .and_then(|n| i32::try_from(n).ok())
+                                    .unwrap_or(-32603),
+                                message: error["message"]
+                                    .as_str()
+                                    .unwrap_or("Codex plugin request failed")
+                                    .to_owned(),
+                                data: error.get("data").cloned(),
+                            })
+                        } else if let Some(result) = envelope.get("result") {
+                            Ok(result.clone())
+                        } else {
+                            Err(RpcError::internal(
+                                "Codex plugin response has neither result nor error",
+                            ))
+                        };
+                        let _ = sender.send(response);
+                    }
                 }
+                Ok::<(), String>(())
             }
-            Err::<(), String>("Codex plugin service closed stdout".to_owned())
+            .await;
+            match result {
+                Err(failure) => {
+                    // Record the reader's cause while stdout is still open.
+                    // Dropping it can make the child exit with SIGPIPE before
+                    // the supervisor observes this task's completion.
+                    read_state
+                        .failure
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(|| failure.clone());
+                    Err(failure)
+                }
+                Ok(()) => Err("Codex plugin service closed stdout".to_owned()),
+            }
         });
         let mut write_task = tokio::spawn(async move {
             while let Some(write) = writes.recv().await {
@@ -264,7 +282,7 @@ impl Client {
                 result = &mut reader => task_failure("reader",result),
                 result = &mut write_task => task_failure("writer",result),
             };
-            *state.failure.lock().unwrap() = Some(failure);
+            state.failure.lock().unwrap().get_or_insert(failure);
             state.alive.store(false, Ordering::Release);
             for (_, sender) in pending.lock().unwrap().drain() {
                 let _ = sender.send(Err(state.error()));

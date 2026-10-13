@@ -116,6 +116,12 @@ approval protocol without persisting approvals, verifies both child results and
 parent links, then archives its generated test threads. It does not install or
 restart the user's service.
 
+Set `CLAUDEX_NATIVE_FACADE_SOCKET` to an installed service's control socket to
+exercise that service instead. Only generated verification chats are archived.
+The `native_side_chat_preserves_parent_snapshot_and_followup_recall` test uses
+the same native executable/socket settings to verify temporary side-chat forks,
+instruction overrides, boundary injection and follow-up recall.
+
 ```sh
 CLAUDEX_NATIVE_CODEX=/absolute/path/to/codex \
 CLAUDEX_NATIVE_CLAUDE=/absolute/path/to/claude \
