@@ -60,14 +60,23 @@ the same sidebar. The desktop app is not modified. It honors `CODEX_CLI_PATH`
 for its local Codex CLI, and the installer writes a stand-in at
 `~/Library/Application Support/claude-codex/router/codex`. Use
 `claudex install --no-ssh` if you don't want the SSH connection; Remote Login is
-then not required. Quit the desktop app and relaunch it with the stand-in:
+then not required.
+
+Install sets `CODEX_CLI_PATH` to the stand-in for your login session with
+`launchctl setenv`, and adds LaunchAgent `com.claude-codex.desktop-env` to set it
+again at each login. The desktop then uses the stand-in however it is opened:
+Dock, Spotlight, login item, or its own relaunch after an update. A desktop that
+was already running keeps its old environment, so quit and reopen it once after
+the first install. The Codex CLI doesn't read the variable, so terminals that
+inherit it are unaffected. `claudex uninstall` removes the LaunchAgent and the
+variable. ACP instances don't set it; launch the desktop with their stand-in
+explicitly:
 
 ```sh
-open -a ChatGPT --env CODEX_CLI_PATH="$HOME/Library/Application Support/claude-codex/router/codex"
+open -a ChatGPT --env CODEX_CLI_PATH="$HOME/Library/Application Support/claude-codex-<provider-id>/router/codex"
 ```
 
-The variable applies only to that launch; starting the app normally returns to
-plain Codex. The stand-in runs the Codex CLI bundled with the desktop app,
+The stand-in runs the Codex CLI bundled with the desktop app,
 unchanged, for every command except the desktop's own app-server launch. That
 launch gets a router (`claudex route`) which:
 
@@ -222,8 +231,8 @@ you explicitly pass `--force`; forcing interrupts those turns. SSH transport
 reconnection preserves live turns, but restarting the facade process does not.
 
 ```sh
-"$facade" service uninstall  # Remove only the LaunchAgent; keep the SSH connection.
-"$facade" uninstall          # Remove the LaunchAgent and managed SSH entries.
+"$facade" service uninstall  # Remove only the service LaunchAgent; keep the SSH connection and desktop routing.
+"$facade" uninstall          # Also remove managed SSH entries and desktop launch routing.
 ```
 
 Both retain conversations, binaries, logs, and identity files. Full uninstall
