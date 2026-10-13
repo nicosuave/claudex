@@ -292,6 +292,38 @@ async fn inputs_preserve_images_and_reject_unsupported_media() {
 }
 
 #[tokio::test]
+async fn local_images_are_sniffed_and_unreadable_files_are_named() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Screenshot.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\nhello").unwrap();
+    let (codex, claude) = user_input(&json!([{"type":"localImage","path":path}]))
+        .await
+        .unwrap();
+    assert_eq!(codex[0]["path"], json!(path));
+    assert_eq!(claude[0]["source"]["media_type"], "image/png");
+    assert_eq!(claude[0]["source"]["data"], "iVBORw0KGgpoZWxsbw==");
+
+    let missing = root.path().join("gone.png");
+    let error = user_input(&json!([{"type":"localImage","path":missing}]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.message.starts_with(&format!(
+            "Cannot read attached image {}:",
+            missing.display()
+        )),
+        "{}",
+        error.message
+    );
+    assert!(
+        user_input(&json!([{"type":"localImage","path":"relative.png"}]))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn selected_skill_is_loaded_and_mentions_preserve_identity() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("SKILL.md");

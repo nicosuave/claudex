@@ -14,7 +14,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
@@ -47,6 +50,17 @@ const CLAUDE_LIST_FILTERS: &[&str] = &[
     "parentThreadId",
     "ancestorThreadId",
 ];
+
+/// Facade methods whose `input` carries the user's message content.
+const INPUT_METHODS: &[&str] = &[
+    "turn/start",
+    "turn/steer",
+    "thread/queue/add",
+    "thread/queue/update",
+];
+/// Encoded image bytes one forwarded request may carry, leaving room for the
+/// rest of the message within the facade's frame limit.
+const MAX_INLINED_IMAGES: usize = MAX_FRAME - 1024 * 1024;
 
 static LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
@@ -584,6 +598,39 @@ fn decode_cursor(cursor: &Value) -> (Value, Option<i64>) {
     (state["codex"].clone(), state["boundary"].as_i64())
 }
 
+/// Embed `localImage` attachments as data URLs before input reaches the facade.
+///
+/// The desktop can attach files that only its own process tree may open, such
+/// as screenshots dragged from the capture thumbnail. The router runs in that
+/// tree; the facade is a separate login-session service that macOS refuses.
+/// Malformed items are left for the facade to reject.
+fn inline_local_images(params: &mut Value) -> Result<(), String> {
+    let Some(input) = params.get_mut("input").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut inlined = 0;
+    for item in input {
+        let Some(path) = item["path"]
+            .as_str()
+            .filter(|_| item["type"] == "localImage")
+        else {
+            continue;
+        };
+        let (mime, bytes) =
+            crate::translate::read_local_image(Path::new(path)).map_err(|error| error.message)?;
+        let url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
+        inlined += url.len();
+        if inlined > MAX_INLINED_IMAGES {
+            return Err("Attached images are too large to send together".into());
+        }
+        let item = item.as_object_mut().expect("typed input items are objects");
+        item.remove("path");
+        item.insert("type".into(), json!("image"));
+        item.insert("url".into(), json!(url));
+    }
+    Ok(())
+}
+
 fn claude_list_query(params: &Value, cursor: Option<Value>) -> Value {
     let mut query = json!({"limit": 1000});
     for field in CLAUDE_LIST_FILTERS {
@@ -724,6 +771,16 @@ impl Router {
                     "threadId" | "path" | "excludeTurns" | "initialTurnsPage"
                 )
             });
+        }
+        if side == Side::Claude
+            && message["method"]
+                .as_str()
+                .is_some_and(|method| INPUT_METHODS.contains(&method))
+            && let Some(params) = message.get_mut("params")
+            && let Err(failure) = inline_local_images(params)
+        {
+            self.send_client(error(message["id"].clone(), failure));
+            return;
         }
         let delegation_scope = match self.prepare_agent_tools(side, &mut message) {
             Ok(scope) => scope,

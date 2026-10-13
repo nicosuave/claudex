@@ -1524,6 +1524,88 @@ async fn service_restart_reconnects_without_sending_claude_requests_to_codex() {
 }
 
 #[tokio::test]
+async fn dropped_images_reach_claude_inline_when_steering_and_queueing() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    // Stands in for a screenshot dragged from the capture thumbnail, which
+    // only the desktop's process tree (where the router runs) may open.
+    let dropped = tempfile::tempdir().unwrap();
+    let image = dropped.path().join("Screenshot.png");
+    let png = b"\x89PNG\r\n\x1a\nscreenshot";
+    std::fs::write(&image, png).unwrap();
+    let attachment = json!({"type":"localImage","path":image});
+    let inlined =
+        json!({"type":"image","url":format!("data:image/png;base64,{}", STANDARD.encode(png))});
+
+    let thread = desktop
+        .thread(json!({"model": "fake-claude", "sandbox": "danger-full-access"}))
+        .await;
+    let reply = desktop.turn(&thread, "fake-claude", "steer-wait").await;
+    let turn = reply["result"]["turn"]["id"].clone();
+    desktop
+        .until(|v| {
+            v["method"] == "item/completed" && v["params"]["item"]["text"] == "Waiting for steering"
+        })
+        .await;
+
+    let missing = desktop
+        .call(
+            "turn/steer",
+            json!({"threadId":thread,"expectedTurnId":turn,
+        "input":[{"type":"localImage","path":dropped.path().join("gone.png")}]}),
+        )
+        .await;
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Cannot read attached image")),
+        "{missing}"
+    );
+    desktop
+        .ok(
+            "turn/steer",
+            json!({"threadId":thread,"expectedTurnId":turn,
+        "input":[{"type":"text","text":"look","text_elements":[]},attachment]}),
+        )
+        .await;
+    let steered = desktop
+        .until(|v| {
+            v["method"] == "item/started"
+                && v["params"]["item"]["type"] == "userMessage"
+                && v["params"]["item"]["content"][0]["text"] == "look"
+        })
+        .await;
+    assert_eq!(steered["params"]["item"]["content"][1], inlined);
+    desktop
+        .ok(
+            "turn/steer",
+            json!({"threadId":thread,"expectedTurnId":turn,
+        "input":[{"type":"text","text":"done","text_elements":[]}]}),
+        )
+        .await;
+    let completed = desktop.completed(&thread).await;
+    assert!(
+        completed["params"]["turn"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["text"] == "Steered: look + done"),
+        "{completed}"
+    );
+
+    // Queued input is replayed by the facade later, so it must be stored inline.
+    let queued = desktop
+        .ok(
+            "thread/queue/add",
+            json!({"threadId":thread,
+        "clientUserMessageId":"queued-image","input":[attachment]}),
+        )
+        .await;
+    assert_eq!(queued["queuedSubmission"]["input"], json!([inlined]));
+}
+
+#[tokio::test]
 async fn other_codex_invocations_run_genuine_codex() {
     let output = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
         .args([
