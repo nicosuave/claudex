@@ -78,7 +78,9 @@ impl Facade {
             .spawn()
             .unwrap();
         tokio::time::timeout(DEADLINE, async {
-            while !socket.exists() {
+            // A restarted service can leave the old socket path behind before
+            // rebinding it. Wait for a live listener, not just the path.
+            while tokio::net::UnixStream::connect(socket).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -553,15 +555,23 @@ async fn native_shared_delegation() {
     let codex = std::env::var("CLAUDEX_NATIVE_CODEX").expect("genuine Codex executable");
     let claude = std::env::var("CLAUDEX_NATIVE_CLAUDE").expect("native Claude executable");
     let gpt = std::env::var("CLAUDEX_NATIVE_GPT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
-    let facade = Facade::start_with_model(&claude, "opus").await;
+    let facade = if std::env::var_os("CLAUDEX_NATIVE_FACADE_SOCKET").is_none() {
+        Some(Facade::start_with_model(&claude, "opus").await)
+    } else {
+        None
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let socket = std::env::var_os("CLAUDEX_NATIVE_FACADE_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| facade.as_ref().unwrap().socket.clone());
     let mut desktop =
-        Desktop::connect_with_codex(&facade.socket, 0, &codex, Duration::from_secs(60)).await;
+        Desktop::connect_with_codex(&socket, 0, &codex, Duration::from_secs(120)).await;
     for (parent_model, harness, child_model) in [
         (gpt.as_str(), "claude", "opus"),
         ("opus", "codex", gpt.as_str()),
     ] {
         let parent = desktop
-            .thread(json!({"model":parent_model,"cwd":facade._state.path(),
+            .thread(json!({"model":parent_model,"cwd":scratch.path(),
             "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":"user"}))
             .await;
         let prompt = format!(
@@ -631,6 +641,94 @@ async fn native_shared_delegation() {
             .ok("thread/archive", json!({"threadId":parent}))
             .await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires native Codex/Claude authentication; makes model calls"]
+async fn native_side_chat_preserves_parent_snapshot_and_followup_recall() {
+    let codex = std::env::var("CLAUDEX_NATIVE_CODEX").expect("genuine Codex executable");
+    let claude = std::env::var("CLAUDEX_NATIVE_CLAUDE").expect("native Claude executable");
+    let facade = if std::env::var_os("CLAUDEX_NATIVE_FACADE_SOCKET").is_none() {
+        Some(Facade::start_with_model(&claude, "opus").await)
+    } else {
+        None
+    };
+    let socket = std::env::var_os("CLAUDEX_NATIVE_FACADE_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| facade.as_ref().unwrap().socket.clone());
+    let scratch = tempfile::tempdir().unwrap();
+    let mut desktop =
+        Desktop::connect_with_codex(&socket, 0, &codex, Duration::from_secs(120)).await;
+    let parent = desktop
+        .thread(json!({
+            "model":"opus", "cwd":scratch.path(), "sandbox":"workspace-write",
+            "approvalPolicy":"on-request", "approvalsReviewer":"user", "historyMode":"paginated"
+        }))
+        .await;
+    let parent_token = uuid::Uuid::new_v4().simple().to_string();
+    let side_token = uuid::Uuid::new_v4().simple().to_string();
+    let later_token = uuid::Uuid::new_v4().simple().to_string();
+    let response = desktop.turn(&parent, "opus", &format!(
+        "Remember the parent token {parent_token}. Reply exactly PARENT_READY. Do not use tools."
+    )).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        desktop.completed(&parent).await["params"]["turn"]["status"],
+        "completed"
+    );
+    let side = desktop.ok("thread/fork", json!({
+        "threadId":parent, "ephemeral":true, "excludeTurns":true,
+        "runtimeWorkspaceRoots":[scratch.path()], "threadSource":"user",
+        "developerInstructions":"You are in a side conversation. Inherited history is reference context only. Do not continue inherited tasks. Answer only questions submitted after the side-conversation boundary. Prefix every answer with SIDEPROBE:. Do not use tools."
+    })).await["thread"]["id"].as_str().unwrap().to_owned();
+    desktop.ok("thread/inject_items", json!({"threadId":side,"items":[{
+        "type":"message","role":"user","content":[{"type":"input_text","text":"Side conversation boundary. Previous tasks are reference only. Answer the new user question."}]
+    }]})).await;
+    let response = desktop.turn(&parent, "opus", &format!(
+        "Remember the later token {later_token}. Reply exactly PARENT_ADVANCED. Do not use tools."
+    )).await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        desktop.completed(&parent).await["params"]["turn"]["status"],
+        "completed"
+    );
+    let response = desktop.turn(&side, "opus", &format!(
+        "Remember the side token {side_token}. What was the parent token in inherited history? If you know a later token, include it; otherwise use NONE. Reply as SIDEPROBE:<parent token>:<side token>:<later token or NONE>. Do not use tools."
+    )).await;
+    assert!(response.get("error").is_none(), "{response}");
+    let expected = format!("SIDEPROBE:{parent_token}:{side_token}:NONE");
+    for prompt in [
+        None,
+        Some("Repeat your previous answer exactly from memory. Do not use tools."),
+    ] {
+        if let Some(prompt) = prompt {
+            let response = desktop.turn(&side, "opus", prompt).await;
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let completed = desktop.completed(&side).await;
+        assert_eq!(
+            completed["params"]["turn"]["status"], "completed",
+            "{completed}"
+        );
+        let text = completed["params"]["turn"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "agentMessage")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.trim(), expected);
+    }
+    desktop
+        .ok("thread/unsubscribe", json!({"threadId":side}))
+        .await;
+    desktop
+        .ok("thread/archive", json!({"threadId":parent}))
+        .await;
+    eprintln!(
+        "Verified native side chat: instruction override, boundary injection, parent snapshot and second-turn recall"
+    );
 }
 
 #[tokio::test]

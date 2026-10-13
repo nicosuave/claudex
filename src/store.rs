@@ -295,11 +295,8 @@ impl Record {
         boundary: &crate::history_recovery::HistoryBoundary,
     ) -> RpcResult<()> {
         use crate::history_recovery::{NativeAnchor, plan_prefix};
-        if self.ephemeral() {
-            return Err(RpcError::invalid(
-                "Ephemeral Claude history cannot be recovered",
-            ));
-        }
+        // A new ephemeral fork can be initialized from its durable parent's
+        // anchors. The server rejects recovery of existing ephemeral history.
         let latest = self
             .backend_message_id
             .as_ref()

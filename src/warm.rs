@@ -99,7 +99,7 @@ impl Parked {
         key: Value,
         session_id: String,
         session: WarmSession,
-        timeout: Duration,
+        timeout: Option<Duration>,
         wake: Wake,
     ) -> Self {
         let reclaim = CancellationToken::new();
@@ -154,7 +154,7 @@ impl Parked {
 async fn watch(
     mut session: WarmSession,
     reclaim: CancellationToken,
-    timeout: Duration,
+    timeout: Option<Duration>,
     key: Value,
     wake: Wake,
     running: Arc<AtomicUsize>,
@@ -164,7 +164,8 @@ async fn watch(
     let mut deadline = session
         .background
         .is_empty()
-        .then(|| Instant::now() + timeout);
+        .then(|| timeout.map(|timeout| Instant::now() + timeout))
+        .flatten();
     loop {
         tokio::select! {
             _ = reclaim.cancelled() => {
@@ -213,7 +214,7 @@ async fn watch(
                     }
                     if session.background.is_empty() {
                         if was_running {
-                            deadline = Some(Instant::now() + timeout.max(ANSWER_GRACE));
+                            deadline = timeout.map(|timeout| Instant::now() + timeout.max(ANSWER_GRACE));
                         }
                     } else {
                         deadline = None;
@@ -256,11 +257,12 @@ fn quiet(event: &BackendEvent) -> bool {
 /// Launch settings a later turn must match to reuse the process. None when the
 /// launch is turn-specific.
 pub fn launch_key(options: &SessionOptions) -> Option<Value> {
-    if options.ephemeral || options.output_schema.is_some() {
+    if options.output_schema.is_some() {
         return None;
     }
     Some(json!({
         "cwd": options.cwd,
+        "ephemeral": options.ephemeral,
         "model": options.model,
         "permissionMode": options.permission_mode,
         "systemPrompt": options.system_prompt,

@@ -603,11 +603,17 @@ impl Server {
     }
     fn park(&mut self, id: String, key: Value, session: crate::warm::WarmSession) {
         self.idle_sessions.retain(|_, parked| parked.is_open());
+        let ephemeral = self.records[&id].ephemeral();
         // Processes running background work are not idle caches; evicting one
         // would kill that work.
-        let idle = |parked: &crate::warm::Parked| parked.running_background() == 0;
-        while self.idle_sessions.values().filter(|p| idle(p)).count()
-            >= self.config.max_idle_sessions
+        // Ephemeral chats need this process for their history, so they are not
+        // expendable cache entries. Closing the chat releases it.
+        let idle = |parked: &crate::warm::Parked| {
+            parked.running_background() == 0 && parked.key["ephemeral"] != true
+        };
+        while !ephemeral
+            && self.idle_sessions.values().filter(|p| idle(p)).count()
+                >= self.config.max_idle_sessions
         {
             let Some(oldest) = self
                 .idle_sessions
@@ -630,7 +636,7 @@ impl Server {
             key,
             session_id,
             session,
-            self.config.idle_session_timeout,
+            (!ephemeral).then_some(self.config.idle_session_timeout),
             wake,
         );
         self.idle_sessions.insert(id, parked);
@@ -1567,10 +1573,16 @@ impl Server {
                         "lastTurnId",
                         "disabledPluginIds",
                         "environmentOverrides",
+                        "baseInstructions",
+                        "developerInstructions",
                     ],
                 )?;
                 let source_id = required_str(p, "threadId")?;
-                self.idle(source_id)?;
+                // ACP forks copy the whole live session. Claude can instead
+                // snapshot a completed prefix while the parent keeps working.
+                if self.acp() {
+                    self.idle(source_id)?;
+                }
                 let source = self.record(source_id)?;
                 if crate::subagents::is_child(source) {
                     return Err(subagent_read_only());
@@ -1580,6 +1592,15 @@ impl Server {
                         "Ephemeral Claude sessions cannot be forked",
                     ));
                 }
+                let mut boundary = crate::history_recovery::HistoryBoundary::for_fork(p)?;
+                if !self.acp()
+                    && boundary == crate::history_recovery::HistoryBoundary::Full
+                    && let Some(turn) = source.turns.last().filter(|t| t["status"] == "inProgress")
+                {
+                    boundary = crate::history_recovery::HistoryBoundary::BeforeTurn(
+                        required_str(turn, "id")?.into(),
+                    );
+                }
                 if self.acp() {
                     if self.acp_lacks("fork") {
                         return Err(RpcError::invalid(
@@ -1588,7 +1609,7 @@ impl Server {
                     }
                     // session/fork copies the whole session; it cannot fork at an earlier turn.
                     let latest = source.turns.last().and_then(|turn| turn["id"].as_str());
-                    match crate::history_recovery::HistoryBoundary::for_fork(p)? {
+                    match &boundary {
                         crate::history_recovery::HistoryBoundary::Full => {}
                         crate::history_recovery::HistoryBoundary::ThroughTurn(id)
                             if Some(id.as_str()) == latest => {}
@@ -1621,7 +1642,7 @@ impl Server {
                 record.session_id = source.session_id.clone();
                 record.fork_from = source.fork_from.clone();
                 record.backend_message_id = source.backend_message_id.clone();
-                record.recover_history(&crate::history_recovery::HistoryBoundary::for_fork(p)?)?;
+                record.recover_history(&boundary)?;
                 self.store.save(&record).map_err(RpcError::internal)?;
                 let id = record.id().to_owned();
                 let result = record.response(!p["excludeTurns"].as_bool().unwrap_or(false), false);
@@ -1631,6 +1652,41 @@ impl Server {
                 self.send(client, response(rpc_id.clone(), result));
                 self.emit(&id, notification("thread/started", json!({"thread": view})));
                 Ok(None)
+            }
+            "thread/inject_items" => {
+                supported_fields(p, &["threadId", "items"])?;
+                let id = required_str(p, "threadId")?;
+                self.idle(id)?;
+                let mut record = self.record(id)?.clone();
+                if record.archived || crate::subagents::is_child(&record) {
+                    return Err(RpcError::invalid(
+                        "Cannot inject into an archived or child thread",
+                    ));
+                }
+                // The desktop injects the side-conversation boundary as a
+                // model-visible user message, without running a turn for it.
+                // Validate the entire batch before queuing any of its context.
+                let mut context = Vec::new();
+                for item in p["items"].as_array().unwrap() {
+                    if item["type"] != "message" || item["role"] != "user" {
+                        return Err(RpcError::invalid("Only user text messages can be injected"));
+                    }
+                    let content = item["content"].as_array().ok_or_else(|| {
+                        RpcError::invalid("Injected messages require a content array")
+                    })?;
+                    for part in content {
+                        if part["type"] != "input_text" || !part["text"].is_string() {
+                            return Err(RpcError::invalid(
+                                "Only input_text content can be injected",
+                            ));
+                        }
+                        context.push(part["text"].as_str().unwrap().to_owned());
+                    }
+                }
+                record.pending_context.extend(context);
+                self.store.save(&record).map_err(RpcError::internal)?;
+                self.records.insert(id.to_owned(), record);
+                Ok(Some(json!({})))
             }
             "thread/revert" | "thread/rollback" => {
                 supported_fields(p, &["threadId", "beforeTurnId", "numTurns"])?;
@@ -1647,6 +1703,11 @@ impl Server {
                     ));
                 }
                 let mut record = self.record(id)?.clone();
+                if record.ephemeral() {
+                    return Err(RpcError::invalid(
+                        "Ephemeral Claude history cannot be recovered",
+                    ));
+                }
                 if record.archived {
                     return Err(RpcError::invalid(
                         "Unarchive the thread before recovering its history",
@@ -1904,6 +1965,10 @@ impl Server {
                     && !self.active.contains_key(id)
                 {
                     self.loaded.remove(id);
+                    if self.records.get(id).is_some_and(Record::ephemeral) {
+                        self.close_idle_session(id);
+                        self.records.remove(id);
+                    }
                 }
                 Ok(Some(json!({"status": status})))
             }
@@ -2700,12 +2765,6 @@ impl Server {
         if crate::subagents::is_child(&record) {
             return Err(subagent_read_only());
         }
-        // Ephemeral sessions have no transcript to resume; retain their process in a future implementation.
-        if record.ephemeral() && !record.turns.is_empty() {
-            return Err(RpcError::invalid(
-                "Multi-turn ephemeral sessions are unsupported; use a durable thread",
-            ));
-        }
         record.settings.apply(p)?;
         self.check_backend_settings(&record.settings)?;
         // A per-turn tier, including "default", leaves the thread's tier unchanged.
@@ -2743,7 +2802,34 @@ impl Server {
                 }
             }
         }
+        let options = self.session_options(
+            &record,
+            p.get("outputSchema").filter(|v| !v.is_null()).cloned(),
+            fast_mode,
+        )?;
+        let launch_key = crate::warm::launch_key(&options).filter(|_| {
+            record.ephemeral()
+                || (self.config.max_idle_sessions > 0
+                    && !self.config.idle_session_timeout.is_zero())
+        });
         let (codex_input, mut claude_input) = translate::user_input(&p["input"]).await?;
+        let needs_ephemeral_process = record.ephemeral() && record.has_session;
+        if needs_ephemeral_process {
+            let parked = self
+                .idle_sessions
+                .get(id)
+                .filter(|p| p.is_open())
+                .ok_or_else(|| {
+                    RpcError::invalid(
+                        "This temporary chat's Claude process ended; open a new side chat",
+                    )
+                })?;
+            if let Some(reason) = crate::warm::mismatch(parked, &options, launch_key.as_ref()) {
+                return Err(RpcError::invalid(format!(
+                    "Cannot restart a temporary chat without losing its history: {reason}"
+                )));
+            }
+        }
         record.tracks_turn_anchors = true;
         append_additional_context(&mut claude_input, &p["additionalContext"]);
         // Context queued while the thread was idle precedes the new input.
@@ -2779,15 +2865,12 @@ impl Server {
         }
         record.touch();
         self.store.save(&record).map_err(RpcError::internal)?;
-        let options = self.session_options(
-            &record,
-            p.get("outputSchema").filter(|v| !v.is_null()).cloned(),
-            fast_mode,
-        )?;
-        let launch_key = crate::warm::launch_key(&options).filter(|_| {
-            self.config.max_idle_sessions > 0 && !self.config.idle_session_timeout.is_zero()
-        });
         let warm = self.reclaim(id, &options, launch_key.as_ref()).await;
+        if needs_ephemeral_process && warm.is_none() {
+            return Err(RpcError::invalid(
+                "This temporary chat's Claude process ended; open a new side chat",
+            ));
+        }
         self.spawn_turn(
             &record,
             LaunchedTurn {

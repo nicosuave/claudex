@@ -160,6 +160,164 @@ fn assert_fork(args: &Value, checkpoint: &Value) {
     assert_ne!(args["session"], checkpoint["session_id"]);
 }
 
+fn answer(turn: &Value) -> &str {
+    turn["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "agentMessage")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn desktop_side_chat_forks_injects_boundary_and_keeps_temporary_history() {
+    let state = tempfile::tempdir().unwrap();
+    // Temporary history must survive even when the durable-process cache is disabled.
+    let mut peer = Peer::open_with_args(state.path(), &["--max-idle-sessions=0"]).await;
+    let source = peer
+        .ok(
+            "thread/start",
+            json!({
+                "sandbox":"danger-full-access", "baseInstructions":"Parent base",
+                "developerInstructions":"Parent developer"
+            }),
+        )
+        .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first = peer.say(&source, "parent history").await;
+    let original = record(state.path(), &source);
+    let checkpoint = &original["turn_anchors"][first["id"].as_str().unwrap()];
+    let fork = peer
+        .ok(
+            "thread/fork",
+            json!({
+                "threadId":source, "ephemeral":true, "excludeTurns":true,
+                "baseInstructions":"Side base", "developerInstructions":"Side developer"
+            }),
+        )
+        .await;
+    let side = fork["thread"]["id"].as_str().unwrap();
+    assert_eq!(fork["thread"]["ephemeral"], true);
+    assert!(fork["thread"]["path"].is_null());
+    assert_eq!(fork["thread"]["turns"], json!([]));
+    assert_eq!(peer.ok("thread/inject_items", json!({"threadId":side,"items":[{
+        "type":"message", "role":"user", "content":[{"type":"input_text","text":"Side boundary"}]
+    }]})).await, json!({}));
+    let first_side = peer.say(side, "first question").await;
+    assert_eq!(answer(&first_side), "Echo: Side boundary\nfirst question");
+    let args = peer.args(side).await;
+    assert_fork(&args, checkpoint);
+    assert_eq!(args["systemPrompt"], "Side base");
+    assert!(
+        args["appendSystemPrompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("Side developer\n")
+    );
+    assert_eq!(args["ephemeral"], true);
+    let process = peer.say(side, "process-info").await;
+    assert!(answer(&process).ends_with("prompt 3"), "{process}");
+    let changed = peer.request("turn/start", json!({
+        "threadId":side,"input":[{"type":"text","text":"discard history"}],"model":"different-model"
+    })).await;
+    assert!(
+        changed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot restart a temporary chat")
+    );
+    let continued = peer.say(side, "process-info").await;
+    assert_eq!(
+        answer(&continued).split(" prompt ").next(),
+        answer(&process).split(" prompt ").next()
+    );
+    assert!(answer(&continued).ends_with("prompt 4"));
+    let list = peer.ok("thread/list", json!({})).await;
+    assert!(
+        !list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == side)
+    );
+    assert!(
+        !state
+            .path()
+            .join("threads")
+            .join(format!("{side}.json"))
+            .exists()
+    );
+    assert_eq!(record(state.path(), &source), original);
+    peer.ok("thread/unsubscribe", json!({"threadId":side}))
+        .await;
+    assert!(
+        peer.request("thread/read", json!({"threadId":side,"includeTurns":false}))
+            .await
+            .get("error")
+            .is_some()
+    );
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn side_chat_snapshots_completed_history_without_interrupting_active_parent() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(state.path()).await;
+    let source = peer.thread("legacy").await;
+    let first = peer.say(&source, "completed parent history").await;
+    let checkpoint =
+        record(state.path(), &source)["turn_anchors"][first["id"].as_str().unwrap()].clone();
+    let active = peer.start(&source, "hang").await;
+    let fork = peer
+        .ok("thread/fork", json!({"threadId":source,"ephemeral":true}))
+        .await;
+    assert_eq!(fork["thread"]["turns"], json!([first]));
+    let side = fork["thread"]["id"].as_str().unwrap();
+    assert_fork(&peer.args(side).await, &checkpoint);
+    assert_eq!(
+        peer.ok(
+            "thread/read",
+            json!({"threadId":source,"includeTurns":true})
+        )
+        .await["thread"]["status"]["type"],
+        "active"
+    );
+    assert!(
+        peer.request(
+            "thread/fork",
+            json!({"threadId":source,"lastTurnId":active})
+        )
+        .await
+        .get("error")
+        .is_some()
+    );
+    peer.ok("turn/interrupt", json!({"threadId":source,"turnId":active}))
+        .await;
+    peer.complete(&active).await;
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn injected_context_rejects_unsupported_items_without_partial_mutation() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(state.path()).await;
+    let thread = peer.thread("legacy").await;
+    let error = peer.request("thread/inject_items", json!({"threadId":thread,"items":[
+        {"type":"message","role":"user","content":[{"type":"input_text","text":"must not be queued"}]},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"unsupported"}]}
+    ]})).await;
+    assert!(error.get("error").is_some());
+    assert_eq!(
+        answer(&peer.say(&thread, "ordinary prompt").await),
+        "Echo: ordinary prompt"
+    );
+    peer.close().await;
+}
+
 fn validate_revert(value: &Value) {
     let root: Value = serde_json::from_str(include_str!("../protocol/codex-0.160.0.json")).unwrap();
     let mut schema = root["definitions"]["v2"]["ThreadRevertResponse"].clone();
