@@ -1,7 +1,8 @@
 //! Deterministic stand-in for genuine `codex app-server`, used to test the
 //! local router. Threads live in memory; `FAKE_CODEX_THREADS=n` seeds `n`
 //! persisted threads with descending timestamps. `fake/state` reports what the
-//! router asked of this backend.
+//! router asked of this backend. Sections start with Codex's built-in pinned
+//! section; `threadSection/list` pages two sections at a time.
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -192,6 +193,8 @@ fn thread(id: &str, created: i64, model: &str, turns: usize) -> Value {
         "status": {"type": "idle"}, "fakeTurns": turns})
 }
 
+const PINNED_SECTION: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--version") {
@@ -212,6 +215,10 @@ fn main() {
         .collect();
     let mut unsubscribed: Vec<String> = vec![];
     let mut requests: Vec<String> = vec![];
+    let mut app_params: Vec<Value> = vec![];
+    let mut sections = vec![json!({"id": PINNED_SECTION, "name": "Pinned", "appearance": null})];
+    // Section id -> member thread ids in position order.
+    let mut members = HashMap::<String, Vec<String>>::new();
     let mut serial = 0u64;
     let mut default_model = "gpt-fake".to_owned();
     let mut effective = HashMap::<String, Value>::new();
@@ -461,6 +468,81 @@ fn main() {
             "thread/loaded/list" => Ok(
                 json!({"data": threads.iter().map(|t| t["id"].clone()).collect::<Vec<_>>(), "nextCursor": null}),
             ),
+            "app/list" | "app/installed" | "app/read" => {
+                app_params.push(p.clone());
+                Ok(json!({"data": [], "nextCursor": null}))
+            }
+            "threadSection/list" => {
+                let start: usize = p["cursor"]
+                    .as_str()
+                    .map(|c| c.strip_prefix("fake-section:").unwrap().parse().unwrap())
+                    .unwrap_or(0);
+                let end = (start + 2).min(sections.len());
+                let next = (end < sections.len()).then(|| format!("fake-section:{end}"));
+                Ok(json!({"data": &sections[start..end], "nextCursor": next}))
+            }
+            "threadSection/create" => {
+                serial += 1;
+                let section = json!({"id": format!("0199{serial:04}-0000-7000-8000-5ec710000000"),
+                    "name": p["name"], "appearance": null});
+                sections.push(section.clone());
+                Ok(json!({"section": section}))
+            }
+            "threadSection/update" => {
+                match sections.iter_mut().find(|s| s["id"] == p["sectionId"]) {
+                    Some(section) => {
+                        section["name"] = p["name"].clone();
+                        Ok(json!({"section": section}))
+                    }
+                    None => Err("thread section not found"),
+                }
+            }
+            "threadSection/delete" => {
+                // As in Codex's state DB, members become unsectioned.
+                sections.retain(|s| s["id"] != p["sectionId"]);
+                members.remove(p["sectionId"].as_str().unwrap_or(""));
+                for thread in threads.iter_mut() {
+                    if thread["section"]["id"] == p["sectionId"] {
+                        thread["section"] = Value::Null;
+                    }
+                }
+                Ok(json!({}))
+            }
+            "thread/section/move" => {
+                let thread_id = p["threadId"].as_str().unwrap_or("").to_owned();
+                let section = sections.iter().find(|s| s["id"] == p["sectionId"]).cloned();
+                let before = p["beforeThreadId"].as_str();
+                if !threads.iter().any(|t| t["id"] == thread_id.as_str()) {
+                    Err("thread not found")
+                } else if !p["sectionId"].is_null() && section.is_none() {
+                    Err("section does not exist")
+                } else if before.is_some_and(|before| {
+                    !members
+                        .get(p["sectionId"].as_str().unwrap_or(""))
+                        .is_some_and(|list| list.iter().any(|id| id == before))
+                }) {
+                    Err("before thread is not in section")
+                } else {
+                    for list in members.values_mut() {
+                        list.retain(|id| *id != thread_id);
+                    }
+                    if let Some(section) = &section {
+                        let list = members
+                            .entry(section["id"].as_str().unwrap().to_owned())
+                            .or_default();
+                        let index = before
+                            .and_then(|before| list.iter().position(|id| id == before))
+                            .unwrap_or(list.len());
+                        list.insert(index, thread_id.clone());
+                    }
+                    let thread = threads
+                        .iter_mut()
+                        .find(|t| t["id"] == thread_id.as_str())
+                        .unwrap();
+                    thread["section"] = section.unwrap_or(Value::Null);
+                    Ok(json!({}))
+                }
+            }
             "thread/list" | "thread/search" => {
                 let field = match p["sortKey"].as_str() {
                     Some("updated_at") => "updatedAt",
@@ -476,10 +558,20 @@ fn main() {
                             && p["searchTerm"]
                                 .as_str()
                                 .is_none_or(|term| t["id"].as_str().unwrap().contains(term))
+                            && p.get("sectionId")
+                                .is_none_or(|section| t["section"]["id"] == *section)
                     })
                     .cloned()
                     .collect();
-                listed.sort_by_key(|t| -t[field].as_i64().unwrap());
+                if p["sortKey"] == "section_position" {
+                    let order = members
+                        .get(p["sectionId"].as_str().unwrap_or(""))
+                        .cloned()
+                        .unwrap_or_default();
+                    listed.sort_by_key(|t| order.iter().position(|id| t["id"] == id.as_str()));
+                } else {
+                    listed.sort_by_key(|t| -t[field].as_i64().unwrap());
+                }
                 let start: usize = p["cursor"]
                     .as_str()
                     .map(|c| c.strip_prefix("fake:").unwrap().parse().unwrap())
@@ -499,7 +591,9 @@ fn main() {
                 let next = (end < listed.len()).then(|| format!("fake:{end}"));
                 Ok(json!({"data": page, "nextCursor": next, "backwardsCursor": "fake-backwards"}))
             }
-            "fake/state" => Ok(json!({"unsubscribed": unsubscribed, "requests": requests})),
+            "fake/state" => {
+                Ok(json!({"unsubscribed": unsubscribed, "requests": requests, "apps": app_params}))
+            }
             _ => Err("unsupported"),
         };
         emit(match result {

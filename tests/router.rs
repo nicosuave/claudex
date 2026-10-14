@@ -1207,6 +1207,194 @@ async fn merged_pages_keep_every_thread_exactly_once_in_order() {
     }
 }
 
+/// Every source kind, as the desktop lists a section's members.
+const ALL_SOURCE_KINDS: &[&str] = &[
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+];
+
+/// Thread ids in a section, paging the way the desktop does.
+async fn section_members(desktop: &mut Desktop, section: &str, limit: u64) -> Vec<String> {
+    let mut members = vec![];
+    let mut cursor = Value::Null;
+    loop {
+        let page = desktop
+            .ok(
+                "thread/list",
+                json!({"cursor":cursor,"limit":limit,"modelProviders":[],"sectionId":section,
+                    "sortKey":"section_position","sourceKinds":ALL_SOURCE_KINDS,"useStateDbOnly":true}),
+            )
+            .await;
+        members.extend(ids(&page));
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            return members;
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_threads_share_codex_sections_through_the_router() {
+    const PINNED: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let codex = desktop.thread(json!({"model": "gpt-fake"})).await;
+    let claude = desktop.thread(json!({"model": "opus"})).await;
+    let second = desktop.thread(json!({"model": "opus"})).await;
+    desktop
+        .ok(
+            "thread/section/move",
+            json!({"threadId": codex, "sectionId": PINNED, "beforeThreadId": null}),
+        )
+        .await;
+    // Neither backend can order its threads around the other's: a Claude
+    // thread placed before a Codex one follows Codex's members.
+    desktop
+        .ok(
+            "thread/section/move",
+            json!({"threadId": claude, "sectionId": PINNED, "beforeThreadId": codex}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/section/move",
+            json!({"threadId": second, "sectionId": PINNED, "beforeThreadId": claude}),
+        )
+        .await;
+    let read = desktop.ok("thread/read", json!({"threadId": claude})).await;
+    assert_eq!(
+        read["thread"]["section"],
+        json!({"id": PINNED, "name": "Pinned", "appearance": null})
+    );
+    let pinned = section_members(&mut desktop, PINNED, 100).await;
+    assert_eq!(pinned, [codex.clone(), second.clone(), claude.clone()]);
+    assert_eq!(section_members(&mut desktop, PINNED, 1).await, pinned);
+    // Codex's sections page two at a time; the router reads every page to
+    // find a destination.
+    desktop
+        .ok("threadSection/create", json!({"name": "Someday"}))
+        .await;
+    let work = desktop
+        .ok("threadSection/create", json!({"name": "Work"}))
+        .await["section"]
+        .clone();
+    let work_id = work["id"].as_str().unwrap();
+    desktop
+        .ok(
+            "thread/section/move",
+            json!({"threadId": second, "sectionId": work_id}),
+        )
+        .await;
+    assert_eq!(
+        section_members(&mut desktop, PINNED, 100).await,
+        [codex.clone(), claude.clone()]
+    );
+    assert_eq!(
+        section_members(&mut desktop, work_id, 100).await,
+        [second.clone()]
+    );
+    let missing = desktop
+        .call(
+            "thread/section/move",
+            json!({"threadId": claude, "sectionId": "0199ffff-0000-7000-8000-000000000000"}),
+        )
+        .await;
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist"),
+        "{missing}"
+    );
+    // Codex renames and deletions reach the Claude thread's copy.
+    desktop
+        .ok(
+            "threadSection/update",
+            json!({"sectionId": work_id, "name": "Renamed"}),
+        )
+        .await;
+    let read = desktop.ok("thread/read", json!({"threadId": second})).await;
+    assert_eq!(read["thread"]["section"]["name"], "Renamed");
+    desktop
+        .ok("threadSection/delete", json!({"sectionId": work_id}))
+        .await;
+    let read = desktop.ok("thread/read", json!({"threadId": second})).await;
+    assert_eq!(read["thread"]["section"], Value::Null);
+    let unsectioned = desktop
+        .ok("thread/list", json!({"limit": 100, "sectionId": null}))
+        .await;
+    assert!(ids(&unsectioned).contains(&second), "{unsectioned}");
+    assert!(!ids(&unsectioned).contains(&claude), "{unsectioned}");
+    desktop
+        .ok(
+            "thread/section/move",
+            json!({"threadId": claude, "sectionId": null}),
+        )
+        .await;
+    assert_eq!(section_members(&mut desktop, PINNED, 100).await, [codex]);
+}
+
+#[tokio::test]
+async fn deleting_a_claude_thread_forgets_it_and_apps_go_to_codex() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let codex = desktop.thread(json!({"model": "gpt-fake"})).await;
+    let claude = desktop.thread(json!({"model": "opus"})).await;
+    // Apps do not depend on the chat's model; Codex never sees the Claude id.
+    desktop
+        .ok("app/list", json!({"threadId": claude, "limit": 10}))
+        .await;
+    desktop
+        .ok(
+            "app/read",
+            json!({"threadId": claude, "appIds": ["fixture"]}),
+        )
+        .await;
+    desktop
+        .ok("app/installed", json!({"threadId": codex}))
+        .await;
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert_eq!(
+        state["apps"],
+        json!([{"limit": 10}, {"appIds": ["fixture"]}, {"threadId": codex}])
+    );
+
+    let goal = desktop
+        .ok("thread/goal/get", json!({"threadId": claude}))
+        .await;
+    assert_eq!(goal, json!({"goal": null}));
+    desktop
+        .ok("thread/delete", json!({"threadId": claude}))
+        .await;
+    desktop
+        .until(|v| v["method"] == "thread/deleted" && v["params"]["threadId"] == claude)
+        .await;
+    let listed = desktop.ok("thread/list", json!({"limit": 100})).await;
+    assert_eq!(ids(&listed), [codex.clone()]);
+    // The router no longer assumes Claude owns the id: it asks the facade,
+    // which no longer knows it, and then genuine Codex.
+    let read = desktop
+        .call("thread/read", json!({"threadId": claude}))
+        .await;
+    assert!(read["error"].is_object(), "{read}");
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("thread/read")),
+        "{state}"
+    );
+}
+
 #[tokio::test]
 async fn claude_server_requests_round_trip_with_namespaced_ids() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_approval-claude")).await;

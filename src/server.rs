@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     backend::{Backend, BackendConfig, BackendEvent, BackendProtocol, SessionOptions},
     protocol::{
-        self, ADOPT_THREAD_METHOD, RpcError, RpcResult, Schemas, notification, now_ms,
-        required_str, response, supported_fields,
+        self, ADOPT_THREAD_METHOD, RpcError, RpcResult, SECTION_CHANGED_METHOD, Schemas,
+        notification, now_ms, required_str, response, supported_fields,
     },
     store::{ModelDefaults, Record, Settings, Store},
     translate::{self, Translator},
@@ -1099,6 +1099,8 @@ impl Server {
             self.adopt_thread(client, &id, &message["params"]).await
         } else if method == "claudex/delegation/attach" {
             self.attach_delegation_tools(&message["params"])
+        } else if method == SECTION_CHANGED_METHOD {
+            self.section_changed(&message["params"])
         } else {
             match Schemas::get().validate(method, &message) {
                 Ok(()) => {
@@ -1941,6 +1943,25 @@ impl Server {
                 }
                 Ok(None)
             }
+            "thread/delete" => {
+                supported_fields(p, &["threadId"])?;
+                let id = required_str(p, "threadId")?;
+                self.delete_thread(client, rpc_id, id).await?;
+                Ok(None)
+            }
+            "thread/goal/get" => {
+                supported_fields(p, &["threadId"])?;
+                self.record(required_str(p, "threadId")?)?;
+                // Goals are a Codex runtime feature; Claude threads never have one.
+                Ok(Some(json!({"goal": null})))
+            }
+            "thread/searchOccurrences" => {
+                supported_fields(p, &["threadId", "searchTerm", "cursor", "limit"])?;
+                let id = required_str(p, "threadId")?;
+                let turns = &self.record(id)?.turns;
+                crate::occurrences::search(id, turns, p, |turn| turn_cursor(id, turn)).map(Some)
+            }
+            "thread/section/move" => self.move_to_section(p).map(Some),
             "thread/unsubscribe" => {
                 supported_fields(p, &["threadId"])?;
                 let id = required_str(p, "threadId")?;
@@ -2419,6 +2440,7 @@ impl Server {
                 "useStateDbOnly",
                 "ancestorThreadId",
                 "parentThreadId",
+                "sectionId",
             ],
         )?;
         let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
@@ -2431,13 +2453,20 @@ impl Server {
             (None, Some(ancestor)) => Some((ancestor, true)),
             (None, None) => None,
         };
+        // None orders a section by its own positions, as Codex does.
         let sort_key = match p["sortKey"].as_str().unwrap_or("created_at") {
-            "created_at" => "createdAt",
-            "updated_at" => "updatedAt",
-            "recency_at" => "recencyAt",
+            "created_at" => Some("createdAt"),
+            "updated_at" => Some("updatedAt"),
+            "recency_at" => Some("recencyAt"),
+            "section_position" if p["sectionId"].is_string() => None,
+            "section_position" => {
+                return Err(RpcError::invalid(
+                    "section-position sorting requires a section filter",
+                ));
+            }
             _ => return Err(RpcError::invalid("Unsupported thread sortKey")),
         };
-        let mut threads: Vec<Value> = self
+        let mut records: Vec<&Record> = self
             .records
             .values()
             .filter(|r| {
@@ -2459,6 +2488,9 @@ impl Server {
                     && !r.ephemeral()
                     && p.get("projectId")
                         .is_none_or(|v| *v == r.thread["projectId"])
+                    // Present and null selects unsectioned threads.
+                    && p.get("sectionId")
+                        .is_none_or(|v| *v == r.thread["section"]["id"])
                     && p["modelProviders"].as_array().is_none_or(|v| {
                         v.is_empty() || v.iter().any(|p| *p == protocol::provider().id.as_str())
                     })
@@ -2475,15 +2507,23 @@ impl Server {
                             .contains(&s.to_lowercase())
                     })
             })
+            .collect();
+        records.sort_by_key(|r| {
+            let value = match sort_key {
+                Some(key) => r.thread[key].as_u64().unwrap_or(0),
+                None => r
+                    .section_position
+                    .and_then(|position| u64::try_from(position).ok())
+                    .unwrap_or(0),
+            };
+            (value, r.id().to_owned())
+        });
+        let threads = records
+            .into_iter()
             .map(|r| r.view(false, self.loaded.contains(r.id())))
             .collect();
-        threads.sort_by_key(|v| {
-            (
-                v[sort_key].as_u64().unwrap_or(0),
-                v["id"].as_str().unwrap_or("").to_owned(),
-            )
-        });
-        page(threads, p, true, "threads")
+        // Timestamps default to newest first; section positions to first placed.
+        page(threads, p, sort_key.is_some(), "threads")
     }
 
     /// Whether `record` is a (transitive, when `any_depth`) child of `ancestor`.
@@ -2502,6 +2542,246 @@ impl Server {
                 .and_then(|r| r.thread["parentThreadId"].as_str());
         }
         false
+    }
+
+    /// Codex's `thread/delete`: the thread and its subagent descendants,
+    /// deepest first, each announced to every client. Claude's own session
+    /// transcripts under `~/.claude` are the user's data and are kept.
+    async fn delete_thread(&mut self, client: u64, rpc_id: &Value, id: &str) -> RpcResult<()> {
+        if self.record(id)?.ephemeral() {
+            return Err(RpcError::invalid(format!(
+                "Thread is not persisted and cannot be deleted: {id}"
+            )));
+        }
+        let subtree = self.subtree(id);
+        // Codex shuts a running thread down first. A subagent's work runs in
+        // its root's turn, which cannot stop for one subagent alone.
+        let in_use = self.active.iter().any(|(root, active)| {
+            root.as_str() != id
+                && active.agents.runs.values().any(|run| {
+                    run.thread_id
+                        .as_ref()
+                        .is_some_and(|thread| subtree.contains(thread))
+                })
+        });
+        if in_use {
+            return Err(RpcError::invalid(
+                "A running turn on the parent thread still uses this subagent thread; interrupt it first",
+            ));
+        }
+        if self.active.contains_key(id) {
+            self.finish(id, "interrupted", Some("Thread was deleted".into()))
+                .await;
+        }
+        let order: Vec<String> = subtree[1..]
+            .iter()
+            .rev()
+            .chain(&subtree[..1])
+            .cloned()
+            .collect();
+        let mut deleted = Vec::new();
+        let mut failure = None;
+        for thread in order {
+            if let Err(error) = self.store.delete(&thread) {
+                failure = Some(RpcError::internal(format!(
+                    "Cannot delete thread {thread}: {error:#}"
+                )));
+                break;
+            }
+            self.forget_thread(&thread);
+            deleted.push(thread);
+        }
+        self.forget_agent_threads(&deleted);
+        if let Some(error) = failure {
+            self.announce_deleted(&deleted);
+            return Err(error);
+        }
+        self.send(client, response(rpc_id.clone(), json!({})));
+        self.announce_deleted(&deleted);
+        Ok(())
+    }
+
+    /// `id` followed by its subagent descendants, breadth first.
+    fn subtree(&self, id: &str) -> Vec<String> {
+        let mut subtree = vec![id.to_owned()];
+        let mut next = 0;
+        while let Some(parent) = subtree.get(next).cloned() {
+            let children: Vec<String> = self
+                .records
+                .values()
+                .filter(|record| record.thread["parentThreadId"] == parent.as_str())
+                .map(|record| record.id().to_owned())
+                .collect();
+            subtree.extend(children);
+            next += 1;
+        }
+        subtree
+    }
+
+    /// Drop a deleted thread's live state: its idle Claude process, record,
+    /// pending save, subscriptions and loaded status.
+    fn forget_thread(&mut self, id: &str) {
+        self.close_idle_session(id);
+        self.records.remove(id);
+        self.unsaved.remove(id);
+        self.loaded.remove(id);
+        for connection in self.connections.values_mut() {
+            connection.subscriptions.remove(id);
+        }
+    }
+
+    /// A later continuation of a deleted subagent must not resume its thread.
+    fn forget_agent_threads(&mut self, deleted: &[String]) {
+        let owners: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| {
+                record
+                    .agents
+                    .values()
+                    .any(|thread| deleted.contains(thread))
+            })
+            .map(|record| record.id().to_owned())
+            .collect();
+        for owner in owners {
+            if let Some(record) = self.records.get_mut(&owner) {
+                record.agents.retain(|_, thread| !deleted.contains(thread));
+            }
+            self.persist(&owner);
+        }
+    }
+
+    /// Codex announces deletions to every client, not only subscribers.
+    fn announce_deleted(&self, ids: &[String]) {
+        for id in ids {
+            let message = notification("thread/deleted", json!({"threadId": id}));
+            for (&client, connection) in &self.connections {
+                if connection.ready && !connection.opt_out.contains("thread/deleted") {
+                    self.send(client, message.clone());
+                }
+            }
+        }
+    }
+
+    /// Codex's `thread/section/move`. Sections belong to genuine Codex, so the
+    /// router finds the destination there and passes it as `claudexSection`.
+    fn move_to_section(&mut self, p: &Value) -> RpcResult<Value> {
+        supported_fields(
+            p,
+            &["threadId", "sectionId", "beforeThreadId", "claudexSection"],
+        )?;
+        let id = required_str(p, "threadId")?;
+        let section_id = p["sectionId"].as_str();
+        let before = p["beforeThreadId"].as_str();
+        if section_id.is_some_and(|section| section.trim().is_empty()) {
+            return Err(RpcError::invalid("sectionId must not be empty"));
+        }
+        if section_id.is_none() && before.is_some() {
+            return Err(RpcError::invalid(
+                "beforeThreadId requires a non-null sectionId",
+            ));
+        }
+        let mut record = self.record(id)?.clone();
+        if record.ephemeral() {
+            return Err(RpcError::invalid(format!(
+                "Ephemeral thread does not support section moves: {id}"
+            )));
+        }
+        let Some(section_id) = section_id else {
+            record.thread["section"] = Value::Null;
+            record.thread["sectionEnteredAt"] = Value::Null;
+            record.section_position = None;
+            self.store.save(&record).map_err(RpcError::internal)?;
+            self.records.insert(id.to_owned(), record);
+            return Ok(json!({}));
+        };
+        let section = &p["claudexSection"];
+        if section["id"] != section_id || !section["name"].is_string() {
+            return Err(RpcError::invalid(
+                "Thread sections belong to genuine Codex; move Claude threads through the desktop router",
+            ));
+        }
+        if before == Some(id) {
+            return Err(RpcError::invalid(format!(
+                "Thread {id} cannot be moved before itself"
+            )));
+        }
+        let mut members: Vec<&Record> = self
+            .records
+            .values()
+            .filter(|member| member.id() != id && member.thread["section"]["id"] == section_id)
+            .collect();
+        members.sort_by_key(|member| (member.section_position, member.id().to_owned()));
+        let mut order: Vec<String> = members
+            .iter()
+            .map(|member| member.id().to_owned())
+            .collect();
+        let index = match before {
+            Some(before) => order
+                .iter()
+                .position(|member| member == before)
+                .ok_or_else(|| {
+                    RpcError::invalid(format!(
+                        "Before thread {before} is not in section {section_id}"
+                    ))
+                })?,
+            None => order.len(),
+        };
+        order.insert(index, id.to_owned());
+        if record.thread["section"]["id"] != section_id {
+            record.thread["section"] = section.clone();
+            record.thread["sectionEnteredAt"] = json!(protocol::now());
+        }
+        // Members are renumbered in order; only changed positions are saved.
+        let mut changed = Vec::new();
+        for (position, member) in order.into_iter().enumerate() {
+            let position = i64::try_from(position).ok();
+            if member == id {
+                record.section_position = position;
+            } else if self.records[&member].section_position != position {
+                let mut updated = self.records[&member].clone();
+                updated.section_position = position;
+                changed.push(updated);
+            }
+        }
+        changed.push(record);
+        for updated in &changed {
+            self.store.save(updated).map_err(RpcError::internal)?;
+        }
+        for updated in changed {
+            self.records.insert(updated.id().to_owned(), updated);
+        }
+        Ok(json!({}))
+    }
+
+    /// The router reports a section genuine Codex renamed (`section`) or
+    /// deleted (`section: null`). As in Codex, deletion unsections its threads.
+    fn section_changed(&mut self, p: &Value) -> RpcResult<Option<Value>> {
+        supported_fields(p, &["sectionId", "section"])?;
+        let section_id = required_str(p, "sectionId")?;
+        let section = &p["section"];
+        if !section.is_null() && section["id"] != section_id {
+            return Err(RpcError::invalid("section does not match sectionId"));
+        }
+        let members: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| record.thread["section"]["id"] == section_id)
+            .map(|record| record.id().to_owned())
+            .collect();
+        for id in members {
+            let mut record = self.records[&id].clone();
+            if section.is_null() {
+                record.thread["section"] = Value::Null;
+                record.thread["sectionEnteredAt"] = Value::Null;
+                record.section_position = None;
+            } else {
+                record.thread["section"] = section.clone();
+            }
+            self.store.save(&record).map_err(RpcError::internal)?;
+            self.records.insert(id, record);
+        }
+        Ok(Some(json!({})))
     }
 
     async fn steer_turn(&mut self, client: u64, rpc_id: &Value, p: &Value) -> RpcResult<()> {
@@ -4687,6 +4967,17 @@ fn resume_cursor(thread_id: &str, kind: &str, anchor: Value) -> Value {
     )
 }
 
+/// An inclusive cursor at one turn that `thread/turns/list` accepts in either
+/// direction, as Codex's search results provide for opening a match.
+fn turn_cursor(thread_id: &str, turn_id: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(
+        json!({"scope": format!("turns:{thread_id}"), "anchor": turn_id,
+            "inclusive": true, "anyDirection": true})
+        .to_string(),
+    )
+}
+
 /// A resume boundary applies to the complete snapshot before turn filtering.
 /// The same item boundary can therefore hydrate each turn independently.
 fn apply_resume_boundary(
@@ -4776,9 +5067,11 @@ fn page(mut items: Vec<Value>, p: &Value, default_desc: bool, scope: &str) -> Rp
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or_else(|| RpcError::invalid("Invalid pagination cursor"))?;
+        // The scope still binds a direction-free turn cursor to its thread.
+        let any_direction = decoded["anyDirection"] == true;
         if decoded["scope"] != scope
-            || decoded["descending"] != descending
-            || decoded["filters"] != json!(filters)
+            || (!any_direction
+                && (decoded["descending"] != descending || decoded["filters"] != json!(filters)))
         {
             return Err(RpcError::invalid(
                 "Cursor belongs to a different list, filter, or sort direction",

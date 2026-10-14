@@ -27,7 +27,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 
-use crate::protocol::ADOPT_THREAD_METHOD;
+use crate::protocol::{ADOPT_THREAD_METHOD, SECTION_CHANGED_METHOD};
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Prefix for request ids the router itself sends to a backend.
@@ -50,6 +50,10 @@ const CLAUDE_LIST_FILTERS: &[&str] = &[
     "parentThreadId",
     "ancestorThreadId",
 ];
+
+/// Codex app (connector) methods. A chat's `threadId` only selects Codex's
+/// per-thread app configuration; apps do not depend on the chat's model.
+const APP_METHODS: &[&str] = &["app/list", "app/installed", "app/read"];
 
 /// Facade methods whose `input` carries the user's message content.
 const INPUT_METHODS: &[&str] = &[
@@ -139,6 +143,7 @@ enum Continuation {
     ClaudeModels,
     Adopt { thread_id: String, turn: Value },
     Resume { thread_id: String, request: Value },
+    Section { thread_id: String, request: Value },
     StartDefault { request: Value },
     Merge { merge: u64, side: Side },
     Delegation { side: Side, step: agents::Step },
@@ -220,6 +225,7 @@ enum Block {
     Models,
     Adopt,
     Resume,
+    Section,
     DefaultModel,
 }
 
@@ -637,6 +643,10 @@ fn claude_list_query(params: &Value, cursor: Option<Value>) -> Value {
         if let Some(value) = params.get(*field).filter(|v| !v.is_null()) {
             query[*field] = value.clone();
         }
+    }
+    // Present and null is a filter of its own: threads in no section.
+    if let Some(section) = params.get("sectionId") {
+        query["sectionId"] = section.clone();
     }
     if let Some(cursor) = cursor {
         query["cursor"] = cursor;
@@ -1090,10 +1100,79 @@ impl Router {
                 return;
             }
         }
+        if side == Side::Claude && APP_METHODS.contains(&method.as_str()) {
+            // Genuine Codex serves apps; it does not know the Claude thread.
+            let mut message = message;
+            if let Some(params) = message["params"].as_object_mut() {
+                params.remove("threadId");
+            }
+            self.forward(Side::Codex, message);
+            return;
+        }
+        if method == "thread/section/move" {
+            self.move_to_section(side, message);
+            return;
+        }
         if side == Side::Codex && method == "turn/start" {
             self.fresh.remove(thread);
         }
         self.forward(side, message);
+    }
+
+    /// Each backend files its own threads, and neither can place a thread
+    /// relative to the other's: a `beforeThreadId` on the other backend
+    /// appends instead. Sections belong to genuine Codex, so a Claude thread's
+    /// destination is first looked up there.
+    fn move_to_section(&mut self, side: Side, mut message: Value) {
+        let foreign_before = message["params"]["beforeThreadId"]
+            .as_str()
+            .is_some_and(|before| self.threads.get(before).is_some_and(|owner| *owner != side));
+        if foreign_before {
+            message["params"]["beforeThreadId"] = Value::Null;
+        }
+        if side == Side::Codex
+            || message["params"]["sectionId"]
+                .as_str()
+                .is_none_or(|section| section.trim().is_empty())
+        {
+            self.forward(side, message);
+            return;
+        }
+        let thread_id = message["params"]["threadId"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        self.block_thread(&thread_id, Block::Section);
+        self.internal_request(
+            Side::Codex,
+            "threadSection/list",
+            json!({"cursor": null, "limit": 100}),
+            Continuation::Section {
+                thread_id,
+                request: message,
+            },
+        );
+    }
+
+    /// A deleted thread's id never returns: forget its ownership and state.
+    fn forget_thread(&mut self, thread: &str) {
+        self.threads.remove(thread);
+        self.fresh.remove(thread);
+        self.claude_loaded.remove(thread);
+        self.claude_turns.remove(thread);
+        self.agent_thread_deleted(thread);
+    }
+
+    /// Claude threads keep their own copy of the section they are filed in.
+    fn section_changed(&mut self, section_id: Value, section: Value) {
+        if self.claude_available() && section_id.is_string() {
+            self.internal_request(
+                Side::Claude,
+                SECTION_CHANGED_METHOD,
+                json!({"sectionId": section_id, "section": section}),
+                Continuation::Ignore,
+            );
+        }
     }
 
     /// Move the desktop's prewarmed, still-empty Codex thread to Claude under
@@ -1189,8 +1268,6 @@ impl Router {
                 );
                 false
             }
-            // Claude chats are never filed in desktop sections.
-            MergeKind::Threads { .. } if !params["sectionId"].is_null() => true,
             MergeKind::Threads { .. } => {
                 let query = claude_list_query(&params, None);
                 self.internal_request(
@@ -1324,6 +1401,9 @@ impl Router {
             MergeKind::Threads { .. } => {
                 let field = sort_field(&state.params);
                 let descending = descending(&state.params);
+                // Codex orders a section by its own positions, which cannot
+                // interleave with the facade's: Claude's members follow Codex's.
+                let section_order = state.params["sortKey"] == "section_position";
                 let data = result["data"].as_array().cloned().unwrap_or_default();
                 // An adopted prewarm can still exist in Codex's metadata.
                 // Claude owns that id; never publish both copies or let the
@@ -1378,16 +1458,22 @@ impl Router {
                     if let Some(id) = thread["id"].as_str() {
                         self.threads.insert(id.to_owned(), Side::Claude);
                     }
-                    if originators.is_none_or(|list| list.contains(&thread["originator"]))
-                        && in_window(sort_value(&thread, field))
+                    let placed = if section_order {
+                        last_page
+                    } else {
+                        in_window(sort_value(&thread, field))
+                    };
+                    if originators.is_none_or(|list| list.contains(&thread["originator"])) && placed
                     {
                         merged.push(thread);
                     }
                 }
-                merged.sort_by_key(|item| {
-                    let value = sort_value(item, field);
-                    if descending { -value } else { value }
-                });
+                if !section_order {
+                    merged.sort_by_key(|item| {
+                        let value = sort_value(item, field);
+                        if descending { -value } else { value }
+                    });
+                }
                 result["data"] = json!(merged);
                 self.decorate_agent_listing(&state.params, &mut result);
                 if matches!(state.kind, MergeKind::Threads { search: false })
@@ -1442,6 +1528,11 @@ impl Router {
                     return;
                 }
                 self.learn(side, &message);
+                if method == "thread/deleted" {
+                    for id in &ids {
+                        self.forget_thread(id);
+                    }
+                }
                 self.agent_notification(side, &message);
                 self.decorate_agent_message(&mut message);
                 if side == Side::Codex && method == "turn/started" {
@@ -1507,6 +1598,26 @@ impl Router {
                 self.agent_thread_unloaded(thread);
                 // Its later turn events no longer reach this connection.
                 self.claude_turns.remove(thread);
+            }
+            if result.is_ok()
+                && forwarded.method == "thread/delete"
+                && let Some(thread) = forwarded.params["threadId"].as_str()
+            {
+                self.forget_thread(thread);
+            }
+            if side == Side::Codex
+                && let Ok(result) = &result
+            {
+                match forwarded.method.as_str() {
+                    "threadSection/update" => self.section_changed(
+                        result["section"]["id"].clone(),
+                        result["section"].clone(),
+                    ),
+                    "threadSection/delete" => {
+                        self.section_changed(forwarded.params["sectionId"].clone(), Value::Null)
+                    }
+                    _ => {}
+                }
             }
             if result
                 .as_ref()
@@ -1644,6 +1755,47 @@ impl Router {
                     Err(failure) => self.send_client(json!({"id":request["id"],"error":failure})),
                 }
                 self.unblock_thread(&blocked, Block::Resume);
+            }
+            Continuation::Section {
+                thread_id,
+                mut request,
+            } => {
+                let wanted = request["params"]["sectionId"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned();
+                match result {
+                    Ok(page) => {
+                        let section = page["data"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|section| section["id"] == wanted.as_str())
+                            .cloned();
+                        match (section, page["nextCursor"].as_str()) {
+                            (Some(section), _) => {
+                                request["params"]["claudexSection"] = section;
+                                self.forward(Side::Claude, request);
+                            }
+                            (None, Some(cursor)) => {
+                                // The thread stays blocked while the next page is read.
+                                self.internal_request(
+                                    Side::Codex,
+                                    "threadSection/list",
+                                    json!({"cursor": cursor, "limit": 100}),
+                                    Continuation::Section { thread_id, request },
+                                );
+                                return;
+                            }
+                            (None, None) => self.send_client(error(
+                                request["id"].clone(),
+                                format!("section {wanted} does not exist"),
+                            )),
+                        }
+                    }
+                    Err(failure) => self.send_client(json!({"id":request["id"],"error":failure})),
+                }
+                self.unblock_thread(&thread_id, Block::Section);
             }
             Continuation::StartDefault { mut request } => {
                 match result {

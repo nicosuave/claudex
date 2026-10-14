@@ -16,7 +16,7 @@ Accepted requests are validated against the pinned schema before execution, with
 | `thread/revert`, `thread/rollback` | Idle loaded thread; retain the prefix before `beforeTurnId` (paginated) or remove `numTurns` (legacy); next native turn forks at the retained UUID |
 | `thread/attachment/{add,list,remove}` | Durable arbitrary attachment type/identity/payload metadata; notification only after save; desktop Git worker owns checkout creation/archive/restore |
 | `thread/read` | `threadId`, `includeTurns` |
-| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `cwd`, `searchTerm`, `useStateDbOnly`, `parentThreadId`, `ancestorThreadId`; all records come from facade state. As in Codex, subagent child threads are excluded by default and selected by `parentThreadId` (direct children), `ancestorThreadId` (all descendants), or `sourceKinds` `subAgent`/`subAgentThreadSpawn`; a relation filter without `sourceKinds` spans all sources |
+| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `sectionId`, `cwd`, `searchTerm`, `useStateDbOnly`, `parentThreadId`, `ancestorThreadId`; all records come from facade state. As in Codex, a null `sectionId` selects threads in no section, `sortKey: section_position` lists one `sectionId` in its own order, and subagent child threads are excluded by default and selected by `parentThreadId` (direct children), `ancestorThreadId` (all descendants), or `sourceKinds` `subAgent`/`subAgentThreadSpawn`; a relation filter without `sourceKinds` spans all sources |
 | `thread/loaded/list` | `cursor`, `limit` |
 | `thread/turns/list` | `threadId`, `cursor`, `limit`, `sortDirection`, `itemsView` |
 | `thread/items/list` | `threadId`, optional `turnId`, `cursor`, `limit`, `sortDirection` |
@@ -25,6 +25,10 @@ Accepted requests are validated against the pinned schema before execution, with
 | `thread/metadata/update` | `threadId`, `projectId` (empty clears), partial `gitInfo` (null fields clear), `daybreakEnabled`; persistent metadata saved atomically; project updates notify subscribers |
 | `thread/settings/update` | Idle thread; model, effort, service tier, summary, cwd, reviewer, approval policy, sandbox policy, disabled plugins and default collaboration settings; saved for subsequent turns with a settings notification |
 | `thread/archive`, `thread/unarchive` | `threadId`; requires no active turn |
+| `thread/delete` | `threadId`. As in Codex, removes the thread and its subagent descendants, deepest first, and announces `thread/deleted` for each to every client. A running turn is interrupted first; a subagent thread that its parent's running turn still uses is refused. Ephemeral threads cannot be deleted. The facade removes its own records and closes the thread's Claude process; Claude's session transcripts under `~/.claude` are the user's data and are kept |
+| `thread/goal/get` | `threadId`; always `goal: null`. Goals are a Codex runtime feature: `thread/goal/set` and `thread/goal/clear` are unsupported for Claude threads |
+| `thread/searchOccurrences` | `threadId`, `searchTerm`, `cursor`, `limit` (default 50, at most 250). As in Codex: case-insensitive literal matches in user messages (after Codex's request marker) and in each turn's final assistant message (its last `final_answer`, or once the turn has ended its last unphased message), in chronological order, with Codex's snippet context, UTF-16 match ranges, and a `turnCursor` that `thread/turns/list` accepts in either direction. Unlike Codex, threads in any history mode can be searched, and assistant Markdown is matched as written (with whitespace collapsed) rather than rendered to text |
+| `thread/section/move` | `threadId`, `sectionId` (null leaves the section), `beforeThreadId`. Sections belong to genuine Codex: behind the desktop router, the destination is looked up in Codex's `threadSection/list` and passed to the facade as `claudexSection`, which a direct client must supply too. The section and the thread's place in it are saved on the facade record and reported as `section` and `sectionEnteredAt` on thread objects. Neither backend can order its threads around the other's: in merged section listings Claude's members follow Codex's, and a `beforeThreadId` on the other backend appends. The router passes Codex section renames and deletions on to Claude threads |
 | `thread/unsubscribe` | `threadId`; active-turn owners must interrupt first |
 | `turn/start` | `threadId`, `input`, `clientUserMessageId`, `cwd`, `model`, `approvalPolicy`, `sandboxPolicy`, `effort`, `serviceTier`, `serviceTierForTurn`, `summary`, `outputSchema` |
 | `turn/steer` | Owner-only active-turn input; checks `expectedTurnId`, persists user input, waits for native replay consumption before completing the turn. As in Codex, a manual compaction cannot be steered: `codexErrorInfo.activeTurnNotSteerable.turnKind` is `compact` |
@@ -42,6 +46,7 @@ Accepted requests are validated against the pinned schema before execution, with
 | `fs/copy`, `fs/remove` | Absolute paths; explicit recursive copy, recursive removal defaults true; symlinks preserved on copy |
 | `command/exec`, `/write`, `/resize`, `/terminate` | Connection-owned real pipe/PTY processes; cwd/env, streaming stdin/output, cancellation, timeout and output caps |
 | `plugin/{list,installed,search,read,install,uninstall}` | Genuine Codex catalog and administration when configured; native consent/auth failures propagate |
+| `app/list`, `app/installed`, `app/read` | Not served by the facade. Behind the desktop router, a request naming a Claude thread goes to genuine Codex without its `threadId`, which only selects Codex's per-thread app configuration |
 | `configRequirements/read` | Full-access/workspace-write, on-request/never approvals, user/native auto review |
 | `collaborationMode/list` | Empty list: no Codex collaboration presets |
 | `experimentalFeature/list` | `cursor`, `limit`; empty list: no Codex experimental features |
@@ -62,7 +67,7 @@ After a turn finishes cleanly, the thread keeps its Claude process (and Codex pl
 
 ## Notifications and tool translation
 
-Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, and `error`.
+Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/deleted`, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, and `error`.
 
 | Claude content | Codex representation |
 | --- | --- |

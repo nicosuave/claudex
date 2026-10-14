@@ -235,6 +235,9 @@ pub struct Record {
     /// Text delivered ahead of the next turn's input.
     #[serde(default)]
     pub pending_context: Vec<String>,
+    /// Order within `thread.section`; lower positions list first.
+    #[serde(default)]
+    pub section_position: Option<i64>,
 }
 
 impl Record {
@@ -285,6 +288,7 @@ impl Record {
             auto_review_denials: vec![],
             approved_actions: vec![],
             pending_context: vec![],
+            section_position: None,
         }
     }
     pub fn id(&self) -> &str {
@@ -474,7 +478,8 @@ struct Writer {
 
 struct WriteJob {
     path: PathBuf,
-    bytes: Vec<u8>,
+    /// The record's new contents, or None to remove it.
+    bytes: Option<Vec<u8>>,
     done: Option<std::sync::mpsc::Sender<Result<(), String>>>,
 }
 
@@ -550,9 +555,22 @@ impl Store {
     }
     /// Write a record and wait until it is durable.
     pub fn save(&self, record: &Record) -> Result<()> {
-        let Some(mut job) = self.record_job(record)? else {
-            return Ok(());
-        };
+        match self.record_job(record)? {
+            Some(job) => self.queue_and_wait(job),
+            None => Ok(()),
+        }
+    }
+    /// Remove a thread's record and wait until the removal is durable. It is
+    /// ordered with queued writes, so an earlier deferred save cannot restore it.
+    pub fn delete(&self, thread_id: &str) -> Result<()> {
+        uuid::Uuid::parse_str(thread_id).context("Invalid persisted thread id")?;
+        self.queue_and_wait(WriteJob {
+            path: self.threads_dir().join(format!("{thread_id}.json")),
+            bytes: None,
+            done: None,
+        })
+    }
+    fn queue_and_wait(&self, mut job: WriteJob) -> Result<()> {
         let (done, outcome) = std::sync::mpsc::channel();
         job.done = Some(done);
         self.queue(job)?;
@@ -579,7 +597,7 @@ impl Store {
         bytes.push(b'\n');
         Ok(Some(WriteJob {
             path: self.threads_dir().join(format!("{id}.json")),
-            bytes,
+            bytes: Some(bytes),
             done: None,
         }))
     }
@@ -673,7 +691,11 @@ fn write_records(
             }
         }
         for (job, waiting) in batch.into_iter().zip(waiting) {
-            let outcome = write_atomic(&job.path, &job.bytes).map_err(|error| format!("{error:#}"));
+            let outcome = match &job.bytes {
+                Some(bytes) => write_atomic(&job.path, bytes),
+                None => remove_durably(&job.path),
+            }
+            .map_err(|error| format!("{error:#}"));
             if let Err(error) = &outcome
                 && waiting.is_empty()
             {
@@ -711,6 +733,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn remove_durably(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    File::open(path.parent().context("State file needs a parent")?)?.sync_all()?;
+    Ok(())
 }
 
 fn private_open(path: &Path, exclusive: bool) -> Result<File> {
