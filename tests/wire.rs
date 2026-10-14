@@ -57,6 +57,10 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
             "ThreadSettingsUpdateResponse",
             "ThreadArchiveResponse",
             "ThreadUnarchiveResponse",
+            "ThreadDeleteResponse",
+            "ThreadGoalGetResponse",
+            "ThreadSearchOccurrencesResponse",
+            "ThreadSectionMoveResponse",
             "TurnStartResponse",
             "TurnInterruptResponse",
             "TurnSteerResponse",
@@ -137,6 +141,10 @@ fn response_schema(method: &str) -> &'static str {
         "thread/settings/update" => "ThreadSettingsUpdateResponse",
         "thread/archive" => "ThreadArchiveResponse",
         "thread/unarchive" => "ThreadUnarchiveResponse",
+        "thread/delete" => "ThreadDeleteResponse",
+        "thread/goal/get" => "ThreadGoalGetResponse",
+        "thread/searchOccurrences" => "ThreadSearchOccurrencesResponse",
+        "thread/section/move" => "ThreadSectionMoveResponse",
         "turn/start" => "TurnStartResponse",
         "turn/interrupt" => "TurnInterruptResponse",
         "turn/steer" => "TurnSteerResponse",
@@ -2822,6 +2830,356 @@ async fn first_prompt_waits_for_connecting_mcp_servers() {
     assert_eq!(
         agent_texts(&completed),
         ["prompted while MCP connecting: false"]
+    );
+    client.close().await;
+}
+
+/// A thread whose subagent spawned a nested agent: (root, child, grandchild).
+async fn subagent_tree(client: &mut Client) -> (String, String, String) {
+    let root = client.thread().await;
+    let turn = client.start(&root, "subagent").await;
+    let completed = client.completed(&turn).await;
+    let child = item(&completed, "agent_call")["receiverThreadIds"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child_turn = client
+        .until(|v| v["method"] == "turn/completed" && v["params"]["threadId"] == child.as_str())
+        .await;
+    let grandchild = item(&child_turn["params"]["turn"], "nested_call")["receiverThreadIds"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (root, child, grandchild)
+}
+
+/// Thread ids announced deleted so far, in order.
+fn deleted(client: &Client) -> Vec<String> {
+    client
+        .history
+        .iter()
+        .filter(|v| v["method"] == "thread/deleted")
+        .map(|v| v["params"]["threadId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn deleting_a_thread_removes_its_subagents_deepest_first() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let (root, child, grandchild) = subagent_tree(&mut client).await;
+    let (other_root, other_child, other_grandchild) = subagent_tree(&mut client).await;
+    let ephemeral =
+        client.ok("thread/start", json!({"ephemeral":true})).await["thread"]["id"].clone();
+    let refused = client
+        .request("thread/delete", json!({"threadId":ephemeral}))
+        .await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not persisted"),
+        "{refused}"
+    );
+
+    client.ok("thread/delete", json!({"threadId":root})).await;
+    client
+        .until(|v| v["method"] == "thread/deleted" && v["params"]["threadId"] == root.as_str())
+        .await;
+    assert_eq!(
+        deleted(&client),
+        [grandchild.clone(), child.clone(), root.clone()]
+    );
+    let threads = state.path().join("threads");
+    for id in [&root, &child, &grandchild] {
+        let read = client.request("thread/read", json!({"threadId":id})).await;
+        assert_eq!(read["error"]["code"], -32602, "{read}");
+        assert!(!threads.join(format!("{id}.json")).exists());
+    }
+    assert_eq!(
+        client
+            .request("thread/delete", json!({"threadId":root}))
+            .await["error"]["code"],
+        -32602
+    );
+
+    // Deleting a subagent's own thread keeps its parent, which then no longer
+    // links a continuation of that agent to the deleted thread.
+    client
+        .ok("thread/delete", json!({"threadId":other_child}))
+        .await;
+    client
+        .until(|v| {
+            v["method"] == "thread/deleted" && v["params"]["threadId"] == other_child.as_str()
+        })
+        .await;
+    assert_eq!(
+        deleted(&client)[3..],
+        [other_grandchild.clone(), other_child.clone()]
+    );
+    let parent: Value =
+        serde_json::from_slice(&std::fs::read(threads.join(format!("{other_root}.json"))).unwrap())
+            .unwrap();
+    let linked: Vec<&Value> = parent["agents"].as_object().unwrap().values().collect();
+    assert!(
+        !linked.contains(&&json!(other_child)) && !linked.contains(&&json!(other_grandchild)),
+        "{parent}"
+    );
+
+    // As Codex shuts a running thread down, a running turn ends first.
+    let busy = client.thread().await;
+    let hanging = client.start(&busy, "hang").await;
+    client.ok("thread/delete", json!({"threadId":busy})).await;
+    assert_eq!(client.completed(&hanging).await["status"], "interrupted");
+    client
+        .until(|v| v["method"] == "thread/deleted" && v["params"]["threadId"] == busy.as_str())
+        .await;
+    client.close().await;
+
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    assert_eq!(
+        ids(&client.ok("thread/list", json!({})).await),
+        [other_root.as_str()]
+    );
+    let read = client
+        .request("thread/read", json!({"threadId":other_grandchild}))
+        .await;
+    assert_eq!(read["error"]["code"], -32602, "{read}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn search_occurrences_finds_visible_messages_and_opens_their_turns() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let long = format!("{}Needle{}", "é".repeat(60), "x".repeat(100));
+    let mut turns = vec![];
+    for text in ["Alpha beta ALPHA", "gamma alpha", long.as_str()] {
+        let turn = client.start(&thread, text).await;
+        client.completed(&turn).await;
+        turns.push(turn);
+    }
+    let all = client
+        .ok(
+            "thread/searchOccurrences",
+            json!({"threadId":thread,"searchTerm":"alpha"}),
+        )
+        .await;
+    assert!(all["nextCursor"].is_null());
+    let found: Vec<(&str, &str, Value)> = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|occurrence| {
+            (
+                occurrence["turnId"].as_str().unwrap(),
+                occurrence["snippet"].as_str().unwrap(),
+                occurrence["snippetMatchRange"].clone(),
+            )
+        })
+        .collect();
+    // User messages and each turn's final answer, case-insensitively, in order.
+    assert_eq!(
+        found,
+        [
+            (
+                turns[0].as_str(),
+                "Alpha beta ALPHA",
+                json!({"start":0,"end":5})
+            ),
+            (
+                turns[0].as_str(),
+                "Alpha beta ALPHA",
+                json!({"start":11,"end":16})
+            ),
+            (
+                turns[0].as_str(),
+                "Echo: Alpha beta ALPHA",
+                json!({"start":6,"end":11})
+            ),
+            (
+                turns[0].as_str(),
+                "Echo: Alpha beta ALPHA",
+                json!({"start":17,"end":22})
+            ),
+            (
+                turns[1].as_str(),
+                "gamma alpha",
+                json!({"start":6,"end":11})
+            ),
+            (
+                turns[1].as_str(),
+                "Echo: gamma alpha",
+                json!({"start":12,"end":17})
+            ),
+        ]
+    );
+    // One page per occurrence resumes within an item, too.
+    let mut paged = vec![];
+    let mut cursor = Value::Null;
+    loop {
+        let page = client
+            .ok(
+                "thread/searchOccurrences",
+                json!({"threadId":thread,"searchTerm":"alpha","limit":1,"cursor":cursor}),
+            )
+            .await;
+        paged.extend(page["data"].as_array().unwrap().iter().cloned());
+        cursor = page["nextCursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert_eq!(json!(paged), all["data"]);
+    let first_page = client
+        .ok(
+            "thread/searchOccurrences",
+            json!({"threadId":thread,"searchTerm":"alpha","limit":1}),
+        )
+        .await;
+    let foreign = client
+        .request(
+            "thread/searchOccurrences",
+            json!({"threadId":thread,"searchTerm":"beta","cursor":first_page["nextCursor"]}),
+        )
+        .await;
+    assert_eq!(foreign["error"]["code"], -32602, "{foreign}");
+    let blank = client
+        .request(
+            "thread/searchOccurrences",
+            json!({"threadId":thread,"searchTerm":"  "}),
+        )
+        .await;
+    assert_eq!(blank["error"]["code"], -32602, "{blank}");
+
+    // Snippets keep 49 characters before and 96 after, with UTF-16 ranges.
+    let needle = client
+        .ok(
+            "thread/searchOccurrences",
+            json!({"threadId":thread,"searchTerm":"NEEDLE"}),
+        )
+        .await;
+    let snippet = format!("... {}Needle{} ...", "é".repeat(49), "x".repeat(96));
+    for occurrence in needle["data"].as_array().unwrap() {
+        assert_eq!(occurrence["snippet"], snippet.as_str());
+        assert_eq!(
+            occurrence["snippetMatchRange"],
+            json!({"start":53,"end":59})
+        );
+    }
+    assert_eq!(needle["data"].as_array().unwrap().len(), 2);
+
+    // A match's turn cursor opens its turn in both directions.
+    let turn_cursor = &all["data"][4]["turnCursor"];
+    let older = client
+        .ok(
+            "thread/turns/list",
+            json!({"threadId":thread,"cursor":turn_cursor,"limit":5,"sortDirection":"desc"}),
+        )
+        .await;
+    assert_eq!(ids(&older), [turns[1].clone(), turns[0].clone()]);
+    let newer = client
+        .ok(
+            "thread/turns/list",
+            json!({"threadId":thread,"cursor":turn_cursor,"limit":5,"sortDirection":"asc"}),
+        )
+        .await;
+    assert_eq!(ids(&newer), [turns[1].clone(), turns[2].clone()]);
+
+    // Claude threads have no Codex goals.
+    assert_eq!(
+        client
+            .ok("thread/goal/get", json!({"threadId":thread}))
+            .await,
+        json!({"goal":null})
+    );
+    let set = client
+        .request(
+            "thread/goal/set",
+            json!({"threadId":thread,"objective":"ship it"}),
+        )
+        .await;
+    assert_eq!(set["error"]["code"], -32601, "{set}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn section_moves_order_and_persist_claude_threads() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let first = client.thread().await;
+    let second = client.thread().await;
+    let other = client.thread().await;
+    let section =
+        json!({"id":"01984de2-8f74-7c91-a3b2-5c5e937cf318","name":"Pinned","appearance":null});
+    let section_id = section["id"].clone();
+    let move_to = |thread: &str, before: Value| json!({"threadId":thread,"sectionId":section_id,"beforeThreadId":before,"claudexSection":section});
+    // Sections belong to genuine Codex; the router supplies the destination.
+    let unknown = client
+        .request(
+            "thread/section/move",
+            json!({"threadId":first,"sectionId":section_id}),
+        )
+        .await;
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    client
+        .ok("thread/section/move", move_to(first.as_str(), Value::Null))
+        .await;
+    client
+        .ok(
+            "thread/section/move",
+            move_to(second.as_str(), json!(first)),
+        )
+        .await;
+    for invalid in [
+        move_to(first.as_str(), json!(first)),
+        move_to(first.as_str(), json!(other)),
+    ] {
+        let refused = client.request("thread/section/move", invalid).await;
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    }
+    let read = client.ok("thread/read", json!({"threadId":first})).await;
+    assert_eq!(read["thread"]["section"], section);
+    assert!(read["thread"]["sectionEnteredAt"].is_u64());
+    let members = json!({"sectionId":section_id,"sortKey":"section_position"});
+    assert_eq!(
+        ids(&client.ok("thread/list", members.clone()).await),
+        [second.as_str(), first.as_str()]
+    );
+    assert_eq!(
+        ids(&client.ok("thread/list", json!({"sectionId":null})).await),
+        [other.as_str()]
+    );
+    assert_eq!(ids(&client.ok("thread/list", json!({})).await).len(), 3);
+    let unfiltered = client
+        .request("thread/list", json!({"sortKey":"section_position"}))
+        .await;
+    assert_eq!(unfiltered["error"]["code"], -32602, "{unfiltered}");
+    client.close().await;
+
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    assert_eq!(
+        ids(&client.ok("thread/list", members.clone()).await),
+        [second.as_str(), first.as_str()]
+    );
+    client
+        .ok(
+            "thread/section/move",
+            json!({"threadId":second,"sectionId":null}),
+        )
+        .await;
+    let read = client.ok("thread/read", json!({"threadId":second})).await;
+    assert!(read["thread"]["section"].is_null());
+    assert!(read["thread"]["sectionEnteredAt"].is_null());
+    assert_eq!(
+        ids(&client.ok("thread/list", members).await),
+        [first.as_str()]
     );
     client.close().await;
 }

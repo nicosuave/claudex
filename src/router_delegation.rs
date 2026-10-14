@@ -1073,6 +1073,9 @@ impl Router {
                 || params["originators"].as_array().is_some_and(|originators| {
                     !originators.is_empty() && !originators.contains(&agent.thread["originator"])
                 })
+                || params
+                    .get("sectionId")
+                    .is_some_and(|section| *section != agent.thread["section"]["id"])
                 || data.iter().any(|item| list_thread(item)["id"] == agent.id)
             {
                 continue;
@@ -1091,6 +1094,10 @@ impl Router {
             agent.decorate(&mut thread);
             thread["turns"] = json!([]);
             data.push(thread);
+        }
+        // A section keeps its server order.
+        if params["sortKey"] == "section_position" {
+            return;
         }
         let field = sort_field(params);
         data.sort_by_key(|item| {
@@ -1254,6 +1261,23 @@ impl Router {
         }
     }
 
+    pub(super) fn agent_thread_deleted(&mut self, thread: &str) {
+        self.agent_thread_unloaded(thread);
+        self.agents.snapshots.remove(thread);
+        self.agents.stale_snapshots.remove(thread);
+        // Shared listings would otherwise keep showing a deleted delegate.
+        if self
+            .agents
+            .registry
+            .agents
+            .get(thread)
+            .is_some_and(|agent| !agent.running())
+            && let Err(error) = self.agents.registry.remove(thread)
+        {
+            note!("Cannot forget deleted agent {thread}: {error:#}");
+        }
+    }
+
     pub(super) fn agent_thread_unloaded(&mut self, thread: &str) {
         if self.agents.active.contains_key(thread) {
             return;
@@ -1369,15 +1393,19 @@ pub(super) fn paginate_listing(params: &Value, result: &mut Value) -> Result<()>
     query.as_object_mut().unwrap().remove("limit");
     let field = sort_field(params);
     let descending = descending(params);
+    // A section keeps its server order; its cursor resumes after a thread.
+    let section_order = params["sortKey"] == "section_position";
     let data = result["data"].as_array_mut().unwrap();
-    data.sort_by_key(|item| {
-        (
-            sort_value(item, field),
-            list_thread(item)["id"].as_str().unwrap_or("").to_owned(),
-        )
-    });
-    if descending {
-        data.reverse();
+    if !section_order {
+        data.sort_by_key(|item| {
+            (
+                sort_value(item, field),
+                list_thread(item)["id"].as_str().unwrap_or("").to_owned(),
+            )
+        });
+        if descending {
+            data.reverse();
+        }
     }
     if let Some(cursor) = params["cursor"].as_str() {
         let encoded = cursor
@@ -1387,26 +1415,34 @@ pub(super) fn paginate_listing(params: &Value, result: &mut Value) -> Result<()>
         if cursor["query"] != query {
             anyhow::bail!("Child-list cursor belongs to another query");
         }
-        let key = (
-            cursor["time"]
-                .as_i64()
-                .context("Invalid child-list timestamp")?,
-            cursor["id"]
-                .as_str()
-                .context("Invalid child-list identity")?
-                .to_owned(),
-        );
-        data.retain(|item| {
-            let candidate = (
-                sort_value(item, field),
-                list_thread(item)["id"].as_str().unwrap_or("").to_owned(),
+        if section_order {
+            let last = data
+                .iter()
+                .position(|item| list_thread(item)["id"] == cursor["id"])
+                .context("Child-list cursor thread is no longer listed")?;
+            data.drain(..=last);
+        } else {
+            let key = (
+                cursor["time"]
+                    .as_i64()
+                    .context("Invalid child-list timestamp")?,
+                cursor["id"]
+                    .as_str()
+                    .context("Invalid child-list identity")?
+                    .to_owned(),
             );
-            if descending {
-                candidate < key
-            } else {
-                candidate > key
-            }
-        });
+            data.retain(|item| {
+                let candidate = (
+                    sort_value(item, field),
+                    list_thread(item)["id"].as_str().unwrap_or("").to_owned(),
+                );
+                if descending {
+                    candidate < key
+                } else {
+                    candidate > key
+                }
+            });
+        }
     }
     let limit = params["limit"].as_u64().unwrap_or(50).clamp(1, 1000) as usize;
     let next = if data.len() > limit {

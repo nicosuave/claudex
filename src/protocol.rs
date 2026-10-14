@@ -11,6 +11,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CODEX_VERSION: &str = "0.160.0";
 /// Facade-only extension: `{threadId, params}` starts a thread with that id.
 pub const ADOPT_THREAD_METHOD: &str = "claudex/thread/adopt";
+/// Facade-only extension for the router: genuine Codex renamed (`section`) or
+/// deleted (`section: null`) the thread section `sectionId`.
+pub const SECTION_CHANGED_METHOD: &str = "claudex/threadSection/changed";
 pub const SCHEMA: &str = include_str!("../protocol/codex-0.160.0.json");
 pub const SUPPORTED_METHODS: &[&str] = &[
     "skills/list",
@@ -59,7 +62,11 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/settings/update",
     "thread/archive",
     "thread/unarchive",
+    "thread/delete",
     "thread/unsubscribe",
+    "thread/goal/get",
+    "thread/searchOccurrences",
+    "thread/section/move",
     "turn/start",
     "turn/interrupt",
     "turn/steer",

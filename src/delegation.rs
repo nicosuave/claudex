@@ -330,6 +330,19 @@ impl Registry {
         }
         result
     }
+    /// Forget a delegated agent whose thread was deleted.
+    pub fn remove(&mut self, id: &str) -> Result<()> {
+        if self.agents.remove(id).is_none() {
+            return Ok(());
+        }
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        match fs::remove_file(directory.join(format!("{id}.json"))) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
     pub fn root<'a>(&'a self, caller: &'a str) -> &'a str {
         self.agents.get(caller).map_or(caller, |agent| &agent.root)
     }

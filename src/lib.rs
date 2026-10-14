@@ -13,6 +13,7 @@ pub mod filesystem;
 pub mod history_recovery;
 #[cfg(unix)]
 pub mod install;
+pub mod occurrences;
 pub mod plugins;
 pub mod protocol;
 #[cfg(unix)]
