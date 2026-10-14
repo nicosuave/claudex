@@ -60,6 +60,8 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
             "TurnStartResponse",
             "TurnInterruptResponse",
             "TurnSteerResponse",
+            "ThreadCompactStartResponse",
+            "ThreadInjectItemsResponse",
             "ThreadQueueAddResponse",
             "ThreadQueueListResponse",
             "ThreadQueueUpdateResponse",
@@ -138,6 +140,8 @@ fn response_schema(method: &str) -> &'static str {
         "turn/start" => "TurnStartResponse",
         "turn/interrupt" => "TurnInterruptResponse",
         "turn/steer" => "TurnSteerResponse",
+        "thread/compact/start" => "ThreadCompactStartResponse",
+        "thread/inject_items" => "ThreadInjectItemsResponse",
         "thread/queue/add" => "ThreadQueueAddResponse",
         "thread/queue/list" => "ThreadQueueListResponse",
         "thread/queue/update" => "ThreadQueueUpdateResponse",
@@ -1031,6 +1035,82 @@ async fn steering_waits_for_consumed_inputs_and_handles_backend_startup() {
         assert!(inactive.get("error").is_some());
         client.close().await;
     }
+}
+
+#[tokio::test]
+async fn manual_compaction_runs_claude_compact_as_its_own_turn() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let empty = client
+        .request("thread/compact/start", json!({"threadId":thread}))
+        .await;
+    assert!(
+        empty["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no history")
+    );
+    let first = client.start(&thread, "hello").await;
+    client.completed(&first).await;
+    // Context queued for the next user turn must not be folded into `/compact`.
+    client.ok("thread/inject_items", json!({"threadId":thread,"items":[{
+        "type":"message", "role":"user", "content":[{"type":"input_text","text":"Side boundary"}]
+    }]})).await;
+
+    let result = client
+        .ok("thread/compact/start", json!({"threadId":thread}))
+        .await;
+    assert_eq!(result, json!({}));
+    let turn = client
+        .until(|v| v["method"] == "turn/started" && v["params"]["turn"]["id"] != first)
+        .await["params"]["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let started = client
+        .until(|v| {
+            v["method"] == "item/started" && v["params"]["item"]["type"] == "contextCompaction"
+        })
+        .await;
+    // Steering a manual compaction fails as it does in Codex.
+    let steer = client
+        .request(
+            "turn/steer",
+            json!({"threadId":thread,"expectedTurnId":turn,
+        "input":[{"type":"text","text":"more"}]}),
+        )
+        .await;
+    assert_eq!(
+        steer["error"]["data"]["codexErrorInfo"],
+        json!({"activeTurnNotSteerable":{"turnKind":"compact"}})
+    );
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["items"],
+        json!([{"type":"contextCompaction","id":started["params"]["item"]["id"]}])
+    );
+    let lifecycle: Vec<_> = client
+        .history
+        .iter()
+        .filter(|v| v["params"]["item"]["type"] == "contextCompaction")
+        .map(|v| v["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(lifecycle, ["item/started", "item/completed"]);
+
+    let next = client.start(&thread, "after").await;
+    let next = client.completed(&next).await;
+    assert!(
+        next["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["text"] == "Echo: Side boundary\nafter"),
+        "{next}"
+    );
+    client.close().await;
 }
 
 #[tokio::test]

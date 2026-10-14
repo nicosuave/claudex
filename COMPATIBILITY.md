@@ -27,7 +27,8 @@ Accepted requests are validated against the pinned schema before execution, with
 | `thread/archive`, `thread/unarchive` | `threadId`; requires no active turn |
 | `thread/unsubscribe` | `threadId`; active-turn owners must interrupt first |
 | `turn/start` | `threadId`, `input`, `clientUserMessageId`, `cwd`, `model`, `approvalPolicy`, `sandboxPolicy`, `effort`, `serviceTier`, `serviceTierForTurn`, `summary`, `outputSchema` |
-| `turn/steer` | Owner-only active-turn input; checks `expectedTurnId`, persists user input, waits for native replay consumption before completing the turn |
+| `turn/steer` | Owner-only active-turn input; checks `expectedTurnId`, persists user input, waits for native replay consumption before completing the turn. As in Codex, a manual compaction cannot be steered: `codexErrorInfo.activeTurnNotSteerable.turnKind` is `compact` |
+| `thread/compact/start` | `threadId`; idle thread with history. Answers `{}`, then runs Claude's `/compact` as a turn without a user message, whose `contextCompaction` item is in progress until Claude's compaction boundary. Context queued by `thread/inject_items` waits for the next user turn. Not available with ACP agents |
 | `thread/queue/{add,list,update,delete,reorder,start}` | Persisted queue with client message identity, notifications, and atomic dequeue/start |
 | `turn/interrupt` | `threadId`, `turnId`; ACK acknowledges the request, `turn/completed` is the terminal event |
 | `model/list` | `cursor`, `limit`, `includeHidden`; native Claude initialize catalog, cached per service process; preserves versioned display names and per-model effort levels, including Fable; models Claude reports as fast-capable advertise Codex's `priority` (Fast) service tier |
@@ -73,7 +74,7 @@ Implemented notifications include `thread/started`, name/archive/unarchive/statu
 | Other native tools | `dynamicToolCall` in namespace `claude` |
 | `TodoWrite` | Tool item plus `turn/plan/updated` |
 | `Agent` (subagent) | `collabAgentToolCall` `spawnAgent` and `wait` items plus a linked child thread; see below |
-| Compaction boundary | `contextCompaction` |
+| Compaction (manual or automatic) | `contextCompaction`, started at Claude's `compacting` status and completed at its compaction boundary. Like Codex v2, no deprecated `thread/compacted` notification |
 | Structured output | Final assistant message containing JSON |
 
 ### Subagents

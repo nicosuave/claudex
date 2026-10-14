@@ -736,7 +736,7 @@ impl Router {
         if side == Side::Claude
             && matches!(
                 message["method"].as_str(),
-                Some("turn/start" | "turn/steer" | "turn/interrupt")
+                Some("turn/start" | "turn/steer" | "turn/interrupt" | "thread/compact/start")
             )
             && let Some(thread) = message["params"]["threadId"].as_str()
             && !self.claude_loaded.contains(thread)

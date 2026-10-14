@@ -63,6 +63,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "turn/start",
     "turn/interrupt",
     "turn/steer",
+    "thread/compact/start",
     "thread/queue/add",
     "thread/queue/list",
     "thread/queue/update",
