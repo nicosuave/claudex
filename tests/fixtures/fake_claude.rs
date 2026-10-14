@@ -399,6 +399,19 @@ fn main() {
                         finish(session, "Parent saw report", false);
                         emit(json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
                     }
+                    // Claude Code 2.1's frames for a manual compaction. The pause
+                    // keeps the compaction running while a test acts on it.
+                    "/compact" => {
+                        emit(json!({"type":"system","subtype":"status","status":"compacting","session_id":session}));
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        emit(json!({"type":"system","subtype":"status","status":null,"session_id":session}));
+                        emit(json!({"type":"system","subtype":"compact_boundary","session_id":session,
+                            "compact_metadata":{"trigger":"manual","pre_tokens":50000,"post_tokens":7500}}));
+                        emit(json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"isSynthetic":true,"session_id":session,"parent_tool_use_id":null,
+                            "message":{"role":"user","content":"This session is being continued from a previous conversation."}}));
+                        emit(json!({"type":"result","subtype":"success","is_error":false,"result":"","session_id":session,"duration_ms":1,"duration_api_ms":0,
+                            "num_turns":0,"total_cost_usd":0.0,"usage":{"input_tokens":0,"output_tokens":0},"modelUsage":{},"permission_denials":[]}));
+                    }
                     "crash" => {
                         eprintln!("fake backend crashed deliberately");
                         std::process::exit(17);

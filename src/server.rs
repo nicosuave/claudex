@@ -159,6 +159,8 @@ struct ActiveTurn {
     interrupting: bool,
     /// Whether this turn asked Claude for fast mode.
     fast_mode: bool,
+    /// Whether this turn runs a manual compaction, which cannot be steered.
+    compaction: bool,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
 }
@@ -903,6 +905,7 @@ impl Server {
                 breaker: Default::default(),
                 interrupting: false,
                 fast_mode: turn.fast_mode,
+                compaction: turn.compaction,
                 worker,
                 cancel,
             },
@@ -961,6 +964,7 @@ impl Server {
                 input: vec![],
                 owner,
                 fast_mode,
+                compaction: false,
             },
         );
         self.records.insert(id.clone(), record);
@@ -1973,7 +1977,16 @@ impl Server {
                 Ok(Some(json!({"status": status})))
             }
             "turn/start" => {
-                self.start_turn(client, rpc_id, p, None).await?;
+                let request = TurnRequest::Input {
+                    queued_submission_id: None,
+                };
+                self.start_turn(client, rpc_id, p, request).await?;
+                Ok(None)
+            }
+            "thread/compact/start" => {
+                supported_fields(p, &["threadId"])?;
+                self.start_turn(client, rpc_id, p, TurnRequest::Compaction)
+                    .await?;
                 Ok(None)
             }
             "thread/approveGuardianDeniedAction" => self.approve_denied_action(p).map(Some),
@@ -2522,6 +2535,9 @@ impl Server {
         if active.interrupting {
             return Err(RpcError::invalid("Cannot steer an interrupting turn"));
         }
+        if active.compaction {
+            return Err(compaction_not_steerable());
+        }
         if let Some(client_id) = p["clientUserMessageId"].as_str() {
             let items = self.records[id].turns.last().unwrap()["items"]
                 .as_array()
@@ -2703,8 +2719,10 @@ impl Server {
                 .ok_or_else(|| RpcError::invalid("Queued submission not found"))?;
                 let params = json!({"threadId":id,"input":entry["input"],
                     "clientUserMessageId":entry["clientUserMessageId"]});
-                self.start_turn(client, rpc_id, &params, entry["id"].as_str())
-                    .await?;
+                let request = TurnRequest::Input {
+                    queued_submission_id: entry["id"].as_str(),
+                };
+                self.start_turn(client, rpc_id, &params, request).await?;
                 return Ok(None);
             }
             _ => return Err(RpcError::unsupported(method)),
@@ -2725,7 +2743,7 @@ impl Server {
         client: u64,
         rpc_id: &Value,
         p: &Value,
-        queued_submission_id: Option<&str>,
+        request: TurnRequest<'_>,
     ) -> RpcResult<()> {
         supported_fields(
             p,
@@ -2764,6 +2782,20 @@ impl Server {
         }
         if crate::subagents::is_child(&record) {
             return Err(subagent_read_only());
+        }
+        let compaction = matches!(request, TurnRequest::Compaction);
+        if compaction {
+            if self.acp() {
+                return Err(RpcError::invalid(
+                    "ACP agents have no request for manual compaction",
+                ));
+            }
+            // A fork's first turn compacts the history it was forked from.
+            if !record.has_session && record.fork_from.is_none() {
+                return Err(RpcError::invalid(
+                    "This thread has no history to compact yet",
+                ));
+            }
         }
         record.settings.apply(p)?;
         self.check_backend_settings(&record.settings)?;
@@ -2812,7 +2844,10 @@ impl Server {
                 || (self.config.max_idle_sessions > 0
                     && !self.config.idle_session_timeout.is_zero())
         });
-        let (codex_input, mut claude_input) = translate::user_input(&p["input"]).await?;
+        let (codex_input, mut claude_input) = match request {
+            TurnRequest::Input { .. } => translate::user_input(&p["input"]).await?,
+            TurnRequest::Compaction => (vec![], vec![json!({"type":"text","text":"/compact"})]),
+        };
         let needs_ephemeral_process = record.ephemeral() && record.has_session;
         if needs_ephemeral_process {
             let parked = self
@@ -2831,17 +2866,22 @@ impl Server {
             }
         }
         record.tracks_turn_anchors = true;
-        append_additional_context(&mut claude_input, &p["additionalContext"]);
-        // Context queued while the thread was idle precedes the new input.
-        for text in std::mem::take(&mut record.pending_context)
-            .into_iter()
-            .rev()
-        {
-            claude_input.insert(0, json!({"type":"text","text":text}));
+        // Claude recognizes `/compact` only as the whole message, so context
+        // queued while the thread was idle waits for the next user turn.
+        if !compaction {
+            append_additional_context(&mut claude_input, &p["additionalContext"]);
+            // Context queued while the thread was idle precedes the new input.
+            for text in std::mem::take(&mut record.pending_context)
+                .into_iter()
+                .rev()
+            {
+                claude_input.insert(0, json!({"type":"text","text":text}));
+            }
         }
         let turn_id = protocol::id();
         let turn = protocol::new_turn(&turn_id);
-        let item = json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input});
+        // As in Codex, a compaction turn has no user message.
+        let item = (!compaction).then(|| json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input}));
         if record.thread["preview"] == "" {
             record.thread["preview"] = json!(
                 codex_input
@@ -2856,7 +2896,15 @@ impl Server {
         }
         record.thread["status"] = json!({"type": "active", "activeFlags": []});
         record.turns.push(turn.clone());
-        record.update_item(item.clone(), true);
+        if let Some(item) = &item {
+            record.update_item(item.clone(), true);
+        }
+        let queued_submission_id = match request {
+            TurnRequest::Input {
+                queued_submission_id,
+            } => queued_submission_id,
+            TurnRequest::Compaction => None,
+        };
         // Consuming a queued message and recording its turn share one durable write.
         if let Some(queued_id) = queued_submission_id {
             record
@@ -2881,10 +2929,17 @@ impl Server {
                 input: claude_input,
                 owner: Some(client),
                 fast_mode,
+                compaction,
             },
         );
         self.records.insert(id.to_owned(), record);
-        self.send(client, response(rpc_id.clone(), json!({"turn": turn})));
+        // thread/compact/start answers `{}` and reports its turn by notification.
+        let result = if compaction {
+            json!({})
+        } else {
+            json!({"turn": turn})
+        };
+        self.send(client, response(rpc_id.clone(), result));
         if queued_submission_id.is_some() {
             self.emit(
                 id,
@@ -2902,20 +2957,22 @@ impl Server {
             id,
             notification("turn/started", json!({"threadId": id, "turn": turn})),
         );
-        self.emit(
-            id,
-            notification(
-                "item/started",
-                json!({"threadId": id, "turnId": turn_id, "item": item, "startedAtMs": now_ms()}),
-            ),
-        );
-        self.emit(
-            id,
-            notification(
-                "item/completed",
-                json!({"threadId": id, "turnId": turn_id, "item": item, "completedAtMs": now_ms()}),
-            ),
-        );
+        if let Some(item) = item {
+            self.emit(
+                id,
+                notification(
+                    "item/started",
+                    json!({"threadId": id, "turnId": turn_id, "item": item, "startedAtMs": now_ms()}),
+                ),
+            );
+            self.emit(
+                id,
+                notification(
+                    "item/completed",
+                    json!({"threadId": id, "turnId": turn_id, "item": item, "completedAtMs": now_ms()}),
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -4572,6 +4629,16 @@ fn acp_fast_mode() -> RpcError {
     RpcError::invalid("Fast mode is available only with Claude, not ACP agents")
 }
 
+/// Codex's error for steering a manual compaction, with the turn error the desktop reads.
+fn compaction_not_steerable() -> RpcError {
+    let message = "cannot steer a compact turn";
+    RpcError {
+        data: Some(json!({"message": message, "additionalDetails": null,
+            "codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}})),
+        ..RpcError::invalid(message)
+    }
+}
+
 fn subagent_read_only() -> RpcError {
     RpcError::invalid(
         "Claude subagent threads are read-only; continue the agent from its parent thread",
@@ -4765,6 +4832,18 @@ struct LaunchedTurn {
     input: Vec<Value>,
     owner: Option<u64>,
     fast_mode: bool,
+    compaction: bool,
+}
+
+/// What a new turn submits to Claude.
+#[derive(Clone, Copy)]
+enum TurnRequest<'a> {
+    /// The user's input, possibly a queued submission that the turn consumes.
+    Input {
+        queued_submission_id: Option<&'a str>,
+    },
+    /// Codex's manual compaction, run as Claude's `/compact` command.
+    Compaction,
 }
 
 struct BackendTurn {

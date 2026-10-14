@@ -24,6 +24,8 @@ pub struct Translator {
     spawns: Vec<(String, Value)>,
     include_reasoning: bool,
     acp: AcpState,
+    /// The compaction item opened by Claude's `compacting` status, until its boundary.
+    compaction: Option<String>,
 }
 
 /// Item state for ACP session updates.
@@ -60,6 +62,7 @@ impl Translator {
             spawns: Vec::new(),
             include_reasoning: true,
             acp: AcpState::default(),
+            compaction: None,
         }
     }
     pub fn with_reasoning(mut self, include: bool) -> Self {
@@ -547,9 +550,25 @@ impl Translator {
                 };
                 events.push(self.event("warning", json!({"message":format!("Claude denied {tool}: {reason}. The action was not performed and has no pending approval.{recovery}")})));
             }
+            // The item stays in progress while Claude summarizes, as Codex's does.
+            Some("system")
+                if message["subtype"] == "status" && message["status"] == "compacting" =>
+            {
+                if self.compaction.is_none() {
+                    let id = protocol::id();
+                    self.start(json!({"type": "contextCompaction", "id": id}), &mut events);
+                    self.compaction = Some(id);
+                }
+            }
             Some("system") if message["subtype"] == "compact_boundary" => {
-                let id = protocol::id();
-                self.start(json!({"type": "contextCompaction", "id": id}), &mut events);
+                let id = match self.compaction.take() {
+                    Some(id) => id,
+                    None => {
+                        let id = protocol::id();
+                        self.start(json!({"type": "contextCompaction", "id": id}), &mut events);
+                        id
+                    }
+                };
                 self.complete(&id, &mut events);
             }
             Some("acp") => self.acp_update(&message["update"], &mut events),

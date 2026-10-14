@@ -60,6 +60,43 @@ fn background_task_outlives_launch_ack_and_tracks_native_completion() {
 }
 
 #[test]
+fn compaction_item_is_in_progress_until_its_boundary() {
+    let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
+    let mut events = translator
+        .receive(&json!({"type":"system","subtype":"status","status":"compacting"}))
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["method"], "item/started");
+    let id = events[0]["params"]["item"]["id"].clone();
+    // Claude clears its status before it reports the boundary.
+    assert!(
+        translator
+            .receive(&json!({"type":"system","subtype":"status","status":null}))
+            .unwrap()
+            .is_empty()
+    );
+    let boundary = json!({"type":"system","subtype":"compact_boundary",
+        "compact_metadata":{"trigger":"auto","pre_tokens":180000,"post_tokens":9000}});
+    let completed = translator.receive(&boundary).unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["method"], "item/completed");
+    assert_eq!(completed[0]["params"]["item"]["id"], id);
+    events.extend(completed);
+    // A boundary without a reported status is still one complete compaction.
+    let alone = translator.receive(&boundary).unwrap();
+    assert_eq!(
+        alone
+            .iter()
+            .map(|e| e["method"].clone())
+            .collect::<Vec<_>>(),
+        ["item/started", "item/completed"]
+    );
+    assert_ne!(alone[0]["params"]["item"]["id"], id);
+    events.extend(alone);
+    contracts(&events);
+}
+
+#[test]
 fn background_failure_and_interruption_do_not_report_success() {
     for status in ["failed", "killed", "stopped"] {
         let mut translator = Translator::new("thread", "turn", Path::new("/tmp"));
