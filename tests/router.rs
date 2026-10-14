@@ -1298,8 +1298,8 @@ async fn claude_threads_share_codex_sections_through_the_router() {
         [codex.clone(), claude.clone()]
     );
     assert_eq!(
-        section_members(&mut desktop, work_id, 100).await,
-        [second.clone()]
+        section_members(&mut desktop, work_id, 100).await.as_slice(),
+        std::slice::from_ref(&second)
     );
     let missing = desktop
         .call(
@@ -1378,7 +1378,7 @@ async fn deleting_a_claude_thread_forgets_it_and_apps_go_to_codex() {
         .until(|v| v["method"] == "thread/deleted" && v["params"]["threadId"] == claude)
         .await;
     let listed = desktop.ok("thread/list", json!({"limit": 100})).await;
-    assert_eq!(ids(&listed), [codex.clone()]);
+    assert_eq!(ids(&listed).as_slice(), std::slice::from_ref(&codex));
     // The router no longer assumes Claude owns the id: it asks the facade,
     // which no longer knows it, and then genuine Codex.
     let read = desktop
