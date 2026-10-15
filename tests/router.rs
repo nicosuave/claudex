@@ -574,9 +574,16 @@ async fn native_shared_delegation() {
             .thread(json!({"model":parent_model,"cwd":scratch.path(),
             "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":"user"}))
             .await;
-        let prompt = format!(
-            "Verify cross-harness delegation. Use the claudex_agents MCP tools, not native subagent tools or shell subprocesses. Call spawn_agent with harness={harness}, model={child_model}, name=Native verification, and message=Reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Then call wait_agent on the returned agent_id until it finishes. Finally reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
-        );
+        let prompt = if harness == "codex" {
+            // Exercise tool selection from a natural user request.
+            format!(
+                "Have a {child_model} subagent with medium reasoning reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Wait for its result, then reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
+            )
+        } else {
+            format!(
+                "Verify cross-harness delegation. Use the claudex_agents MCP tools, not native subagent tools or shell subprocesses. Call spawn_agent with harness={harness}, model={child_model}, name=Native verification, and message=Reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Then call wait_agent on the returned agent_id until it finishes. Finally reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
+            )
+        };
         let reply = desktop.turn(&parent, parent_model, &prompt).await;
         assert!(reply.get("error").is_none(), "{reply}");
         let completed = loop {
@@ -620,6 +627,20 @@ async fn native_shared_delegation() {
             .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
             .await;
         assert_eq!(child["thread"]["parentThreadId"], parent);
+        if harness == "codex" {
+            assert_eq!(spawn["model"], child_model);
+            assert_eq!(spawn["reasoningEffort"], "medium");
+            assert_eq!(child["thread"]["modelProvider"], "openai");
+            assert_eq!(child["thread"]["canAcceptDirectInput"], true);
+            let resumed = desktop
+                .ok(
+                    "thread/resume",
+                    json!({"threadId":child["thread"]["id"],"excludeTurns":true}),
+                )
+                .await;
+            assert_eq!(resumed["model"], child_model);
+            assert_eq!(resumed["reasoningEffort"], "medium");
+        }
         let report = child["thread"]["turns"]
             .as_array()
             .unwrap()

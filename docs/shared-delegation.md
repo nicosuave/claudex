@@ -7,6 +7,10 @@ clients. Claude receives the catalog through its native SDK MCP server as
 `claudex_agents__<tool>` tools. Both transports call the same router dispatcher.
 Native same-harness delegation remains available.
 
+Claude receives routing guidance with the SDK MCP server's initialization only
+when this catalog is present. A request for a Codex/GPT child uses the shared
+bridge, preserving the actual native child chat, model and direct-input controls.
+
 ## Tools
 
 | Tool | Arguments | Behavior |

@@ -15,6 +15,16 @@ pub const NAMESPACE: &str = "claudex_agents";
 pub const MAX_DEPTH: u64 = 8;
 pub const MAX_RUNNING: usize = 10;
 
+/// Guidance for Claude's SDK MCP server, only when the router supplied this catalog.
+pub fn claude_instructions(tools: &[Value]) -> Option<&'static str> {
+    tools
+        .iter()
+        .any(|tool| tool["name"] == format!("{NAMESPACE}__spawn_agent"))
+        .then_some(
+            "This desktop session provides Claudex cross-harness delegation. For a requested Codex/GPT child, use this server's claudex_agents__spawn_agent with harness=codex and the requested model and effort, then claudex_agents__wait_agent for its result. This creates the actual Codex child chat with its own model, session, permissions and follow-up controls. Use native Agent for Claude subagents. This guidance applies only to delegation; it does not authorize spawning an agent without a task that calls for one.",
+        )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {

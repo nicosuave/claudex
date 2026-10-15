@@ -474,8 +474,12 @@ pub(crate) fn mcp_local(message: &Value, tools: &[Value]) -> McpLocal {
                 "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" => requested,
                 _ => "2025-11-25",
             };
-            json!({"protocolVersion":version,"capabilities":{"tools":{}},
-                "serverInfo":{"name":"codex_desktop","version":env!("CARGO_PKG_VERSION")}})
+            let mut result = json!({"protocolVersion":version,"capabilities":{"tools":{}},
+                "serverInfo":{"name":"codex_desktop","version":env!("CARGO_PKG_VERSION")}});
+            if let Some(instructions) = crate::delegation::claude_instructions(tools) {
+                result["instructions"] = json!(instructions);
+            }
+            result
         }
         Some("tools/list") => json!({"tools":tools}),
         Some("ping") => json!({}),
@@ -1006,6 +1010,22 @@ mod tests {
         assert_eq!(
             response["response"]["response"]["mcp_response"]["result"]["protocolVersion"],
             "2025-06-18"
+        );
+        assert!(
+            response["response"]["response"]["mcp_response"]["result"]
+                .get("instructions")
+                .is_none()
+        );
+        let delegation_tools =
+            crate::dynamic_tools::parse(&json!([crate::delegation::dynamic_spec()]))
+                .unwrap()
+                .iter()
+                .map(crate::dynamic_tools::Tool::mcp_spec)
+                .collect::<Vec<_>>();
+        let response = mcp_control_response(&request("initialize"), &delegation_tools).unwrap();
+        assert_eq!(
+            response["response"]["response"]["mcp_response"]["result"]["instructions"],
+            crate::delegation::claude_instructions(&delegation_tools).unwrap()
         );
         let response = mcp_control_response(&request("tools/list"), &tools).unwrap();
         assert_eq!(
