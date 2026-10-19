@@ -537,6 +537,8 @@ impl Installation {
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
+  <!-- Give native authentication its own security audit session rather than inheriting GUI Keychain state. -->
+  <key>SessionCreate</key><true/>
   <key>WorkingDirectory</key><string>{home}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>{search_path}</string></dict>
   <key>StandardOutPath</key><string>{log}</string>
@@ -1548,12 +1550,19 @@ mod tests {
         assert!(
             std::process::Command::new("plutil")
                 .arg("-lint")
-                .arg(plist)
+                .arg(&plist)
                 .output()
                 .unwrap()
                 .status
                 .success()
         );
+        let session = std::process::Command::new("plutil")
+            .args(["-extract", "SessionCreate", "raw", "-o", "-"])
+            .arg(&plist)
+            .output()
+            .unwrap();
+        assert!(session.status.success());
+        assert_eq!(String::from_utf8(session.stdout).unwrap().trim(), "true");
         let desktop_env = temp.path().join("desktop-env.plist");
         fs::write(&desktop_env, install.render_desktop_env_plist().unwrap()).unwrap();
         let arguments = std::process::Command::new("plutil")
