@@ -333,11 +333,13 @@ async fn run(args: Args) -> Result<()> {
     let store = Store::open(state)?;
     let (events, receiver) = mpsc::channel(512);
     let server = Server::new(config, store, events.clone())?;
+    // Register handlers before a listener can advertise readiness.
+    let termination = termination()?;
     let engine = tokio::spawn(server.run(receiver));
     let shutdown = CancellationToken::new();
     let result = tokio::select! {
         result = transport::serve(&endpoint, events.clone(), shutdown.clone()) => result,
-        _ = termination() => Ok(()),
+        _ = termination => Ok(()),
     };
     shutdown.cancel();
     let _ = events.send(Event::Shutdown).await;
@@ -389,14 +391,17 @@ async fn proxy(_path: PathBuf) -> Result<()> {
     bail!("Desktop SSH proxy requires Unix sockets")
 }
 
-async fn termination() {
+fn termination() -> Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler");
-        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-    }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Register SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("Register SIGINT handler")?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }

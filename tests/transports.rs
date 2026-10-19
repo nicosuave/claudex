@@ -185,14 +185,39 @@ async fn unix_socket_is_private_framed_and_removed_on_graceful_shutdown() {
     unsafe {
         libc::kill(child.id().unwrap() as i32, libc::SIGTERM);
     }
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success()
-    );
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "facade exit status: {status}");
     assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_signals_are_handled_as_soon_as_the_listener_is_ready() {
+    // Exercise the readiness boundary repeatedly because either process can run first.
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        for _ in 0..8 {
+            let temp = tempfile::Builder::new()
+                .prefix("facade-signal-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = temp.path().join("rpc.sock");
+            let (mut child, _) =
+                start(temp.path(), &format!("unix-lines://{}", path.display())).await;
+            assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                status.success(),
+                "signal {signal}, facade exit status: {status}"
+            );
+            assert!(!path.exists());
+        }
+    }
 }
 
 #[cfg(unix)]
