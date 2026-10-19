@@ -6,11 +6,31 @@ The native Claude backend accepts `thread/fork` with
 and idle. Configuration overrides and history-boundary overrides are rejected.
 ACP agents do not support this mode.
 
-A prediction uses an exact native transcript fork, the parent's model and
-instructions, and the requested turn effort. It permits one turn. Built-in
-tools, MCP servers, desktop tools, plugin runtime startup, native hooks, and
-automatic memory are disabled for that fork. It does not save a new chat or
-change the parent's conversation. Unsubscribing removes the temporary record.
+A prediction uses Claude's native read-only `side_question` against the parent's
+parked process. That preserves the parent's model, instructions, tools, effort,
+and cached history prefix. Native Claude denies tool execution and permits one
+response without adding the question to the parent's transcript or rebuilding
+its cached prefix. No new Claude process or plugin runtime starts, and the
+parent conversation is unchanged.
+Identical prompts against the same parked parent share one pending or completed
+request. Unsubscribing removes the temporary facade record.
+
+Predictions are best effort and never fall back to a cold full-history request.
+They require a live idle parent with matching settings and an unchanged history
+anchor. The last parent request must have started within five minutes and have
+at most 10,000 uncached or cache-write input tokens, matching native suggestions'
+cold-prefix budget. The prediction prompt is limited to 8 KiB. Ineligible
+requests return `{"suggestion":null}` without making a model call. Requests time
+out after ten seconds; cancellation or a new parent turn cancels only the side
+question. Steering, configuration overrides, and structured-output overrides
+are unsupported. An optional prediction effort is accepted but the parent's
+effort is retained to preserve its cache.
+
+Anthropic's [prompt cache guidance](https://claude.com/resources/articles/reducing-cost-and-improving-performance-with-claude-platform)
+states that caches are model-specific. Switching an Opus parent to Haiku
+would require a separate cache; predictions therefore keep the current model.
+The native control response has no per-request usage object, so the facade does
+not report the parent's cumulative billing as prediction usage.
 
 ## Desktop compatibility
 
@@ -42,9 +62,10 @@ are unchanged.
 
 ## Verification
 
-`tests/history_wire.rs` covers the desktop fork request, inherited model/history
-anchor, tool-free launch, temporary cleanup, parent isolation, and rejection of
-overrides and unsupported parents. `tests/router.rs` covers the compatibility
+`tests/history_wire.rs` covers the desktop fork request, warm-process reuse,
+coalescing, cold and stale suppression, prompt limits, cancellation, temporary
+cleanup, parent isolation, and rejection of overrides and unsupported parents.
+`tests/router.rs` covers the compatibility
 provider, its echoed value, preserved thread metadata, and the routed prediction
 fork/turn/unsubscribe transaction.
 
@@ -53,9 +74,11 @@ Claude installation:
 
 ```sh
 mbx test --locked --features test-backend --test history_wire \
-  native_prediction_fork_uses_history_without_tools_or_hooks -- --ignored --nocapture
+  native_prediction_reuses_cache_without_tools_or_hooks -- --ignored --nocapture
 ```
 
-It verifies real transcript recall, absence of tool and hook side effects, and
-continued parent recall. A successful protocol probe does not by itself prove
-that the installed desktop renders its prediction.
+It verifies real prediction recall, absence of tool and hook side effects, and
+continued parent recall. Native diagnostic usage must show over 10,000 cached
+input tokens and fewer than 2,048 fresh/cache-write input tokens; an identical
+request must not make another model call. A successful protocol probe does not
+by itself prove that the installed desktop renders its prediction.

@@ -372,7 +372,6 @@ async fn native_workspace_boundary_and_file_approval() {
         effort: Some("low".into()),
         output_schema: None,
         ephemeral: true,
-        prediction_mode: false,
         dynamic_tools: vec![],
         native_settings: json!({"sandbox":{"allowUnsandboxedCommands":false}}),
         sandbox: Policy::workspace(),

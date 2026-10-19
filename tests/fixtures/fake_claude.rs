@@ -44,8 +44,13 @@ fn finish(session: &str, text: &str, error: bool) {
 fn finish_with(session: &str, text: &str, error: bool, result: Value) {
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
     let assistant_id = uuid::Uuid::new_v4().to_string();
+    let input_tokens = if text == "Echo: cold-cache" {
+        30_000
+    } else {
+        4
+    };
     emit(
-        json!({"type":"stream_event","session_id":session,"event":{"type":"message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":"fake-claude","usage":{"input_tokens":4,"output_tokens":0}}}}),
+        json!({"type":"stream_event","session_id":session,"event":{"type":"message_start","message":{"id":message_id,"type":"message","role":"assistant","content":[],"model":"fake-claude","usage":{"input_tokens":input_tokens,"output_tokens":0}}}}),
     );
     emit(
         json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}),
@@ -57,7 +62,7 @@ fn finish_with(session: &str, text: &str, error: bool, result: Value) {
         json!({"type":"stream_event","session_id":session,"event":{"type":"content_block_stop","index":0}}),
     );
     emit(
-        json!({"type":"assistant","session_id":session,"uuid":assistant_id,"parent_tool_use_id":null,"message":{"id":message_id,"type":"message","role":"assistant","model":"fake-claude","content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":3}}}),
+        json!({"type":"assistant","session_id":session,"uuid":assistant_id,"parent_tool_use_id":null,"message":{"id":message_id,"type":"message","role":"assistant","model":"fake-claude","content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":{"input_tokens":input_tokens,"output_tokens":3}}}),
     );
     let mut message = json!({"type":"result","subtype":if error {"error_during_execution"} else {"success"},"is_error":error,"result":text,"errors":if error {vec![text]} else {vec![]},"session_id":session,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{"input_tokens":if text == "Echo: usage-probe" {40} else {4},"output_tokens":if text == "Echo: usage-probe" {30} else {3}},"modelUsage":{"fake-claude":{"contextWindow":200000},"auxiliary-model":{"contextWindow":1000000}},"permission_denials":[]});
     message
@@ -88,6 +93,8 @@ fn main() {
     let mut hanging = false;
     let mut background = false;
     let mut prompts = 0;
+    let mut predictions = 0;
+    let mut pending_prediction: Option<String> = None;
     // With --fake-mcp-pending, a server reports connecting for the first status polls.
     let mut mcp_polls = 0;
     let mut prompted_while_connecting = false;
@@ -188,6 +195,33 @@ fn main() {
                             json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}}),
                         );
                     }
+                    Some("side_question") => {
+                        predictions += 1;
+                        if let Some(path) = args
+                            .iter()
+                            .find_map(|arg| arg.strip_prefix("--fake-prediction-log="))
+                        {
+                            let mut log = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                                .unwrap();
+                            writeln!(log, "{}", json!({"kind":"start","requestId":request_id}))
+                                .unwrap();
+                        }
+                        let question = value["request"]["question"].as_str().unwrap();
+                        if question.starts_with("hang-prediction") {
+                            pending_prediction = request_id.as_str().map(str::to_owned);
+                            emit(json!({"type":"system","subtype":"control_request_progress",
+                                "request_id":request_id,"status":"started"}));
+                        } else {
+                            let response = json!({"suggestion":format!("process {} prediction {predictions} prompt {prompts}",std::process::id())}).to_string();
+                            emit(
+                                json!({"type":"control_response","response":{"subtype":"success",
+                                "request_id":request_id,"response":{"response":response,"synthetic":false}}}),
+                            );
+                        }
+                    }
                     Some("interrupt") => {
                         emit(
                             json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{}}}),
@@ -200,6 +234,23 @@ fn main() {
                     _ => emit(
                         json!({"type":"control_response","response":{"subtype":"error","request_id":request_id,"error":"unsupported fake control request"}}),
                     ),
+                }
+            }
+            Some("control_cancel_request") => {
+                if pending_prediction.as_deref() == value["request_id"].as_str() {
+                    if let Some(path) = args
+                        .iter()
+                        .find_map(|arg| arg.strip_prefix("--fake-prediction-log="))
+                    {
+                        let mut log = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                        writeln!(
+                            log,
+                            "{}",
+                            json!({"kind":"cancel","requestId":value["request_id"]})
+                        )
+                        .unwrap();
+                    }
+                    pending_prediction = None;
                 }
             }
             Some("user") => {
@@ -302,13 +353,6 @@ fn main() {
                         "systemPrompt":args.iter().find_map(|a| a.strip_prefix("--system-prompt=")),
                         "appendSystemPrompt":args.iter().find_map(|a| a.strip_prefix("--append-system-prompt=")),
                         "ephemeral":args.iter().any(|a| a=="--no-session-persistence"),
-                        "tools":args.iter().find_map(|a| a.strip_prefix("--tools=")),
-                        "strictMcp":args.iter().any(|a| a=="--strict-mcp-config"),
-                        "mcpConfig":args.iter().find_map(|a| a.strip_prefix("--mcp-config="))
-                            .map(|raw| serde_json::from_str::<Value>(raw).unwrap()),
-                        "settings":args.iter().find_map(|a| a.strip_prefix("--settings="))
-                            .map(|raw| serde_json::from_str::<Value>(raw).unwrap()),
-                        "permissionMode":args.iter().find_map(|a| a.strip_prefix("--permission-mode=")),
                         "session":session
                     }).to_string(), false),
                     text if text.starts_with("background-bash") => {

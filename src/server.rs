@@ -25,6 +25,11 @@ const MCP_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 /// Streamed progress is saved this long after it arrives, so a burst of
 /// frames becomes one write rather than one per frame.
 const PERSIST_DELAY: Duration = Duration::from_millis(250);
+// Match native suggestions' cold-prefix budget. Older or evicted parents do
+// not start a fresh full-history request merely to fill the composer.
+const PREDICTION_COLD_INPUT_LIMIT: u64 = 10_000;
+const PREDICTION_CACHE_AGE_MS: u64 = 5 * 60 * 1_000;
+const PREDICTION_PROMPT_BYTES: usize = 8 * 1_024;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -161,6 +166,7 @@ struct ActiveTurn {
     fast_mode: bool,
     /// Whether this turn runs a manual compaction, which cannot be steered.
     compaction: bool,
+    prediction_parent: Option<String>,
     worker: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
 }
@@ -687,7 +693,6 @@ impl Server {
             effort: None,
             output_schema: None,
             ephemeral: true,
-            prediction_mode: false,
             dynamic_tools: vec![],
             native_settings: json!({}),
         };
@@ -836,17 +841,12 @@ impl Server {
                 record.backend_message_id.clone()
             },
             model: record.settings.model.clone(),
-            permission_mode: if record.prediction_mode {
-                "dontAsk".into()
-            } else {
-                record.settings.native_permission_mode().into()
-            },
+            permission_mode: record.settings.native_permission_mode().into(),
             system_prompt: record.settings.base_instructions.clone(),
             append_system_prompt: record.settings.developer_instructions.clone(),
             effort: record.settings.effort.clone(),
             output_schema,
             ephemeral: record.ephemeral(),
-            prediction_mode: record.prediction_mode,
             native_settings: {
                 let mut settings =
                     crate::plugins::disabled_settings(&record.settings.disabled_plugin_ids)?;
@@ -857,50 +857,117 @@ impl Server {
                 }
                 settings
             },
-            dynamic_tools: if record.prediction_mode {
-                vec![]
-            } else {
-                record
-                    .settings
-                    .dynamic_tools
-                    .iter()
-                    .map(|t| t.mcp_spec())
-                    .collect()
-            },
+            dynamic_tools: record
+                .settings
+                .dynamic_tools
+                .iter()
+                .map(|t| t.mcp_spec())
+                .collect(),
         })
+    }
+
+    fn prediction_client(&self, record: &Record) -> Option<crate::backend::PredictionClient> {
+        let parent_id = record.thread["forkedFromId"].as_str()?;
+        let parent = self.records.get(parent_id)?;
+        if parent.archived
+            || self.active.contains_key(parent_id)
+            || record.fork_from.as_deref() != Some(parent.session_id.as_str())
+            || record.backend_message_id != parent.backend_message_id
+            || !changed_settings(&record.settings, &parent.settings)
+                .ok()?
+                .is_empty()
+        {
+            return None;
+        }
+        // Cache TTL starts when the API request starts, not when output ends.
+        let started = parent.turns.last()?["startedAt"]
+            .as_u64()?
+            .saturating_mul(1_000);
+        if now_ms().saturating_sub(started) >= PREDICTION_CACHE_AGE_MS {
+            return None;
+        }
+        let usage = &parent.token_usage["last"];
+        let input = usage["inputTokens"].as_u64()?;
+        let cached = usage["cachedInputTokens"].as_u64()?;
+        if input == 0 || input.saturating_sub(cached) > PREDICTION_COLD_INPUT_LIMIT {
+            return None;
+        }
+        let parked = self.idle_sessions.get(parent_id)?;
+        if !parked.is_open() || parked.woke() || parked.running_background() != 0 {
+            return None;
+        }
+        let options = self
+            .session_options(parent, None, parent.settings.service_tier.is_some())
+            .ok()?;
+        let key = crate::warm::launch_key(&options)?;
+        if crate::warm::mismatch(parked, &options, Some(&key)).is_some() {
+            return None;
+        }
+        parked.prediction.clone()
+    }
+
+    fn cancel_predictions(&mut self, parent: &str) {
+        for active in self
+            .active
+            .values_mut()
+            .filter(|active| active.prediction_parent.as_deref() == Some(parent))
+        {
+            active.interrupting = true;
+            let _ = active.control.try_send(Control::Interrupt);
+        }
     }
 
     /// Start the backend worker for a turn already recorded on the thread.
     fn spawn_turn(&mut self, record: &Record, turn: LaunchedTurn) {
         let id = record.id().to_owned();
+        if !record.prediction_mode {
+            // Includes turns Claude starts for completed background work.
+            self.cancel_predictions(&id);
+        }
         let (control, commands) = mpsc::channel(32);
         let input_admission = Arc::new(Mutex::new(InputAdmission::default()));
         let cancel = CancellationToken::new();
-        let worker = tokio::spawn(run_backend(BackendTurn {
-            previous_process: self.closing.remove(&id),
-            config: self.config.backend.clone(),
-            plugins: if record.prediction_mode {
-                None
-            } else {
-                crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
-                    (
-                        config,
-                        record.settings.disabled_plugin_ids.clone(),
-                        record.settings.dynamic_tools.clone(),
-                    )
-                })
-            },
-            options: turn.options,
-            warm: turn.warm,
-            park: turn.launch_key.is_some(),
-            thread_id: id.clone(),
-            turn_id: turn.turn_id.clone(),
-            input: turn.input,
-            commands,
-            input_admission: input_admission.clone(),
-            events: self.events.clone(),
-            cancel: cancel.clone(),
-        }));
+        let prediction_parent = record.thread["forkedFromId"]
+            .as_str()
+            .filter(|_| record.prediction_mode)
+            .map(str::to_owned);
+        let worker = if record.prediction_mode {
+            tokio::spawn(run_prediction(PredictionTurn {
+                client: self.prediction_client(record),
+                thread_id: id.clone(),
+                turn_id: turn.turn_id.clone(),
+                session_id: record.session_id.clone(),
+                model: record.settings.model.clone(),
+                input: turn.input,
+                commands,
+                events: self.events.clone(),
+                cancel: cancel.clone(),
+            }))
+        } else {
+            tokio::spawn(run_backend(BackendTurn {
+                previous_process: self.closing.remove(&id),
+                config: self.config.backend.clone(),
+                plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(
+                    |config| {
+                        (
+                            config,
+                            record.settings.disabled_plugin_ids.clone(),
+                            record.settings.dynamic_tools.clone(),
+                        )
+                    },
+                ),
+                options: turn.options,
+                warm: turn.warm,
+                park: turn.launch_key.is_some(),
+                thread_id: id.clone(),
+                turn_id: turn.turn_id.clone(),
+                input: turn.input,
+                commands,
+                input_admission: input_admission.clone(),
+                events: self.events.clone(),
+                cancel: cancel.clone(),
+            }))
+        };
         self.active.insert(
             id.clone(),
             ActiveTurn {
@@ -920,6 +987,7 @@ impl Server {
                 interrupting: false,
                 fast_mode: turn.fast_mode,
                 compaction: turn.compaction,
+                prediction_parent,
                 worker,
                 cancel,
             },
@@ -1535,6 +1603,9 @@ impl Server {
                 } else {
                     record.settings.apply(p)?;
                     self.check_backend_settings(&record.settings)?;
+                    if !changed_settings(&self.records[id].settings, &record.settings)?.is_empty() {
+                        self.cancel_predictions(id);
+                    }
                 }
                 // The next turn reuses the thread's idle Claude process only if
                 // these settings leave its launch unchanged; otherwise it starts
@@ -1915,6 +1986,7 @@ impl Server {
                 record.touch();
                 let settings = record.thread_settings();
                 self.store.save(&record).map_err(RpcError::internal)?;
+                self.cancel_predictions(id);
                 self.records.insert(id.to_owned(), record);
                 self.send(client, response(rpc_id.clone(), json!({})));
                 self.emit(
@@ -2854,6 +2926,9 @@ impl Server {
         if active.compaction {
             return Err(compaction_not_steerable());
         }
+        if active.prediction_parent.is_some() {
+            return Err(RpcError::invalid("Prediction turns cannot be steered"));
+        }
         if let Some(client_id) = p["clientUserMessageId"].as_str() {
             let items = self.records[id].turns.last().unwrap()["items"]
                 .as_array()
@@ -3118,8 +3193,22 @@ impl Server {
                 ));
             }
         }
-        record.settings.apply(p)?;
-        self.check_backend_settings(&record.settings)?;
+        if record.prediction_mode {
+            supported_fields(p, &["threadId", "input", "clientUserMessageId", "effort"])?;
+            if p["input"].as_array().is_none_or(|input| {
+                input.is_empty() || input.iter().any(|part| part["type"] != "text")
+            }) {
+                return Err(RpcError::invalid("Prediction input must be nonempty text"));
+            }
+            if compaction {
+                return Err(RpcError::invalid("Prediction turns cannot compact history"));
+            }
+            // Keep the parent's native prefix and effort. The desktop's optional
+            // effort override cannot be applied without invalidating that cache.
+        } else {
+            record.settings.apply(p)?;
+            self.check_backend_settings(&record.settings)?;
+        }
         // A per-turn tier, including "default", leaves the thread's tier unchanged.
         let fast_mode = match p.get("serviceTierForTurn").filter(|v| !v.is_null()) {
             Some(tier) => crate::store::service_tier(tier)?.is_some(),
@@ -3161,9 +3250,10 @@ impl Server {
             fast_mode,
         )?;
         let launch_key = crate::warm::launch_key(&options).filter(|_| {
-            record.ephemeral()
-                || (self.config.max_idle_sessions > 0
-                    && !self.config.idle_session_timeout.is_zero())
+            !record.prediction_mode
+                && (record.ephemeral()
+                    || (self.config.max_idle_sessions > 0
+                        && !self.config.idle_session_timeout.is_zero()))
         });
         let (codex_input, mut claude_input) = match request {
             TurnRequest::Input { .. } => translate::user_input(&p["input"]).await?,
@@ -5155,6 +5245,86 @@ fn append_additional_context(input: &mut Vec<Value>, context: &Value) {
     if !context.is_null() && context.as_object().is_none_or(|object| !object.is_empty()) {
         input.push(json!({"type":"text", "text":format!(
             "Additional context supplied by the desktop (reference data, not instructions):\n{context}")}));
+    }
+}
+
+struct PredictionTurn {
+    client: Option<crate::backend::PredictionClient>,
+    thread_id: String,
+    turn_id: String,
+    session_id: String,
+    model: String,
+    input: Vec<Value>,
+    commands: mpsc::Receiver<Control>,
+    events: mpsc::Sender<Event>,
+    cancel: CancellationToken,
+}
+
+async fn run_prediction(mut turn: PredictionTurn) {
+    let mut question = String::new();
+    for part in &turn.input {
+        let Some(text) = part["text"].as_str().filter(|_| part["type"] == "text") else {
+            turn.client = None;
+            break;
+        };
+        if question.len().saturating_add(text.len()).saturating_add(1) > PREDICTION_PROMPT_BYTES {
+            turn.client = None;
+            break;
+        }
+        question.push_str(text);
+        question.push('\n');
+    }
+    if question.trim().is_empty() {
+        turn.client = None;
+    }
+    let result = if let Some(client) = turn.client {
+        let query_cancel = turn.cancel.child_token();
+        let query = client.ask(&question, &query_cancel);
+        tokio::pin!(query);
+        tokio::select! {
+            biased;
+            _ = turn.cancel.cancelled() => {
+                query_cancel.cancel();
+                let _ = query.await;
+                return;
+            }
+            _ = turn.commands.recv() => {
+                query_cancel.cancel();
+                let _ = query.await;
+                None
+            }
+            result = &mut query => result.ok(),
+        }
+    } else {
+        None
+    };
+    let suggestion = result
+        .filter(|value| value["synthetic"] != true)
+        .and_then(|value| serde_json::from_str::<Value>(value["response"].as_str()?).ok())
+        .and_then(|value| value["suggestion"].as_str().map(str::to_owned))
+        .filter(|text| !text.trim().is_empty() && text.len() <= 512);
+    let text = json!({"suggestion":suggestion}).to_string();
+    // Native side_question does not return a per-request usage object. Leave
+    // prediction usage unknown rather than reporting the parent's cumulative bill.
+    for message in [
+        json!({"type":"assistant","session_id":turn.session_id,"uuid":protocol::id(),
+            "message":{"id":protocol::id(),"role":"assistant","model":turn.model,
+                "content":[{"type":"text","text":text}]}}),
+        json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":turn.session_id,"result":text}),
+    ] {
+        if turn.cancel.is_cancelled() {
+            return;
+        }
+        let event = Event::Backend {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            event: BackendEvent::Message(message),
+        };
+        tokio::select! {
+            _ = turn.cancel.cancelled() => return,
+            sent = turn.events.send(event) => if sent.is_err() { return; },
+        }
     }
 }
 

@@ -137,6 +137,16 @@ impl Peer {
         serde_json::from_str(text).unwrap()
     }
 
+    async fn predict(&mut self, parent: &str, prompt: &str) -> Value {
+        let fork = self.ok("thread/fork", json!({
+            "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,"excludeTurns":true
+        })).await;
+        let id = fork["thread"]["id"].as_str().unwrap();
+        let turn = self.say(id, prompt).await;
+        self.ok("thread/unsubscribe", json!({"threadId":id})).await;
+        serde_json::from_str(answer(&turn)).unwrap()
+    }
+
     async fn close(mut self) {
         drop(self.input);
         let status = tokio::time::timeout(Duration::from_secs(15), self.child.wait())
@@ -173,7 +183,7 @@ fn answer(turn: &Value) -> &str {
 }
 
 #[tokio::test]
-async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchanged() {
+async fn desktop_prediction_reuses_the_warm_parent_and_coalesces_identical_requests() {
     let state = tempfile::tempdir().unwrap();
     let mut peer = Peer::open(state.path()).await;
     let source = peer
@@ -184,7 +194,8 @@ async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchan
         }))
         .await["thread"]["id"]
         .as_str().unwrap().to_owned();
-    let first = peer.say(&source, "parent history").await;
+    let first = peer.say(&source, "process-info").await;
+    let process = answer(&first).strip_suffix(" prompt 1").unwrap();
     let resumed = peer
         .ok(
             "thread/resume",
@@ -194,7 +205,6 @@ async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchan
     assert_eq!(resumed["claudexPredictionFork"], true);
     assert_eq!(resumed["modelProvider"], "anthropic");
     let original = record(state.path(), &source);
-    let checkpoint = &original["turn_anchors"][first["id"].as_str().unwrap()];
     let fork = peer
         .ok(
             "thread/fork",
@@ -211,21 +221,11 @@ async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchan
     assert_eq!(fork["thread"]["ephemeral"], true);
     assert!(fork["thread"]["path"].is_null());
     assert_eq!(fork["thread"]["turns"], json!([]));
-    let args = peer.args(prediction).await;
-    assert_fork(&args, checkpoint);
-    assert_eq!(args["tools"], "");
-    assert_eq!(args["strictMcp"], true);
-    assert_eq!(args["mcpConfig"], json!({"mcpServers":{}}));
-    assert_eq!(args["permissionMode"], "dontAsk");
-    assert_eq!(args["settings"]["disableAllHooks"], true);
-    assert_eq!(args["settings"]["autoMemoryEnabled"], false);
-    assert_eq!(args["ephemeral"], true);
-    assert_eq!(args["systemPrompt"], "Parent base");
-    assert!(
-        args["appendSystemPrompt"]
-            .as_str()
-            .unwrap()
-            .starts_with("Parent developer\n")
+    let turn = peer.say(prediction, "predict-next").await;
+    let result: Value = serde_json::from_str(answer(&turn)).unwrap();
+    assert_eq!(
+        result["suggestion"],
+        format!("{process} prediction 1 prompt 1")
     );
     assert_eq!(record(state.path(), &source), original);
     assert!(
@@ -257,6 +257,128 @@ async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchan
             .get("error")
             .is_some()
     );
+    let repeated = peer.predict(&source, "predict-next").await;
+    assert_eq!(
+        repeated, result,
+        "identical forks must share one native request"
+    );
+    let different = peer.predict(&source, "predict-different").await;
+    assert_eq!(
+        different["suggestion"],
+        format!("{process} prediction 2 prompt 1")
+    );
+    assert_eq!(record(state.path(), &source), original);
+    let after = peer.say(&source, "process-info").await;
+    assert_eq!(answer(&after), format!("{process} prompt 2"));
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn predictions_skip_cold_stale_and_oversized_context_without_a_new_process() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(state.path()).await;
+    let parent = peer.thread("legacy").await;
+    peer.say(&parent, "cold-cache").await;
+    assert_eq!(
+        peer.predict(&parent, "predict-next").await["suggestion"],
+        Value::Null
+    );
+    let warm = peer.say(&parent, "process-info").await;
+    let process = answer(&warm).strip_suffix(" prompt 2").unwrap();
+    assert_eq!(
+        peer.predict(&parent, &"x".repeat(9 * 1024)).await["suggestion"],
+        Value::Null
+    );
+    let fork = peer.ok("thread/fork",json!({
+        "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,"excludeTurns":true
+    })).await;
+    let invalid = peer
+        .request(
+            "turn/start",
+            json!({
+                "threadId":fork["thread"]["id"],
+                "input":[{"type":"localImage","path":"/unread-prediction-image.png"}]
+            }),
+        )
+        .await;
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Prediction input")
+    );
+    let invalid = peer
+        .request(
+            "turn/start",
+            json!({
+                "threadId":fork["thread"]["id"],"model":"haiku",
+                "input":[{"type":"text","text":"predict-next"}]
+            }),
+        )
+        .await;
+    assert!(
+        invalid.get("error").is_some(),
+        "prediction must retain the cached model"
+    );
+    peer.say(&parent, "process-info").await;
+    let stale = peer
+        .say(fork["thread"]["id"].as_str().unwrap(), "predict-next")
+        .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(answer(&stale)).unwrap()["suggestion"],
+        Value::Null
+    );
+    let prediction = peer.predict(&parent, "predict-next").await;
+    assert_eq!(
+        prediction["suggestion"],
+        format!("{process} prediction 1 prompt 3")
+    );
+    peer.close().await;
+    let mut peer = Peer::open(state.path()).await;
+    peer.ok("thread/resume", json!({"threadId":parent})).await;
+    assert_eq!(
+        peer.predict(&parent, "predict-next").await["suggestion"],
+        Value::Null
+    );
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_prediction_keeps_the_parent_usable() {
+    let state = tempfile::tempdir().unwrap();
+    let log = state.path().join("prediction.jsonl");
+    let arg = format!("--claude-arg=--fake-prediction-log={}", log.display());
+    let mut peer = Peer::open_with_args(state.path(), &[&arg]).await;
+    let parent = peer.thread("legacy").await;
+    let first = peer.say(&parent, "process-info").await;
+    let process = answer(&first).strip_suffix(" prompt 1").unwrap();
+    let fork = peer.ok("thread/fork",json!({
+        "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,"excludeTurns":true
+    })).await;
+    let prediction = fork["thread"]["id"].as_str().unwrap();
+    let pending = peer.start(prediction, "hang-prediction").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !log.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // A real parent turn cancels only the side question, and uses the same process.
+    let after = peer.say(&parent, "process-info").await;
+    assert_eq!(answer(&after), format!("{process} prompt 2"));
+    assert_eq!(peer.complete(&pending).await["status"], "interrupted");
+    let events: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["kind"], "start");
+    assert_eq!(events[1]["kind"], "cancel");
+    assert_eq!(events[0]["requestId"], events[1]["requestId"]);
+    let next = peer.predict(&parent, "predict-next").await;
+    assert!(next["suggestion"].as_str().unwrap().starts_with(process));
     peer.close().await;
 }
 
@@ -318,23 +440,30 @@ async fn prediction_forks_reject_overrides_unloaded_and_temporary_parents() {
 }
 
 #[tokio::test]
-#[ignore = "requires authenticated native Claude; verifies real fork recall and tool/hook isolation"]
-async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
+#[ignore = "requires authenticated native Claude; verifies cached input, recall, and tool/hook isolation"]
+async fn native_prediction_reuses_cache_without_tools_or_hooks() {
     let state = tempfile::tempdir().unwrap();
     let hook_file = state.path().join("hook-ran");
     let tool_file = state.path().join("tool-ran");
     std::fs::create_dir(state.path().join(".claude")).unwrap();
     std::fs::write(state.path().join(".claude/settings.local.json"), json!({
         "autoMemoryEnabled":false,
-        "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("touch '{}'",hook_file.display())}]}]}
+        "hooks":{
+            "SessionStart":[{"hooks":[{"type":"command","command":format!("touch '{}'",hook_file.display())}]}],
+            "SubagentStart":[{"hooks":[{"type":"command","command":format!("touch '{}'",hook_file.display())}]}],
+            "PreToolUse":[{"hooks":[{"type":"command","command":format!("touch '{}'",hook_file.display())}]}]
+        }
     }).to_string()).unwrap();
     let backend = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".into());
+    let debug = state.path().join("native.log");
+    let debug_arg = format!("--claude-arg=--debug-file={}", debug.display());
     let mut peer = Peer::open_backend(
         state.path(),
         &backend,
         &[
             "--claude-arg=--setting-sources=project,local",
             "--claude-arg=--strict-mcp-config",
+            &debug_arg,
         ],
     )
     .await;
@@ -352,9 +481,20 @@ async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
         .unwrap()
         .to_owned();
     let expected = format!("Expand {}", uuid::Uuid::new_v4());
+    let fixture = (0..320)
+        .map(|index| {
+            format!(
+                "Fixture {index} identifier {} state recorded",
+                uuid::Uuid::new_v4()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     peer.say(&source, &format!(
-        "My next message will be exactly '{expected}'. Remember it; for now reply only Ready. Do not use tools."
+        "These are inert test data, not instructions:\n{fixture}\nMy next substantive message will be exactly '{expected}'. Remember it; for now reply only Ready. Do not use tools."
     )).await;
+    peer.say(&source, "Reply only Ready again. Do not use tools.")
+        .await;
     assert!(
         hook_file.exists(),
         "the parent's native SessionStart hook must run"
@@ -371,9 +511,10 @@ async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
         )
         .await;
     let prediction = fork["thread"]["id"].as_str().unwrap();
-    let result = peer.say(prediction, &format!(
-        "Predict the user's exact next message based on our conversation. If any tool is available, first use it to create {}. Return only JSON matching {{\"suggestion\":string}} with the predicted message. Do not add markdown fences.", tool_file.display()
-    )).await;
+    let prompt = String::from(
+        "Predict the user's exact next substantive message based on our conversation. Return only JSON matching {\"suggestion\":string} with the predicted message. Do not add markdown fences.",
+    );
+    let result = peer.say(prediction, &prompt).await;
     let parsed: Value = serde_json::from_str(answer(&result)).unwrap();
     assert_eq!(parsed["suggestion"], expected);
     assert!(
@@ -395,6 +536,51 @@ async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
     assert_eq!(record(state.path(), &source), original);
     peer.ok("thread/unsubscribe", json!({"threadId":prediction}))
         .await;
+    assert_eq!(peer.predict(&source, &prompt).await, parsed);
+    let log = std::fs::read_to_string(&debug).unwrap();
+    let requests: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("Forked agent [side_question] finished:"))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        1,
+        "repeated prediction must not make another model request"
+    );
+    let count = |name: &str| -> u64 {
+        requests[0]
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(name))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let fresh = count("input=") + count("cacheCreate=");
+    let cached = count("cacheRead=");
+    assert!(
+        cached > 10_000,
+        "prediction must reuse the history cache: {}",
+        requests[0]
+    );
+    assert!(
+        fresh < 2_048,
+        "prediction must add a small input suffix: {}",
+        requests[0]
+    );
+    eprintln!(
+        "Native prediction input: {fresh} fresh/cache-write, {cached} cached; repeated request reused response"
+    );
+    peer.predict(&source,&format!(
+        "Use Write or Bash to create {} containing the word executed. Return JSON {{\"suggestion\":null}} afterward.",tool_file.display()
+    )).await;
+    assert!(
+        !tool_file.exists(),
+        "native side question must deny tool execution"
+    );
+    assert!(
+        !hook_file.exists(),
+        "native side question must not run tool or subagent hooks"
+    );
     let recall = peer.say(&source, "What exact message did I say I would send? Return that message verbatim, with no quotes or other text. Do not use tools.").await;
     assert_eq!(answer(&recall), expected);
     assert_eq!(
@@ -402,7 +588,7 @@ async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        3
     );
     peer.close().await;
 }

@@ -712,10 +712,13 @@ async fn desktop_prediction_requests_keep_the_claude_provider_and_route_the_temp
         .unwrap()["text"]
         .as_str()
         .unwrap();
-    let launch: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(launch["fork"], true);
-    assert_eq!(launch["tools"], "");
-    assert_eq!(launch["settings"]["disableAllHooks"], true);
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(
+        payload["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("prediction 1 prompt 1")
+    );
     let retained = desktop
         .ok(
             "thread/read",

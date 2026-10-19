@@ -205,7 +205,7 @@ pub struct Record {
     pub session_id: String,
     pub has_session: bool,
     pub fork_from: Option<String>,
-    /// One-shot, tool-free fork used by desktop prompt predictions.
+    /// One-shot, read-only question against the parent's warm native process.
     #[serde(default)]
     pub prediction_mode: bool,
     #[serde(default)]
