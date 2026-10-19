@@ -302,6 +302,13 @@ fn main() {
                         "systemPrompt":args.iter().find_map(|a| a.strip_prefix("--system-prompt=")),
                         "appendSystemPrompt":args.iter().find_map(|a| a.strip_prefix("--append-system-prompt=")),
                         "ephemeral":args.iter().any(|a| a=="--no-session-persistence"),
+                        "tools":args.iter().find_map(|a| a.strip_prefix("--tools=")),
+                        "strictMcp":args.iter().any(|a| a=="--strict-mcp-config"),
+                        "mcpConfig":args.iter().find_map(|a| a.strip_prefix("--mcp-config="))
+                            .map(|raw| serde_json::from_str::<Value>(raw).unwrap()),
+                        "settings":args.iter().find_map(|a| a.strip_prefix("--settings="))
+                            .map(|raw| serde_json::from_str::<Value>(raw).unwrap()),
+                        "permissionMode":args.iter().find_map(|a| a.strip_prefix("--permission-mode=")),
                         "session":session
                     }).to_string(), false),
                     text if text.starts_with("background-bash") => {

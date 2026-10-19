@@ -14,6 +14,21 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
     let object = p
         .as_object_mut()
         .ok_or_else(|| RpcError::invalid("params must be an object"))?;
+    if method == "thread/fork" && object.get("experimentalPredictionMode") == Some(&json!(true)) {
+        crate::protocol::supported_fields(
+            params,
+            &[
+                "threadId",
+                "experimentalPredictionMode",
+                "ephemeral",
+                "excludeTurns",
+                "threadSource",
+            ],
+        )?;
+        if object.get("ephemeral") != Some(&json!(true)) {
+            return Err(RpcError::invalid("Prediction forks require ephemeral=true"));
+        }
+    }
     let mut warnings = Vec::new();
     if let Some(profile) = object
         .remove("permissions")
@@ -121,10 +136,14 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
                 // They are not Claude settings. Warn instead of pretending to
                 // enable Codex-only execution features on the native backend.
                 key if key.starts_with("features.") => native_features = true,
-                // The local desktop also injects its Codex memory storage and
-                // Node REPL setup. Claude keeps its own native memory and MCP
-                // configuration; these do not configure the Claude backend.
-                "memories.dual_write" | "memories.version" | "mcp_servers.node_repl" => {
+                // The local desktop injects Codex memory and desktop-owned MCP
+                // runtimes, including disabled placeholders. Claude keeps its
+                // native memory/MCP configuration and its separate tool bridge.
+                "memories.dual_write"
+                | "memories.version"
+                | "mcp_servers.node_repl"
+                | "mcp_servers.artifact_session"
+                | "mcp_servers.cua_repl" => {
                     native_features = true;
                 }
                 "apps.connector_openai_pages.tools"
@@ -149,7 +168,7 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
             )));
         }
         if native_features {
-            warnings.push("Claude uses its native runtime, memory and tools; Codex runtime feature, memory and Node REPL overrides are not applied.".into());
+            warnings.push("Claude uses its native runtime, memory and tools; Codex runtime feature, memory and desktop MCP overrides (node_repl, artifact_session, cua_repl) are not applied. Existing desktop tool forwarding is separate.".into());
         }
     }
     if let Some(mode) = object.remove("collaborationMode").filter(|v| !v.is_null()) {

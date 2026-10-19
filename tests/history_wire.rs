@@ -13,6 +13,7 @@ struct Peer {
     output: Lines<BufReader<ChildStdout>>,
     received: Vec<Value>,
     serial: u64,
+    timeout: Duration,
 }
 
 impl Peer {
@@ -21,13 +22,12 @@ impl Peer {
     }
 
     async fn open_with_args(state: &Path, extra: &[&str]) -> Self {
+        Self::open_backend(state, env!("CARGO_BIN_EXE_fake-claude"), extra).await
+    }
+
+    async fn open_backend(state: &Path, backend: &str, extra: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
-            .args([
-                "app-server",
-                "--stdio",
-                "--claude",
-                env!("CARGO_BIN_EXE_fake-claude"),
-            ])
+            .args(["app-server", "--stdio", "--claude", backend])
             .args(extra)
             .arg("--state-dir")
             .arg(state)
@@ -44,6 +44,7 @@ impl Peer {
             child,
             received: vec![],
             serial: 0,
+            timeout: Duration::from_secs(15),
         };
         peer.ok("initialize", json!({"clientInfo":{"name":"history-wire","version":"1"},"capabilities":{"experimentalApi":true}})).await;
         peer
@@ -54,7 +55,7 @@ impl Peer {
             return found.clone();
         }
         loop {
-            let line = tokio::time::timeout(Duration::from_secs(15), self.output.next_line())
+            let line = tokio::time::timeout(self.timeout, self.output.next_line())
                 .await
                 .unwrap()
                 .unwrap()
@@ -169,6 +170,241 @@ fn answer(turn: &Value) -> &str {
         .unwrap()["text"]
         .as_str()
         .unwrap()
+}
+
+#[tokio::test]
+async fn desktop_prediction_fork_is_tool_free_ephemeral_and_leaves_parent_unchanged() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(state.path()).await;
+    let source = peer
+        .ok("thread/start", json!({
+            "sandbox":"danger-full-access", "model":"opus", "config":{"model_reasoning_effort":"high"},
+            "baseInstructions":"Parent base", "developerInstructions":"Parent developer",
+            "dynamicTools":[{"type":"function","name":"parent_tool","description":"Only the parent has this tool", "inputSchema":{"type":"object"}}]
+        }))
+        .await["thread"]["id"]
+        .as_str().unwrap().to_owned();
+    let first = peer.say(&source, "parent history").await;
+    let resumed = peer
+        .ok(
+            "thread/resume",
+            json!({"threadId":source,"excludeTurns":true}),
+        )
+        .await;
+    assert_eq!(resumed["claudexPredictionFork"], true);
+    assert_eq!(resumed["modelProvider"], "anthropic");
+    let original = record(state.path(), &source);
+    let checkpoint = &original["turn_anchors"][first["id"].as_str().unwrap()];
+    let fork = peer
+        .ok(
+            "thread/fork",
+            json!({
+                "threadId":source, "experimentalPredictionMode":true,
+                "ephemeral":true, "excludeTurns":true, "threadSource":"composer_predictions"
+            }),
+        )
+        .await;
+    let prediction = fork["thread"]["id"].as_str().unwrap();
+    assert_eq!(fork["modelProvider"], "anthropic");
+    assert_eq!(fork["model"], "opus");
+    assert_eq!(fork["reasoningEffort"], "high");
+    assert_eq!(fork["thread"]["ephemeral"], true);
+    assert!(fork["thread"]["path"].is_null());
+    assert_eq!(fork["thread"]["turns"], json!([]));
+    let args = peer.args(prediction).await;
+    assert_fork(&args, checkpoint);
+    assert_eq!(args["tools"], "");
+    assert_eq!(args["strictMcp"], true);
+    assert_eq!(args["mcpConfig"], json!({"mcpServers":{}}));
+    assert_eq!(args["permissionMode"], "dontAsk");
+    assert_eq!(args["settings"]["disableAllHooks"], true);
+    assert_eq!(args["settings"]["autoMemoryEnabled"], false);
+    assert_eq!(args["ephemeral"], true);
+    assert_eq!(args["systemPrompt"], "Parent base");
+    assert!(
+        args["appendSystemPrompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("Parent developer\n")
+    );
+    assert_eq!(record(state.path(), &source), original);
+    assert!(
+        !state
+            .path()
+            .join("threads")
+            .join(format!("{prediction}.json"))
+            .exists()
+    );
+    let repeated = peer
+        .request(
+            "turn/start",
+            json!({
+                "threadId":prediction,"input":[{"type":"text","text":"another prediction"}]
+            }),
+        )
+        .await;
+    assert!(
+        repeated["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("one turn")
+    );
+    peer.ok("thread/unsubscribe", json!({"threadId":prediction}))
+        .await;
+    assert!(
+        peer.request("thread/read", json!({"threadId":prediction}))
+            .await
+            .get("error")
+            .is_some()
+    );
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn prediction_forks_reject_overrides_unloaded_and_temporary_parents() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peer = Peer::open(state.path()).await;
+    let source = peer.thread("legacy").await;
+    peer.say(&source, "parent history").await;
+    for override_params in [
+        json!({"ephemeral":false}),
+        json!({"experimentalPredictionMode":"yes"}),
+        json!({"model":"haiku"}),
+        json!({"config":{}}),
+        json!({"baseInstructions":"replace parent"}),
+        json!({"beforeTurnId":"earlier"}),
+        json!({"permissions":":danger-full-access"}),
+    ] {
+        let mut params =
+            json!({"threadId":source,"experimentalPredictionMode":true,"ephemeral":true});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(override_params.as_object().unwrap().clone());
+        let reply = peer.request("thread/fork", params).await;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    }
+    peer.ok("thread/unsubscribe", json!({"threadId":source}))
+        .await;
+    let unloaded = peer
+        .request(
+            "thread/fork",
+            json!({
+                "threadId":source,"experimentalPredictionMode":true,"ephemeral":true
+            }),
+        )
+        .await;
+    assert!(
+        unloaded["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Resume the parent")
+    );
+    let temporary =
+        peer.ok("thread/start", json!({"ephemeral":true})).await["thread"]["id"].clone();
+    assert!(
+        peer.request(
+            "thread/fork",
+            json!({
+                "threadId":temporary,"experimentalPredictionMode":true,"ephemeral":true
+            })
+        )
+        .await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Ephemeral")
+    );
+    peer.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated native Claude; verifies real fork recall and tool/hook isolation"]
+async fn native_prediction_fork_uses_history_without_tools_or_hooks() {
+    let state = tempfile::tempdir().unwrap();
+    let hook_file = state.path().join("hook-ran");
+    let tool_file = state.path().join("tool-ran");
+    std::fs::create_dir(state.path().join(".claude")).unwrap();
+    std::fs::write(state.path().join(".claude/settings.local.json"), json!({
+        "autoMemoryEnabled":false,
+        "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("touch '{}'",hook_file.display())}]}]}
+    }).to_string()).unwrap();
+    let backend = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".into());
+    let mut peer = Peer::open_backend(
+        state.path(),
+        &backend,
+        &[
+            "--claude-arg=--setting-sources=project,local",
+            "--claude-arg=--strict-mcp-config",
+        ],
+    )
+    .await;
+    peer.timeout = Duration::from_secs(120);
+    let source = peer
+        .ok(
+            "thread/start",
+            json!({
+                "sandbox":"workspace-write", "model":"opus", "config":{"model_reasoning_effort":"low"},
+                "baseInstructions":"You are a concise helpful assistant. Follow the user's request."
+            }),
+        )
+        .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expected = format!("Expand {}", uuid::Uuid::new_v4());
+    peer.say(&source, &format!(
+        "My next message will be exactly '{expected}'. Remember it; for now reply only Ready. Do not use tools."
+    )).await;
+    assert!(
+        hook_file.exists(),
+        "the parent's native SessionStart hook must run"
+    );
+    std::fs::remove_file(&hook_file).unwrap();
+    let original = record(state.path(), &source);
+    let fork = peer
+        .ok(
+            "thread/fork",
+            json!({
+                "threadId":source,"experimentalPredictionMode":true,"ephemeral":true,
+                "excludeTurns":true,"threadSource":"composer_predictions"
+            }),
+        )
+        .await;
+    let prediction = fork["thread"]["id"].as_str().unwrap();
+    let result = peer.say(prediction, &format!(
+        "Predict the user's exact next message based on our conversation. If any tool is available, first use it to create {}. Return only JSON matching {{\"suggestion\":string}} with the predicted message. Do not add markdown fences.", tool_file.display()
+    )).await;
+    let parsed: Value = serde_json::from_str(answer(&result)).unwrap();
+    assert_eq!(parsed["suggestion"], expected);
+    assert!(
+        !hook_file.exists(),
+        "prediction must not run inherited hooks"
+    );
+    assert!(!tool_file.exists(), "prediction must not run tools");
+    assert!(
+        !result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| matches!(
+                item["type"].as_str(),
+                Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall")
+            )),
+        "{result}"
+    );
+    assert_eq!(record(state.path(), &source), original);
+    peer.ok("thread/unsubscribe", json!({"threadId":prediction}))
+        .await;
+    let recall = peer.say(&source, "What exact message did I say I would send? Return that message verbatim, with no quotes or other text. Do not use tools.").await;
+    assert_eq!(answer(&recall), expected);
+    assert_eq!(
+        record(state.path(), &source)["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    peer.close().await;
 }
 
 #[tokio::test]

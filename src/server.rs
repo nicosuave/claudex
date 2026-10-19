@@ -687,6 +687,7 @@ impl Server {
             effort: None,
             output_schema: None,
             ephemeral: true,
+            prediction_mode: false,
             dynamic_tools: vec![],
             native_settings: json!({}),
         };
@@ -835,12 +836,17 @@ impl Server {
                 record.backend_message_id.clone()
             },
             model: record.settings.model.clone(),
-            permission_mode: record.settings.native_permission_mode().into(),
+            permission_mode: if record.prediction_mode {
+                "dontAsk".into()
+            } else {
+                record.settings.native_permission_mode().into()
+            },
             system_prompt: record.settings.base_instructions.clone(),
             append_system_prompt: record.settings.developer_instructions.clone(),
             effort: record.settings.effort.clone(),
             output_schema,
             ephemeral: record.ephemeral(),
+            prediction_mode: record.prediction_mode,
             native_settings: {
                 let mut settings =
                     crate::plugins::disabled_settings(&record.settings.disabled_plugin_ids)?;
@@ -851,12 +857,16 @@ impl Server {
                 }
                 settings
             },
-            dynamic_tools: record
-                .settings
-                .dynamic_tools
-                .iter()
-                .map(|t| t.mcp_spec())
-                .collect(),
+            dynamic_tools: if record.prediction_mode {
+                vec![]
+            } else {
+                record
+                    .settings
+                    .dynamic_tools
+                    .iter()
+                    .map(|t| t.mcp_spec())
+                    .collect()
+            },
         })
     }
 
@@ -869,13 +879,17 @@ impl Server {
         let worker = tokio::spawn(run_backend(BackendTurn {
             previous_process: self.closing.remove(&id),
             config: self.config.backend.clone(),
-            plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
-                (
-                    config,
-                    record.settings.disabled_plugin_ids.clone(),
-                    record.settings.dynamic_tools.clone(),
-                )
-            }),
+            plugins: if record.prediction_mode {
+                None
+            } else {
+                crate::plugin_runtime::configured(record.settings.cwd.clone()).map(|config| {
+                    (
+                        config,
+                        record.settings.disabled_plugin_ids.clone(),
+                        record.settings.dynamic_tools.clone(),
+                    )
+                })
+            },
             options: turn.options,
             warm: turn.warm,
             park: turn.launch_key.is_some(),
@@ -1236,6 +1250,7 @@ impl Server {
         let experimental_fields: &[&str] = match method {
             "thread/start" => &["historyMode", "projectId"],
             "thread/list" => &["projectId"],
+            "thread/fork" => &["experimentalPredictionMode"],
             _ => &[],
         };
         if !self.connections[&client].experimental
@@ -1527,6 +1542,11 @@ impl Server {
                 record.touch();
                 let mut result =
                     record.response(!p["excludeTurns"].as_bool().unwrap_or(false), true);
+                // The router uses this capability for desktop prediction
+                // compatibility; direct facade replies keep the native provider.
+                if !self.acp() {
+                    result["claudexPredictionFork"] = json!(true);
+                }
                 if let Some(options) = p.get("initialTurnsPage").filter(|value| !value.is_null()) {
                     let mut options = options.clone();
                     options["threadId"] = json!(id);
@@ -1574,6 +1594,7 @@ impl Server {
                         "sandboxPolicy",
                         "ephemeral",
                         "excludeTurns",
+                        "experimentalPredictionMode",
                         "threadSource",
                         "beforeTurnId",
                         "lastTurnId",
@@ -1584,6 +1605,20 @@ impl Server {
                     ],
                 )?;
                 let source_id = required_str(p, "threadId")?;
+                let prediction_mode = p["experimentalPredictionMode"] == true;
+                if prediction_mode {
+                    if self.acp() {
+                        return Err(RpcError::invalid(
+                            "Prediction forks require the native Claude backend",
+                        ));
+                    }
+                    if !self.loaded.contains(source_id) {
+                        return Err(RpcError::invalid(
+                            "Resume the parent thread before requesting a prediction fork",
+                        ));
+                    }
+                    self.idle(source_id)?;
+                }
                 // ACP forks copy the whole live session. Claude can instead
                 // snapshot a completed prefix while the parent keeps working.
                 if self.acp() {
@@ -1635,6 +1670,7 @@ impl Server {
                     p,
                     &self.connections[&client].originator,
                 );
+                record.prediction_mode = prediction_mode;
                 record.thread["forkedFromId"] = json!(source_id);
                 record.thread["sessionId"] = source.thread["sessionId"].clone();
                 record.thread["preview"] = source.thread["preview"].clone();
@@ -3062,6 +3098,11 @@ impl Server {
         }
         if crate::subagents::is_child(&record) {
             return Err(subagent_read_only());
+        }
+        if record.prediction_mode && record.has_session {
+            return Err(RpcError::invalid(
+                "Prediction forks support one turn; create a new prediction fork",
+            ));
         }
         let compaction = matches!(request, TurnRequest::Compaction);
         if compaction {

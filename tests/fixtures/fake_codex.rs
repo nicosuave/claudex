@@ -216,6 +216,7 @@ fn main() {
     let mut unsubscribed: Vec<String> = vec![];
     let mut requests: Vec<String> = vec![];
     let mut app_params: Vec<Value> = vec![];
+    let mut thread_configs = HashMap::<String, Value>::new();
     let mut sections = vec![json!({"id": PINNED_SECTION, "name": "Pinned", "appearance": null})];
     // Section id -> member thread ids in position order.
     let mut members = HashMap::<String, Vec<String>>::new();
@@ -277,6 +278,7 @@ fn main() {
                 let model = p["model"].as_str().unwrap_or("gpt-fake");
                 let created = 2_000_000_000 + serial as i64;
                 let started = thread(&id, created, model, 0);
+                thread_configs.insert(id.clone(), p["config"].clone());
                 effective.insert(id.clone(), settings(p));
                 if p["config"]["mcp_servers.claudex_agents"].is_object() {
                     mcps.insert(
@@ -591,9 +593,9 @@ fn main() {
                 let next = (end < listed.len()).then(|| format!("fake:{end}"));
                 Ok(json!({"data": page, "nextCursor": next, "backwardsCursor": "fake-backwards"}))
             }
-            "fake/state" => {
-                Ok(json!({"unsubscribed": unsubscribed, "requests": requests, "apps": app_params}))
-            }
+            "fake/state" => Ok(
+                json!({"unsubscribed": unsubscribed, "requests": requests, "apps": app_params, "threadConfigs":thread_configs}),
+            ),
             _ => Err("unsupported"),
         };
         emit(match result {

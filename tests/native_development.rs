@@ -44,6 +44,7 @@ async fn native_workspace_tls_cache_and_local_server() {
         effort: Some("low".into()),
         output_schema: None,
         ephemeral: true,
+        prediction_mode: false,
         dynamic_tools: vec![],
         native_settings: json!({"sandbox":{
             "allowUnsandboxedCommands":false,

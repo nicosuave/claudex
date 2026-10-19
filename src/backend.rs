@@ -80,6 +80,7 @@ pub struct SessionOptions {
     pub effort: Option<String>,
     pub output_schema: Option<Value>,
     pub ephemeral: bool,
+    pub prediction_mode: bool,
     pub dynamic_tools: Vec<Value>,
     pub native_settings: Value,
     pub sandbox: crate::sandbox::Policy,
@@ -215,6 +216,17 @@ fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<Pr
     if options.ephemeral {
         cmd.arg("--no-session-persistence");
     }
+    if options.prediction_mode {
+        if !options.dynamic_tools.is_empty() {
+            bail!("Prediction forks cannot register desktop tools");
+        }
+        cmd.args([
+            "--tools=",
+            "--strict-mcp-config",
+            "--mcp-config={\"mcpServers\":{}}",
+            "--disable-slash-commands",
+        ]);
+    }
     if !options.dynamic_tools.is_empty() {
         cmd.arg("--mcp-config").arg(
             json!({"mcpServers":{"codex_desktop":{"type":"sdk","name":"codex_desktop"}}})
@@ -251,6 +263,13 @@ fn launch_settings(
     let mut overlays = Vec::new();
     let mut input = config.extra_args.iter();
     while let Some(arg) = input.next() {
+        if options.prediction_mode
+            && ["--tools", "--mcp-config"]
+                .iter()
+                .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        {
+            bail!("{arg} conflicts with tool-free prediction forks");
+        }
         if options.sandbox.is_workspace() {
             if arg == "--setting-sources" {
                 sources = input
@@ -371,6 +390,11 @@ fn launch_settings(
         .context("native Claude settings must be an object")?;
     supplied |= !native.is_empty();
     merge_settings(&mut settings, options.native_settings.clone());
+    if options.prediction_mode {
+        settings["disableAllHooks"] = json!(true);
+        settings["autoMemoryEnabled"] = json!(false);
+        supplied = true;
+    }
     if options.sandbox.is_workspace() {
         options
             .sandbox
@@ -1067,6 +1091,7 @@ mod tests {
             effort: None,
             output_schema: None,
             ephemeral: true,
+            prediction_mode: false,
             dynamic_tools: Vec::new(),
             native_settings: json!({}),
             sandbox: Default::default(),

@@ -257,7 +257,7 @@ fn quiet(event: &BackendEvent) -> bool {
 /// Launch settings a later turn must match to reuse the process. None when the
 /// launch is turn-specific.
 pub fn launch_key(options: &SessionOptions) -> Option<Value> {
-    if options.output_schema.is_some() {
+    if options.prediction_mode || options.output_schema.is_some() {
         return None;
     }
     Some(json!({
