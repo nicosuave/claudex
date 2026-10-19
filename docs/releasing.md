@@ -20,7 +20,7 @@ signing certificates and notarization credentials stay in the local Keychain.
 
 The `release` workflow builds Linux ARM64 and x86-64 archives, smoke-tests the
 executables, verifies checksums, and creates the GitHub release. Production
-release builds do not restore or publish compiler caches.
+release CI builds do not restore or publish compiler caches.
 
 ## macOS signing and publication
 
@@ -35,10 +35,11 @@ scripts/release_macos_local.sh 0.1.0
 The script requires the local and remote tag to match HEAD and a clean checkout.
 It uses the existing Developer ID Application identity and the
 `sidequery-notarization` Keychain profile, or the `CODESIGN_IDENTITY` and
-`NOTARY_PROFILE` overrides. It builds without compiler wrappers, remaps local
-source paths out of compiler output, signs both architectures, requires accepted
-Apple notarization, and uploads archives with SHA-256 files. Standalone command
-line binaries cannot be stapled; the notarization ticket is served by Apple.
+`NOTARY_PROFILE` overrides. It uses Boxington for local builds when available
+(otherwise uncached Cargo), remaps local source paths out of compiler output,
+signs both architectures, requires accepted Apple notarization, and uploads
+archives with SHA-256 files. Standalone command line binaries cannot be stapled;
+the notarization ticket is served by Apple.
 
 Archives contain `claudex`, `LICENSE`, `NOTICE`, and the vendored protocol license.
 The Cargo binary target retains the name `claude-codex-server`; release archives

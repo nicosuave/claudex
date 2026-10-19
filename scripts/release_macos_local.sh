@@ -34,10 +34,16 @@ fi
 [[ -n "$identity" ]] || { echo "No Developer ID Application signing identity found" >&2; exit 1; }
 xcrun notarytool history --keychain-profile "$profile" --output-format json >/dev/null
 
-# Production builds bypass Boxington and any compiler wrapper deliberately.
-# rustup selects a matching cargo/rustc pair with both macOS targets installed.
+# Local builds use Boxington when installed; production CI remains uncached.
+# Put rustup's matching Cargo/rustc pair first, including for the mbx cargo shim.
 cargo=$(rustup which cargo)
 rustc=$(rustup which rustc)
+builder=("$cargo")
+if command -v mbx >/dev/null 2>&1; then
+  builder=("$(command -v mbx)")
+else
+  echo "Boxington unavailable; using uncached Cargo for local release builds" >&2
+fi
 mkdir -p "$artifacts"
 
 build_macos() {
@@ -45,11 +51,10 @@ build_macos() {
   local binary="$root/target/$target/release/claude-codex-server"
   local archive="$artifacts/claudex-${version}-macos-${arch}-notarization.zip"
   local result="$artifacts/notarization-${arch}.json"
-  env RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= \
-    RUSTC="$rustc" RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
+  env PATH="$(dirname "$cargo"):$PATH" RUSTC="$rustc" \
     CARGO_TARGET_DIR="$root/target" \
     CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$root=claudex"$'\x1f'"--remap-path-prefix=$HOME/.cargo=cargo"$'\x1f'"--remap-path-prefix=$HOME/.rustup=rustup" \
-    "$cargo" build --locked --release --target "$target" --bin claude-codex-server
+    "${builder[@]}" build --locked --release --target "$target" --bin claude-codex-server
   codesign --force --options runtime --timestamp --sign "$identity" \
     --identifier com.nicosuave.claudex "$binary"
   codesign --verify --strict "$binary"
