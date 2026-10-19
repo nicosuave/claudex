@@ -191,6 +191,8 @@ pub struct Router {
     fresh: HashMap<String, FreshThread>,
     initialize_params: Option<Value>,
     claude_loaded: HashSet<String>,
+    /// Actual providers behind the desktop prediction compatibility alias.
+    prediction_providers: HashMap<String, String>,
     /// Claude turns the desktop saw start and not yet finish, by thread. The
     /// desktop's connection outlives a facade restart, so if the facade goes
     /// away first, only the router can end them.
@@ -671,6 +673,7 @@ impl Router {
             fresh: HashMap::new(),
             initialize_params: None,
             claude_loaded: HashSet::new(),
+            prediction_providers: HashMap::new(),
             claude_turns: HashMap::new(),
             claude_requests: HashMap::new(),
             forwarded: HashMap::new(),
@@ -742,6 +745,16 @@ impl Router {
                 ));
             }
             return;
+        }
+        if side == Side::Claude
+            && message["params"]["modelProvider"] == "openai"
+            && let Some(provider) = message["params"]["threadId"]
+                .as_str()
+                .and_then(|thread| self.prediction_providers.get(thread))
+        {
+            // The desktop can echo the resume response's compatibility alias.
+            // Resolve it only after thread ownership has selected Claude.
+            message["params"]["modelProvider"] = json!(provider);
         }
         if side == Side::Claude
             && matches!(
@@ -1159,6 +1172,7 @@ impl Router {
         self.threads.remove(thread);
         self.fresh.remove(thread);
         self.claude_loaded.remove(thread);
+        self.prediction_providers.remove(thread);
         self.claude_turns.remove(thread);
         self.agent_thread_deleted(thread);
     }
@@ -1627,6 +1641,19 @@ impl Router {
                 self.agent_notification(side,&json!({"method":"turn/started","params":{"threadId":forwarded.params["threadId"],"turn":message["result"]["turn"]}}));
             }
             self.decorate_agent_pages(&forwarded.method, &forwarded.params, &mut message);
+            if side == Side::Claude
+                && forwarded.method == "thread/resume"
+                && message["result"]["claudexPredictionFork"] == true
+                && let Some(thread) = message["result"]["thread"]["id"].as_str()
+                && let Some(provider) = message["result"]["modelProvider"].as_str()
+            {
+                self.prediction_providers
+                    .insert(thread.into(), provider.into());
+                // The unmodified desktop gates composer predictions on this
+                // top-level field. Keep the actual model, nested thread provider,
+                // persisted metadata and backend routing unchanged.
+                message["result"]["modelProvider"] = json!("openai");
+            }
         }
         if side == Side::Claude
             && let (Some(forwarded), Err(error)) = (&forwarded, &result)

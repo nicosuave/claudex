@@ -205,6 +205,9 @@ pub struct Record {
     pub session_id: String,
     pub has_session: bool,
     pub fork_from: Option<String>,
+    /// One-shot, read-only question against the parent's warm native process.
+    #[serde(default)]
+    pub prediction_mode: bool,
     #[serde(default)]
     pub backend_message_id: Option<String>,
     #[serde(default)]
@@ -273,6 +276,7 @@ impl Record {
             session_id: uuid::Uuid::new_v4().to_string(),
             has_session: false,
             fork_from: None,
+            prediction_mode: false,
             backend_message_id: None,
             turn_anchors: BTreeMap::new(),
             tracks_turn_anchors: true,

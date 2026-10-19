@@ -41,11 +41,15 @@ outside the repository. `scripts/extract-desktop-turn-fixture.mjs` evaluates the
 final expression with controlled inputs; the checked-in fixture records the
 bundle and expression SHA-256 hashes so it can be refreshed deliberately.
 
-Codex's injected `mcp_servers.node_repl`, `memories.version`, and
-`memories.dual_write` configuration describes its own runtime. Claude warns and
-uses native memory/MCP configuration. Approval and sandbox settings retain their
-native semantics; workspace tests use the desktop's actual workspace-write and
-automatic-review payload, rather than substituting full access.
+Codex's injected `mcp_servers.node_repl`, `mcp_servers.artifact_session`,
+`mcp_servers.cua_repl`, `memories.version`, and `memories.dual_write` configuration
+describes its own runtime. Claude filters these known overrides, warns, and uses
+native memory/MCP configuration. The new MCP entries include enabled launch
+definitions and disabled placeholders. Filtering them restores chat creation;
+it does not connect Claude to native CUA or viewer-bound artifact sessions.
+Genuine Codex requests retain their runtime configuration. Approval and sandbox
+settings retain their native semantics; workspace tests use the desktop's actual
+workspace-write and automatic-review payload, rather than substituting full access.
 
 ## Service lifecycle
 

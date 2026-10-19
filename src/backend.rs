@@ -94,7 +94,7 @@ pub enum BackendEvent {
 pub struct ClaudeBackend {
     stdin: SharedStdin,
     pending: Pending,
-    controls: Semaphore,
+    controls: Arc<Semaphore>,
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
     process_id: u32,
@@ -717,7 +717,7 @@ impl ClaudeBackend {
         let mut backend = Self {
             stdin,
             pending,
-            controls: Semaphore::new(8),
+            controls: Arc::new(Semaphore::new(8)),
             cancel,
             task: Some(task),
             process_id,
@@ -764,6 +764,16 @@ impl ClaudeBackend {
 
     pub fn initialization(&self) -> &Value {
         &self.initialization
+    }
+
+    fn prediction_client(&self) -> PredictionClient {
+        PredictionClient {
+            stdin: self.stdin.clone(),
+            pending: self.pending.clone(),
+            controls: self.controls.clone(),
+            closed: self.cancel.clone(),
+            cached: Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
     /// Wait, at most `deadline`, until no MCP server is still connecting. Claude
@@ -908,6 +918,79 @@ impl Drop for PendingGuard {
     }
 }
 
+/// Read-only questions share the live parent's native request prefix. Dropping
+/// this handle never shuts down or interrupts the parent process.
+#[derive(Clone)]
+pub(crate) struct PredictionClient {
+    stdin: SharedStdin,
+    pending: Pending,
+    controls: Arc<Semaphore>,
+    closed: CancellationToken,
+    cached: Arc<tokio::sync::Mutex<Option<(String, Value)>>>,
+}
+
+impl PredictionClient {
+    pub async fn ask(&self, question: &str, cancel: &CancellationToken) -> Result<Value> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request = async {
+            // One entry per parked parent also coalesces identical requests.
+            let mut cached = self.cached.lock().await;
+            if let Some((previous, response)) = cached.as_ref()
+                && previous == question
+            {
+                return Ok(response.clone());
+            }
+            let _permit = self.controls.acquire().await?;
+            let (sender, receiver) = oneshot::channel();
+            self.pending
+                .lock()
+                .unwrap()
+                .insert(request_id.clone(), sender);
+            let _cleanup = PendingGuard {
+                pending: self.pending.clone(),
+                id: request_id.clone(),
+            };
+            write_frame(
+                &self.stdin,
+                &json!({
+                    "type":"control_request", "request_id":request_id,
+                    "request":{"subtype":"side_question","question":question,"history":[]}
+                }),
+            )
+            .await?;
+            let response = receiver
+                .await
+                .context("Claude prediction channel closed")?
+                .map_err(|error| anyhow!(error))?;
+            *cached = Some((question.to_owned(), response.clone()));
+            Ok(response)
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow!("Prediction cancelled")),
+            _ = self.closed.cancelled() => Err(anyhow!("Claude parent closed")),
+            result = tokio::time::timeout(Duration::from_secs(10), request) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!("Claude prediction timed out")),
+                }
+            }
+        };
+        if result.is_err() {
+            // Cancel only this read-only question, never the parent's turn.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(250),
+                write_frame(
+                    &self.stdin,
+                    &json!({"type":"control_cancel_request","request_id":request_id}),
+                ),
+            )
+            .await;
+        }
+        result
+    }
+}
+
 /// One turn's agent process. Both variants accept and emit Claude stream-json
 /// control frames, so the server drives either through the same contract.
 pub enum Backend {
@@ -916,6 +999,13 @@ pub enum Backend {
 }
 
 impl Backend {
+    pub(crate) fn prediction_client(&self) -> Option<PredictionClient> {
+        match self {
+            Self::Claude(backend) => Some(backend.prediction_client()),
+            Self::Acp(_) => None,
+        }
+    }
+
     pub async fn spawn(
         config: &BackendConfig,
         options: &SessionOptions,

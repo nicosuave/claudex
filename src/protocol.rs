@@ -200,6 +200,9 @@ impl Schemas {
         static INSTANCE: OnceLock<Schemas> = OnceLock::new();
         INSTANCE.get_or_init(|| {
             let mut root: Value = serde_json::from_str(SCHEMA).expect("vendored protocol schema");
+            // Desktop's prediction fork is newer than the baseline schema.
+            root["definitions"]["v2"]["ThreadForkParams"]["properties"]
+                ["experimentalPredictionMode"] = json!({"type": "boolean"});
             let mut schema = root["definitions"]["ClientRequest"].clone();
             schema["oneOf"].as_array_mut().unwrap().retain(|request| {
                 request["properties"]["method"]["enum"][0]

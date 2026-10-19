@@ -644,6 +644,102 @@ async fn native_shared_delegation() {
 }
 
 #[tokio::test]
+async fn desktop_prediction_requests_keep_the_claude_provider_and_route_the_temporary_fork() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"fake-claude","sandbox":"danger-full-access"}))
+        .await;
+    assert!(
+        desktop
+            .turn(&parent, "fake-claude", "parent context")
+            .await
+            .get("error")
+            .is_none()
+    );
+    let completed = desktop.completed(&parent).await;
+    let resumed = desktop
+        .ok(
+            "thread/resume",
+            json!({"threadId":parent,"excludeTurns":true}),
+        )
+        .await;
+    assert_eq!(resumed["modelProvider"], "openai");
+    assert_eq!(resumed["thread"]["modelProvider"], "anthropic");
+    assert_eq!(resumed["claudexPredictionFork"], true);
+    // A renderer may reuse the top-level compatibility provider on later resume.
+    let echoed = desktop
+        .ok(
+            "thread/resume",
+            json!({"threadId":parent,"modelProvider":resumed["modelProvider"],"excludeTurns":true}),
+        )
+        .await;
+    assert_eq!(echoed["thread"]["modelProvider"], "anthropic");
+    let fork = desktop
+        .ok(
+            "thread/fork",
+            json!({
+                "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,
+                "excludeTurns":true,"threadSource":"composer_predictions"
+            }),
+        )
+        .await;
+    let prediction = fork["thread"]["id"].as_str().unwrap();
+    // The desktop supplies no model override on this special fork's turn.
+    desktop
+        .ok(
+            "turn/start",
+            json!({
+                "threadId":prediction,"turnTrigger":"composer_predictions",
+                "responsesapiClientMetadata":{
+                    "prediction_source_thread_id":parent,
+                    "prediction_source_turn_id":completed["params"]["turn"]["id"],
+                    "prediction_trigger":"live"
+                },
+                "clientUserMessageId":uuid::Uuid::new_v4().to_string(),
+                "input":[{"type":"text","text":"fork-info","text_elements":[]}],
+                "effort":"low","outputSchema":null
+            }),
+        )
+        .await;
+    let result = desktop.completed(prediction).await;
+    assert_eq!(result["params"]["turn"]["status"], "completed");
+    let text = result["params"]["turn"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "agentMessage")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(
+        payload["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("prediction 1 prompt 1")
+    );
+    let retained = desktop
+        .ok(
+            "thread/read",
+            json!({"threadId":parent,"includeTurns":true}),
+        )
+        .await;
+    assert_eq!(retained["thread"]["modelProvider"], "anthropic");
+    assert_eq!(retained["thread"]["turns"].as_array().unwrap().len(), 1);
+    desktop
+        .ok("thread/unsubscribe", json!({"threadId":prediction}))
+        .await;
+    assert!(
+        desktop
+            .call("thread/read", json!({"threadId":prediction}))
+            .await
+            .get("error")
+            .is_some()
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires native Codex/Claude authentication; makes model calls"]
 async fn native_side_chat_preserves_parent_snapshot_and_followup_recall() {
     let codex = std::env::var("CLAUDEX_NATIVE_CODEX").expect("genuine Codex executable");
@@ -1057,14 +1153,26 @@ async fn one_picker_and_one_sidebar_span_codex_and_claude() {
     assert_eq!(defaults.len(), 1);
     assert_eq!(defaults[0]["id"], "gpt-fake");
 
-    let codex = desktop.thread(json!({"model": "gpt-fake"})).await;
+    let desktop_mcp = json!({
+        "mcp_servers.artifact_session":{"command":"/desktop/node_repl", "enabled":true},
+        "mcp_servers.cua_repl":{"command":"/desktop/node", "enabled":true}
+    });
+    let codex = desktop
+        .thread(json!({"model": "gpt-fake", "config":desktop_mcp}))
+        .await;
     let reply = desktop.turn(&codex, "gpt-fake", "hello codex").await;
     assert!(reply.get("error").is_none(), "{reply}");
     desktop.completed(&codex).await;
+    let state = desktop.ok("fake/state", json!({})).await;
+    for (key, value) in desktop_mcp.as_object().unwrap() {
+        assert_eq!(state["threadConfigs"][&codex][key], *value);
+    }
 
     let claude = desktop
         .thread(json!({"model": "opus", "config": {
             "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+            "mcp_servers.artifact_session":{"command":"/desktop/node_repl", "env":{"NODE_REPL_TRUSTED_SERVICES":"{\"artifact_session\":\"@oai/artifact-tool/artifact-session/service\"}"}},
+            "mcp_servers.cua_repl":{"command":"/desktop/node", "args":["/desktop/@oai/cua-repl/bin/cua-repl.mjs"], "enabled":true},
             "memories.dual_write":true, "memories.version":"v2"
         }}))
         .await;
@@ -1120,6 +1228,8 @@ async fn a_prewarmed_codex_thread_moves_to_claude_on_its_first_claude_turn() {
         .thread(
             json!({"cwd": "/tmp", "sandbox": "danger-full-access", "config": {
                 "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+                "mcp_servers.artifact_session":{"command":"", "enabled":false},
+                "mcp_servers.cua_repl":{"command":"/desktop/electron", "enabled":false},
                 "memories.dual_write":true, "memories.version":"v2"
             }}),
         )
@@ -1552,6 +1662,8 @@ async fn current_desktop_projectless_task_submits_first_and_followup_messages() 
         "permissions":":workspace", "approvalPolicy":"on-request","approvalsReviewer":"auto_review",
         "historyMode":"paginated","threadSource":"user","dynamicTools":[],"runtimeWorkspaceRoots":[cwd.path()],
         "config":{"mcp_servers.node_repl":{"command":"node","args":["desktop-repl.js"]},
+            "mcp_servers.artifact_session":{"command":"", "enabled":false},
+            "mcp_servers.cua_repl":{"command":"/desktop/electron", "enabled":false},
             "memories.version":"v2","memories.dual_write":true,"features.request_permissions_tool":true}})).await;
     // main's project-assignment write must complete before the desktop sends
     // the first message, including projectless tasks (empty projectId).

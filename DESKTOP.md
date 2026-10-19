@@ -98,6 +98,10 @@ Codex chats continue to work. Set `CLAUDE_CODEX_ROUTER_CODEX` to use a different
 genuine Codex executable. See [the desktop router contract](docs/router-desktop-flow.md)
 for creation, metadata, model-selection and reconnection behavior.
 
+Prompt-bar predictions run through the local router and native Claude prediction
+forks. See [prompt predictions](docs/prompt-predictions.md) for the compatibility
+contract and verification. No desktop app patch is needed.
+
 ### Connect from another computer
 
 On the remote Mac, run `claudex install`, then reconnect that Mac's

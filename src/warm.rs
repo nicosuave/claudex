@@ -82,6 +82,7 @@ pub struct Parked {
     pub key: Value,
     pub session_id: String,
     pub parked_at: Instant,
+    pub(crate) prediction: Option<crate::backend::PredictionClient>,
     running: Arc<AtomicUsize>,
     woke: Arc<AtomicBool>,
     reclaim: CancellationToken,
@@ -105,6 +106,7 @@ impl Parked {
         let reclaim = CancellationToken::new();
         let running = Arc::new(AtomicUsize::new(session.background.len()));
         let woke = Arc::new(AtomicBool::new(false));
+        let prediction = session.backend.prediction_client();
         Self {
             watcher: tokio::spawn(watch(
                 session,
@@ -120,6 +122,7 @@ impl Parked {
             key,
             session_id,
             parked_at: Instant::now(),
+            prediction,
             reclaim,
         }
     }

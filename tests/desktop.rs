@@ -50,13 +50,21 @@ fn incompatible_shell_restrictions_are_not_silently_discarded() {
 
 #[test]
 fn codex_desktop_runtime_overrides_do_not_block_claude_requests() {
-    for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
+    for method in [
+        "thread/start",
+        "thread/resume",
+        "thread/fork",
+        "thread/settings/update",
+        "turn/start",
+    ] {
         let (params, warnings) = normalize(
             method,
             &json!({
                 "approvalPolicy":"on-request", "sandbox":"workspace-write",
                 "config":{
                     "mcp_servers.node_repl":{"command":"node", "args":["desktop-repl.js"]},
+                    "mcp_servers.artifact_session":{"command":"/desktop/node_repl", "env":{"NODE_REPL_TRUSTED_SERVICES":"{\"artifact_session\":\"@oai/artifact-tool/artifact-session/service\"}"}},
+                    "mcp_servers.cua_repl":{"command":"/desktop/node", "args":["/desktop/@oai/cua-repl/bin/cua-repl.mjs"], "enabled":true},
                     "memories.dual_write":true, "memories.version":"v2",
                     "model_reasoning_effort":"high"
                 }
@@ -67,11 +75,18 @@ fn codex_desktop_runtime_overrides_do_not_block_claude_requests() {
         assert_eq!(params["effort"], "high");
         assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandbox"], "workspace-write");
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Node REPL overrides are not applied"))
-        );
+        assert!(warnings.iter().any(|w| w.contains(
+            "desktop MCP overrides (node_repl, artifact_session, cua_repl) are not applied"
+        )));
+        let (disabled, _) = normalize(
+            method,
+            &json!({"config":{
+                "mcp_servers.artifact_session":{"command":"", "enabled":false},
+                "mcp_servers.cua_repl":{"command":"/desktop/electron", "enabled":false}
+            }}),
+        )
+        .unwrap();
+        assert!(disabled.get("config").is_none());
     }
     // Keep rejecting unrelated settings instead of dropping arbitrary MCP or
     // memory configuration merely because the desktop supplies some of it.
