@@ -2,6 +2,57 @@
 
 This document describes implemented behavior, not full protocol equivalence or a guarantee about future Codex/Claude releases. The wire schema is `protocol/codex-0.160.0.json`.
 
+## Feature support matrix
+
+Status: **Supported** works through the Codex protocol; **Partial** works with the stated gap; **Claude-native** is provided by Claude's own runtime rather than the Codex feature; **Unsupported** is rejected or absent. Details are in the sections below.
+
+| Area | Feature | Status | Notes |
+| --- | --- | --- | --- |
+| Conversation | Start, resume, list, archive, rename | Supported | Facade-owned records plus native Claude transcripts |
+| Conversation | Fork, revert, rollback | Supported | Exact native transcript prefix; files and external effects are not undone |
+| Conversation | Steer, queue, interrupt | Supported | One active turn per thread |
+| Conversation | Ephemeral threads | Partial | One turn only; cannot be forked |
+| Conversation | Model and effort selection | Supported | Claude CLI catalog; `low` through `max` |
+| Conversation | Context usage, compaction | Supported | Usage from latest top-level request; compaction is Claude's |
+| Conversation | Reasoning summaries | Partial | Exposed thinking only; `concise`/`detailed` lengths not enforced |
+| Conversation | Structured output (`outputSchema`) | Supported | Final assistant message containing JSON |
+| Conversation | Collaboration modes, plan mode | Unsupported | Default mode only |
+| Conversation | Review mode | Unsupported | |
+| Subagents | Claude subagents (`Agent` tool) | Claude-native | Run inside the turn; output folded into the parent tool result. No Codex child threads, so the desktop agent tree stays empty |
+| Subagents | Background agents and workflows | Claude-native | Turn stays open until Claude reports idle |
+| Subagents | Codex multi-agent (child thread spawn) | Unsupported | `subAgentThreadSpawn` lists return no threads |
+| Subagents | Guardian/auto approval reviewer | Partial | Mapped to Claude native auto review, not a Codex reviewer |
+| Tools | Shell | Supported | `Bash` → `commandExecution`; output arrives with the result, not streamed |
+| Tools | File edits | Partial | `Write`/`Edit`/`MultiEdit` → `fileChange` with best-effort diffs; edits made via shell commands produce no file-change item |
+| Tools | `apply_patch` | Claude-native | Claude edit tools instead |
+| Tools | Web search and fetch | Claude-native | Claude `WebSearch`/`WebFetch` as `dynamicToolCall`; no `webSearch` item |
+| Tools | Image viewing | Claude-native | Claude `Read` on image files; no image-view item |
+| Tools | Image generation | Partial | Only through an installed Codex plugin |
+| Tools | Plan/todo updates | Supported | `TodoWrite` → `turn/plan/updated` |
+| Tools | User questions | Supported | Single-select → `requestUserInput`; multi-select → desktop option picker |
+| Tools | Other Claude tools | Partial | `dynamicToolCall` in namespace `claude`; generic approval via question fallback |
+| Tools | Desktop dynamic tools | Supported | Reverse `item/tool/call` through the turn owner |
+| Tools | Multimodal tool results | Partial | Rendered as text; native MCP result metadata dropped |
+| MCP | Claude-configured MCP servers | Claude-native | Shown as `mcpToolCall`; outside the Bash sandbox |
+| MCP | Codex plugin MCP/app tools | Supported | Executed by genuine Codex; metadata preserved |
+| MCP | Interactive elicitation | Unsupported | Authenticate in Codex settings |
+| Plugins, skills, hooks | Codex plugin administration | Supported | Forwarded to genuine Codex when configured |
+| Plugins, skills, hooks | Codex plugin skills | Supported | Listed with real `SKILL.md` paths |
+| Plugins, skills, hooks | Standalone skills, Claude plugins | Claude-native | Loaded by Claude; skill input items unsupported |
+| Plugins, skills, hooks | Codex hooks | Partial | Manageable; not executed around Claude turns. Claude hooks run normally |
+| Permissions | Workspace-write, full access | Supported | Claude OS-enforced Bash sandbox and scoped file permissions |
+| Permissions | Read-only, external sandbox | Unsupported | |
+| Permissions | Command/file approvals, session grants | Supported | Session grants match exact tool input and cwd |
+| Permissions | `never` approval policy | Partial | Maps to `dontAsk`: denies, does not bypass |
+| Input | Text, images | Supported | Data/HTTP(S) URLs, local PNG/JPEG/GIF/WebP |
+| Input | Audio, video, file IDs, mentions, skill items | Unsupported | |
+| Desktop host | Filesystem, `command/exec`, `process/*` | Supported | Privileged; trusted local clients only |
+| Desktop host | Attachments, worktrees | Partial | Metadata stored; desktop Git worker owns checkouts; UI orchestration unverified |
+| Desktop host | SSH reconnect | Supported | Live turn survives; facade restart interrupts it |
+| Account | Login, quotas, account management | Unsupported | Claude's own authentication |
+| Other | Realtime voice, remote control, cloud tasks, transcript import | Unsupported | |
+| Platform | macOS / Windows | Supported / Unsupported | |
+
 ## Client methods
 
 Accepted requests are validated against the pinned schema before execution, with supplemental schemas for legacy `getAuthStatus` and `thread/rollback` RPCs omitted from the export. Fields below are the supported non-null fields; unsupported non-null fields fail. Values must also satisfy the upstream schema.

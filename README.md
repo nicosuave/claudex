@@ -4,7 +4,7 @@ A Rust facade that exposes the Codex app-server thread/turn protocol over Claude
 
 The implementation targets the generated **Codex CLI 0.160.0** schema. The Claude transport was developed against **Claude Code 2.1.288** and the official Claude Agent SDK's subprocess/control implementation. No Node or Python bridge is required.
 
-This is a working core implementation, **not complete Codex feature parity**. Unsupported methods return `-32601`; unsupported non-null options return `-32602`. See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact surface and behavioral differences.
+This is a working core implementation, **not complete Codex feature parity**. Unsupported methods return `-32601`; unsupported non-null options return `-32602`. See the [feature support matrix](COMPATIBILITY.md#feature-support-matrix) for a summary and [COMPATIBILITY.md](COMPATIBILITY.md) for the exact surface and behavioral differences.
 
 ## macOS desktop installation
 
