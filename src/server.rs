@@ -1291,7 +1291,12 @@ impl Server {
         p: &Value,
         adopted_id: Option<(&str, &Value)>,
     ) -> RpcResult<Option<Value>> {
-        let (mut params, warnings) = crate::desktop::normalize(method, p)?;
+        let (mut params, warnings) = crate::desktop::normalize(method, p).inspect_err(|error| {
+            eprintln!(
+                "Rejected desktop {method} for thread {}: {}",
+                p["threadId"], error.message
+            )
+        })?;
         // Named workspace presets use the host defaults. Never override an
         // explicit sandboxPolicy, including an explicit networkAccess=false.
         if matches!(

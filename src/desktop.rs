@@ -122,6 +122,7 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
             object.insert("environmentOverrides".into(), json!(overrides));
         }
         let mut unsupported = Vec::new();
+        let mut ignored = Vec::new();
         let mut native_features = false;
         for (key, value) in config {
             if value.is_null() {
@@ -158,7 +159,20 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
                         warnings.push("Codex tool allowlists do not configure Claude MCP servers. Desktop tools supplied in dynamicTools are bridged separately; Claude's native tools and configured MCP servers remain available.".into());
                     }
                 }
-                _ => unsupported.push(key.as_str()),
+                // Config-layer overrides of model identity, sandboxing or
+                // approvals would silently diverge from the request's typed
+                // fields, so they still fail.
+                key if is_execution_policy_key(key) => unsupported.push(key),
+                // Desktop releases add Codex-only config keys without notice.
+                // Rejecting them breaks resuming existing chats, so report
+                // them instead.
+                _ => {
+                    eprintln!(
+                        "Ignoring desktop {method} config {key}={}",
+                        loggable_config_value(key, value)
+                    );
+                    ignored.push(key.as_str());
+                }
             }
         }
         if !unsupported.is_empty() {
@@ -166,6 +180,12 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
                 "Unsupported Claude configuration: {}",
                 unsupported.join(", ")
             )));
+        }
+        if !ignored.is_empty() {
+            warnings.push(format!(
+                "Codex configuration not applied to Claude: {}",
+                ignored.join(", ")
+            ));
         }
         if native_features {
             warnings.push("Claude uses its native runtime, memory and tools; Codex runtime feature, memory and desktop MCP overrides (node_repl, artifact_session, cua_repl) are not applied. Existing desktop tool forwarding is separate.".into());
@@ -191,4 +211,52 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
     // Deprecated and ignored by the pinned Codex protocol as well.
     object.remove("multiAgentMode");
     Ok((p, warnings))
+}
+
+fn is_execution_policy_key(key: &str) -> bool {
+    [
+        "model",
+        "model_provider",
+        "model_providers",
+        "sandbox_mode",
+        "sandbox_workspace_write",
+        "approval_policy",
+        "approvals_reviewer",
+    ]
+    .iter()
+    .any(|policy| {
+        key.strip_prefix(policy)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
+/// Enough of an ignored config value to support it later without copying
+/// credentials into the server log: objects list their field names only.
+fn loggable_config_value(key: &str, value: &Value) -> String {
+    const SENSITIVE: [&str; 7] = [
+        "auth", "env", "header", "key", "password", "secret", "token",
+    ];
+    const MAX_LEN: usize = 300;
+    let lowered = key.to_ascii_lowercase();
+    if SENSITIVE.iter().any(|word| lowered.contains(word)) {
+        return "<redacted>".into();
+    }
+    let text = match value {
+        Value::Object(fields) => format!(
+            "{{{}}}",
+            fields
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Array(items) if items.iter().any(|item| item.is_object()) => {
+            format!("[{} entries]", items.len())
+        }
+        _ => value.to_string(),
+    };
+    match text.char_indices().nth(MAX_LEN) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text,
+    }
 }
