@@ -854,8 +854,17 @@ impl Router {
         };
         match message["method"].as_str() {
             Some("thread/settings/updated") => {
+                let settings = &p["threadSettings"];
+                // Only a complete native report can confirm effective permissions.
+                // A missing/malformed report must not revive a stale snapshot.
+                if !settings["cwd"].is_string()
+                    || settings["approvalPolicy"].is_null()
+                    || !settings["approvalsReviewer"].is_string()
+                    || !settings["sandboxPolicy"].is_object()
+                {
+                    return;
+                }
                 if let Some(snapshot) = self.agents.snapshots.get_mut(thread) {
-                    let settings = &p["settings"];
                     for field in [
                         "cwd",
                         "approvalPolicy",
@@ -1488,6 +1497,30 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_settings_notification_does_not_confirm_stale_permissions() {
+        let (client, _client_rx) = mpsc::channel(32);
+        let (codex, _codex_rx) = mpsc::channel(32);
+        let mut router = Router::new(client, codex, None, true);
+        router.remember_agent_snapshot(&json!({"thread":{"id":"parent"},"cwd":"/tmp",
+            "approvalPolicy":"on-request","approvalsReviewer":"user",
+            "sandbox":{"type":"workspaceWrite"}}));
+        router.invalidate_agent_snapshot(&json!({"method":"turn/start","params":{
+            "threadId":"parent","approvalsReviewer":"auto_review"}}));
+        for settings in [Value::Null, json!({"approvalsReviewer":"auto_review"})] {
+            router.agent_notification(
+                Side::Codex,
+                &json!({"method":"thread/settings/updated",
+                "params":{"threadId":"parent","threadSettings":settings}}),
+            );
+            assert!(router.agents.stale_snapshots.contains("parent"));
+            assert_eq!(
+                router.agents.snapshots["parent"]["approvalsReviewer"],
+                "user"
+            );
+        }
+    }
 
     #[test]
     fn backend_disconnect_preserves_another_routers_running_agent() {

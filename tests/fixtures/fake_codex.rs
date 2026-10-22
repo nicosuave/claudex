@@ -187,6 +187,32 @@ fn emit(value: Value) {
     out.flush().unwrap();
 }
 
+fn update_settings(thread: &str, params: &Value, effective: &mut HashMap<String, Value>) {
+    let Some(settings) = effective.get_mut(thread) else {
+        return;
+    };
+    let previous = settings.clone();
+    for field in [
+        "cwd",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "disabledPluginIds",
+    ] {
+        if let Some(value) = params.get(field).filter(|value| !value.is_null()) {
+            settings[field] = value.clone();
+        }
+    }
+    if let Some(policy) = params.get("sandboxPolicy").filter(|value| !value.is_null()) {
+        settings["sandbox"] = policy.clone();
+    }
+    if *settings != previous {
+        let mut reported = settings.clone();
+        reported["sandboxPolicy"] = reported.as_object_mut().unwrap().remove("sandbox").unwrap();
+        emit(json!({"method":"thread/settings/updated","params":{
+            "threadId":thread,"threadSettings":reported}}));
+    }
+}
+
 fn thread(id: &str, created: i64, model: &str, turns: usize) -> Value {
     json!({"id": id, "preview": "", "modelProvider": "openai", "model": model,
         "createdAt": created, "updatedAt": created, "recencyAt": created, "turns": [],
@@ -307,6 +333,7 @@ fn main() {
                     continue;
                 }
                 let thread_id = p["threadId"].as_str().unwrap_or("");
+                update_settings(thread_id, p, &mut effective);
                 match threads.iter_mut().find(|t| t["id"] == thread_id) {
                     Some(thread) => {
                         thread["fakeTurns"] = json!(thread["fakeTurns"].as_u64().unwrap() + 1);
@@ -459,6 +486,7 @@ fn main() {
                     if let Some(model) = p.get("model") {
                         thread["model"] = model.clone();
                     }
+                    update_settings(p["threadId"].as_str().unwrap(), p, &mut effective);
                     Ok(json!({}))
                 }
                 None => Err("thread not found"),
