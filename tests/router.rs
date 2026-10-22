@@ -387,6 +387,55 @@ async fn native_mcp_delegation_works_in_both_directions_with_linked_history() {
 }
 
 #[tokio::test]
+async fn codex_parent_delegates_after_switching_to_approve_for_me() {
+    for method in ["thread/settings/update", "turn/start"] {
+        let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+        let mut desktop = Desktop::connect(&facade.socket, 0).await;
+        let parent = desktop
+            .thread(json!({"model":"gpt-fake","cwd":facade._state.path(),
+            "sandbox":"workspace-write","approvalPolicy":"on-request","approvalsReviewer":"user"}))
+            .await;
+        let actions = script(json!([
+            {"tool":"spawn_agent","arguments":{"harness":"claude","model":"opus","message":"delegated task"}},
+            {"tool":"wait_agent","arguments":{"agent_id":"$agent","timeout_ms":10_000}}
+        ]));
+        if method == "thread/settings/update" {
+            desktop
+                .ok(
+                    method,
+                    json!({"threadId":parent,"approvalsReviewer":"auto_review"}),
+                )
+                .await;
+        }
+        desktop
+            .ok(
+                "turn/start",
+                json!({"threadId":parent,"model":"gpt-fake",
+            "approvalsReviewer":"auto_review",
+            "input":[{"type":"text","text":actions,"text_elements":[]}]}),
+            )
+            .await;
+        let completed = desktop.completed(&parent).await;
+        let reports = reports(&completed);
+        assert_ne!(reports[0]["isError"], true, "{method}: {reports:?}");
+        assert_eq!(result(&reports[1])["report"], "Echo: delegated task");
+        let child = result(&reports[0])["agent_id"].clone();
+        let settings = desktop.ok("thread/resume", json!({"threadId":child})).await;
+        assert_eq!(settings["approvalsReviewer"], "auto_review");
+        assert_eq!(settings["approvalPolicy"], "on-request");
+        assert_eq!(settings["sandbox"]["type"], "workspaceWrite");
+        let state = desktop.ok("fake/state", json!({})).await;
+        assert!(
+            !state["requests"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("thread/resume")),
+            "Delegation must not resume the active Codex parent: {state}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn desktop_can_open_running_delegate_without_reconfiguring_it() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
@@ -566,9 +615,10 @@ async fn native_shared_delegation() {
         .unwrap_or_else(|| facade.as_ref().unwrap().socket.clone());
     let mut desktop =
         Desktop::connect_with_codex(&socket, 0, &codex, Duration::from_secs(120)).await;
-    for (parent_model, harness, child_model) in [
-        (gpt.as_str(), "claude", "opus"),
-        ("opus", "codex", gpt.as_str()),
+    for (parent_model, harness, child_model, reviewer) in [
+        (gpt.as_str(), "claude", "opus", "user"),
+        ("opus", "codex", gpt.as_str(), "user"),
+        ("gpt-6.1-sol", "claude", "opus", "auto_review"),
     ] {
         let parent = desktop
             .thread(json!({"model":parent_model,"cwd":scratch.path(),
@@ -577,7 +627,15 @@ async fn native_shared_delegation() {
         let prompt = format!(
             "Verify cross-harness delegation. Use the claudex_agents MCP tools, not native subagent tools or shell subprocesses. Call spawn_agent with harness={harness}, model={child_model}, name=Native verification, and message=Reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Then call wait_agent on the returned agent_id until it finishes. Finally reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
         );
-        let reply = desktop.turn(&parent, parent_model, &prompt).await;
+        // Change the review mode on the turn, as the desktop composer does.
+        let reply = desktop
+            .call(
+                "turn/start",
+                json!({"threadId":parent,"model":parent_model,
+            "approvalsReviewer":reviewer,
+            "input":[{"type":"text","text":prompt,"text_elements":[]}]}),
+            )
+            .await;
         assert!(reply.get("error").is_none(), "{reply}");
         let completed = loop {
             let message = desktop
@@ -620,6 +678,10 @@ async fn native_shared_delegation() {
             .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
             .await;
         assert_eq!(child["thread"]["parentThreadId"], parent);
+        let settings = desktop
+            .ok("thread/resume", json!({"threadId":child["thread"]["id"]}))
+            .await;
+        assert_eq!(settings["approvalsReviewer"], reviewer);
         let report = child["thread"]["turns"]
             .as_array()
             .unwrap()
