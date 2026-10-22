@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
@@ -35,6 +36,22 @@ pub enum ServiceAction {
     Uninstall,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthSession {
+    Login,
+    Isolated,
+}
+
+impl AuthSession {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
 struct SshSetup {
     block: String,
     authorized_line: String,
@@ -55,6 +72,7 @@ pub struct Installation {
     begin: String,
     end: String,
     acp: Option<AcpAgent>,
+    auth_session: Option<AuthSession>,
 }
 
 impl Installation {
@@ -98,6 +116,7 @@ impl Installation {
             label,
             home,
             acp,
+            auth_session: None,
         }
     }
 
@@ -113,7 +132,17 @@ impl Installation {
 
     /// `ssh: false` installs only the service and the local desktop router;
     /// it needs no Remote Login, key, or SSH configuration.
-    pub async fn install(&self, claude: &Path, ssh: bool) -> Result<()> {
+    pub async fn install(
+        mut self,
+        claude: &Path,
+        ssh: bool,
+        auth_session: Option<AuthSession>,
+    ) -> Result<()> {
+        self.auth_session = auth_session;
+        // Resolve before replacing metadata or the service definition. Existing
+        // installations keep the security session in which native auth works.
+        let auth_session = self.selected_auth_session()?;
+        self.auth_session = Some(auth_session);
         // The default Claude installation serves both local and incoming
         // desktop SSH connections. ACP instances keep their dedicated hosts.
         let remote = self.acp.is_none();
@@ -194,10 +223,21 @@ impl Installation {
         };
         // Record ownership before copying the executable so an interrupted
         // first install can be retried safely. Ownership checks ran above.
-        let metadata = json!({"application":"claude-codex-server","version":env!("CARGO_PKG_VERSION"),
+        let previous_metadata = read_optional(&self.root.join("installation.json"))?;
+        let previous_metadata: Value = if previous_metadata.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&previous_metadata)?
+        };
+        let mut metadata = json!({"application":"claude-codex-server","version":env!("CARGO_PKG_VERSION"),
             "claude":claude,"codex":codex,"desktopCodex":desktop_codex,"ssh":ssh,"remote":remote,"remoteProfile":remote_profile,
             "acp":self.acp.as_ref().map(|acp| json!({"agent":agent,"args":acp.args,
                 "providerId":acp.provider_id,"providerName":acp.provider_name}))});
+        // Bootstrap can restore the previous plist on failure. Keep its saved
+        // choice until the replacement definition has been bootstrapped.
+        if let Some(previous) = previous_metadata.get("authSession") {
+            metadata["authSession"] = previous.clone();
+        }
         atomic_write(
             &self.root.join("installation.json"),
             &serde_json::to_vec_pretty(&metadata)?,
@@ -240,6 +280,7 @@ impl Installation {
             // install is explicitly an upgrade, but only after the idle check.
             self.service(ServiceAction::Restart, false).await?;
         }
+        println!("Authentication session: {}", auth_session.name());
         if ssh {
             self.check_ssh().await?;
             println!(
@@ -516,6 +557,40 @@ impl Installation {
         ))
     }
 
+    fn selected_auth_session(&self) -> Result<AuthSession> {
+        if let Some(session) = self.auth_session {
+            return Ok(session);
+        }
+        let metadata = read_optional(&self.root.join("installation.json"))?;
+        if !metadata.is_empty() {
+            let metadata: Value = serde_json::from_str(&metadata)?;
+            if let Some(session) = metadata.get("authSession") {
+                return serde_json::from_value(session.clone())
+                    .context("Invalid saved authSession; expected login or isolated");
+            }
+        }
+        if !self.plist.exists() {
+            return Ok(AuthSession::Login);
+        }
+        self.check_plist()?;
+        // Parse the value rather than matching XML text: whitespace varies,
+        // and an explicitly false SessionCreate differs from true.
+        let output = std::process::Command::new("plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&self.plist)
+            .output()
+            .context("Cannot inspect the service authentication session")?;
+        if !output.status.success() {
+            bail!("Cannot parse LaunchAgent {}", self.plist.display());
+        }
+        let plist: Value = serde_json::from_slice(&output.stdout)?;
+        match plist.get("SessionCreate") {
+            Some(Value::Bool(true)) => Ok(AuthSession::Isolated),
+            Some(Value::Bool(false)) | None => Ok(AuthSession::Login),
+            _ => bail!("LaunchAgent SessionCreate must be a boolean"),
+        }
+    }
+
     fn render_plist(&self) -> Result<String> {
         let label = xml(Path::new(&self.label))?;
         let launcher = xml(&self.root.join("bin/codex"))?;
@@ -526,6 +601,10 @@ impl Installation {
             self.home.display()
         );
         let search_path = xml(Path::new(&search_path))?;
+        let security_session = match self.selected_auth_session()? {
+            AuthSession::Login => "",
+            AuthSession::Isolated => "  <key>SessionCreate</key><true/>\n",
+        };
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -537,8 +616,7 @@ impl Installation {
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
-  <!-- Give native authentication its own security audit session rather than inheriting GUI Keychain state. -->
-  <key>SessionCreate</key><true/>
+{security_session}  <!-- Preserve the selected native authentication context across upgrades. -->
   <key>WorkingDirectory</key><string>{home}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>{search_path}</string></dict>
   <key>StandardOutPath</key><string>{log}</string>
@@ -659,6 +737,10 @@ impl Installation {
                     self.plist.exists(),
                     self.root.join("logs/server.log").display()
                 );
+                println!(
+                    "Authentication session: {}",
+                    self.selected_auth_session()?.name()
+                );
             }
             ServiceAction::Install => {
                 if !self.root.join("bin/codex").is_file() {
@@ -666,6 +748,7 @@ impl Installation {
                 }
                 private_directory(&self.root.join("logs"))?;
                 fs::create_dir_all(self.plist.parent().unwrap())?;
+                let auth_session = self.selected_auth_session()?;
                 let plist = self.render_plist()?;
                 let previous = read_optional(&self.plist)?;
                 if previous != plist {
@@ -703,7 +786,7 @@ impl Installation {
                 } else if !loaded {
                     self.bootstrap().await?;
                 }
-                self.wait_ready().await?;
+                self.finish_service_install(auth_session).await?;
                 println!("Service installed and ready.");
             }
             ServiceAction::Start => {
@@ -740,6 +823,21 @@ impl Installation {
             }
         }
         Ok(())
+    }
+
+    async fn finish_service_install(&self, auth_session: AuthSession) -> Result<()> {
+        // Bootstrap succeeded, so the new definition is retained even if its
+        // readiness check fails. Save the matching context before waiting.
+        let path = self.root.join("installation.json");
+        let metadata = read_optional(&path)?;
+        let mut metadata: Value = if metadata.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&metadata)?
+        };
+        metadata["authSession"] = json!(auth_session);
+        atomic_write(&path, &serde_json::to_vec_pretty(&metadata)?, 0o600)?;
+        self.wait_ready().await
     }
 
     async fn bootstrap(&self) -> Result<()> {
@@ -1291,6 +1389,94 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
+    fn auth_session_preserves_saved_choices_and_explicit_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut install = Installation::at_home(temp.path().to_path_buf(), None);
+        assert_eq!(install.selected_auth_session().unwrap(), AuthSession::Login);
+        fs::create_dir_all(&install.root).unwrap();
+        let metadata = install.root.join("installation.json");
+        for session in [AuthSession::Login, AuthSession::Isolated] {
+            fs::write(&metadata, json!({"authSession":session}).to_string()).unwrap();
+            // The saved choice also survives removal of the service plist.
+            assert_eq!(install.selected_auth_session().unwrap(), session);
+        }
+        install.auth_session = Some(AuthSession::Login);
+        assert_eq!(install.selected_auth_session().unwrap(), AuthSession::Login);
+        fs::write(&metadata, r#"{"authSession":"unknown"}"#).unwrap();
+        // An explicit selection can repair an invalid stored choice.
+        assert_eq!(install.selected_auth_session().unwrap(), AuthSession::Login);
+        install.auth_session = None;
+        assert!(install.selected_auth_session().is_err());
+    }
+
+    #[tokio::test]
+    async fn installed_auth_session_survives_readiness_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut install = Installation::at_home(temp.path().to_path_buf(), None);
+        fs::create_dir_all(&install.root).unwrap();
+        let metadata = install.root.join("installation.json");
+        fs::write(&metadata, r#"{"authSession":"isolated","version":"kept"}"#).unwrap();
+        // The replacement definition was accepted by launchd, but its socket
+        // never appears. A later reinstall must retain the applied choice.
+        install.auth_session = Some(AuthSession::Login);
+        fs::create_dir_all(install.plist.parent().unwrap()).unwrap();
+        fs::write(&install.plist, install.render_plist().unwrap()).unwrap();
+        let error = install
+            .finish_service_install(AuthSession::Login)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Service not ready"));
+        let metadata: Value = serde_json::from_slice(&fs::read(metadata).unwrap()).unwrap();
+        assert_eq!(metadata["authSession"], "login");
+        assert_eq!(metadata["version"], "kept");
+        let next = Installation::at_home(temp.path().to_path_buf(), None);
+        assert_eq!(next.selected_auth_session().unwrap(), AuthSession::Login);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auth_session_migrates_the_existing_owned_service_definition() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = Installation::at_home(temp.path().to_path_buf(), None);
+        fs::create_dir_all(install.plist.parent().unwrap()).unwrap();
+        let default_plist = install.render_plist().unwrap();
+        for (key, expected) in [
+            ("", AuthSession::Login),
+            ("<key>SessionCreate</key>\n  <false/>", AuthSession::Login),
+            ("<key>SessionCreate</key>\n  <true/>", AuthSession::Isolated),
+        ] {
+            let plist = default_plist.replace("</dict></plist>", &format!("{key}</dict></plist>"));
+            fs::write(&install.plist, plist).unwrap();
+            assert_eq!(install.selected_auth_session().unwrap(), expected);
+            // Re-rendering and a subsequent installer retain the migrated mode.
+            fs::write(&install.plist, install.render_plist().unwrap()).unwrap();
+            let next = Installation::at_home(temp.path().to_path_buf(), None);
+            assert_eq!(next.selected_auth_session().unwrap(), expected);
+        }
+        fs::create_dir_all(&install.root).unwrap();
+        fs::write(
+            install.root.join("installation.json"),
+            r#"{"authSession":"login"}"#,
+        )
+        .unwrap();
+        let isolated_plist = default_plist.replace(
+            "</dict></plist>",
+            "<key>SessionCreate</key><true/></dict></plist>",
+        );
+        fs::write(&install.plist, isolated_plist).unwrap();
+        assert_eq!(install.selected_auth_session().unwrap(), AuthSession::Login);
+        fs::remove_file(install.root.join("installation.json")).unwrap();
+        let invalid = default_plist.replace(
+            "</dict></plist>",
+            "<key>SessionCreate</key><string>true</string></dict></plist>",
+        );
+        fs::write(&install.plist, invalid).unwrap();
+        assert!(install.selected_auth_session().is_err());
+        fs::write(&install.plist, "unrelated service").unwrap();
+        assert!(install.selected_auth_session().is_err());
+    }
+
+    #[test]
     fn remote_shell_block_preserves_user_content_and_uninstalls_cleanly() {
         let install = Installation::at_home(PathBuf::from("/Users/example"), None);
         let original = "# Personal environment\nexport EXAMPLE=1\n";
@@ -1561,6 +1747,18 @@ mod tests {
             .arg(&plist)
             .output()
             .unwrap();
+        assert!(
+            !session.status.success(),
+            "new services use the login session"
+        );
+        let mut isolated = Installation::at_home(temp.path().to_path_buf(), None);
+        isolated.auth_session = Some(AuthSession::Isolated);
+        fs::write(&plist, isolated.render_plist().unwrap()).unwrap();
+        let session = std::process::Command::new("plutil")
+            .args(["-extract", "SessionCreate", "raw", "-o", "-"])
+            .arg(&plist)
+            .output()
+            .unwrap();
         assert!(session.status.success());
         assert_eq!(String::from_utf8(session.stdout).unwrap().trim(), "true");
         let desktop_env = temp.path().join("desktop-env.plist");
@@ -1647,7 +1845,8 @@ mod tests {
 
     #[test]
     fn acp_agents_install_as_independent_instances() {
-        let home = PathBuf::from("/Users/example");
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
         let claude = Installation::at_home(home.clone(), None);
         let agent = Installation::at_home(
             home,
@@ -1662,6 +1861,18 @@ mod tests {
         );
         assert_ne!(claude.root, agent.root);
         assert_ne!(claude.plist, agent.plist);
+        for (instance, session) in [
+            (&claude, AuthSession::Login),
+            (&agent, AuthSession::Isolated),
+        ] {
+            fs::create_dir_all(&instance.root).unwrap();
+            fs::write(
+                instance.root.join("installation.json"),
+                json!({"authSession":session}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(instance.selected_auth_session().unwrap(), session);
+        }
         assert_eq!(agent.label, "com.claude-codex.desktop.opencode");
         assert_eq!(agent.host, "claude-codex-opencode");
         assert!(

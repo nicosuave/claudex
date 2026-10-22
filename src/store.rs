@@ -625,7 +625,9 @@ impl Store {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let mut record: Record = serde_json::from_reader(File::open(&path)?)
+            // serde_json does not buffer Read inputs: parsing a File directly
+            // makes a syscall per byte and delays readiness for large histories.
+            let mut record: Record = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("Cannot load {}", path.display()))?;
             if !record.tracks_request_usage {
                 // Older records stored an entire turn's billing total as context.

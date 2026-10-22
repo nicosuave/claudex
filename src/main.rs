@@ -108,6 +108,9 @@ enum Command {
         /// router then reaches Claude without Remote Login.
         #[arg(long)]
         no_ssh: bool,
+        /// Native authentication context; upgrades preserve the saved choice.
+        #[arg(long, value_enum)]
+        auth_session: Option<claude_codex_server::install::AuthSession>,
     },
     /// Check executables, service, local SSH, and native Claude authentication.
     #[cfg(unix)]
@@ -206,9 +209,12 @@ async fn run(args: Args) -> Result<()> {
     }
     #[cfg(unix)]
     match &args.command {
-        Some(Command::Install { no_ssh }) => {
+        Some(Command::Install {
+            no_ssh,
+            auth_session,
+        }) => {
             return claude_codex_server::install::Installation::current(acp.clone())?
-                .install(&args.claude, !no_ssh)
+                .install(&args.claude, !no_ssh, *auth_session)
                 .await;
         }
         Some(Command::Doctor) => {

@@ -43,6 +43,70 @@ fn initialize() -> Value {
 }
 
 #[tokio::test]
+async fn large_saved_histories_do_not_delay_service_readiness() {
+    use claude_codex_server::store::{Record, Settings, Store};
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut expected = Vec::new();
+    {
+        let store = Store::open(temp.path()).unwrap();
+        // Unbuffered JSON reads issue a syscall per byte. A realistic history
+        // size must still fit inside the service manager's 20-second deadline.
+        for _ in 0..4 {
+            let mut record = Record::new(
+                Settings::new(temp.path().to_path_buf(), "sonnet".into()),
+                store.threads_dir(),
+                &json!({}),
+                "startup-test",
+            );
+            record.turns = vec![json!({
+                "id": uuid::Uuid::new_v4().to_string(), "status":"completed",
+                "items":[{"id":uuid::Uuid::new_v4().to_string(), "type":"agentMessage",
+                    "text":"history ".repeat(1024 * 1024)}]
+            })];
+            store.save(&record).unwrap();
+            expected.push(record.id().to_owned());
+        }
+    }
+    // start() waits at most 15s for the listener, leaving room for the health
+    // handshake before the installed manager's readiness deadline.
+    let (mut child, address) = start(temp.path(), "ws://127.0.0.1:0").await;
+    let (mut ws, _) = connect_async(&address).await.unwrap();
+    ws.send(Message::Text(initialize().to_string().into()))
+        .await
+        .unwrap();
+    let hello = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let hello: Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
+    assert!(hello["result"]["userAgent"].is_string());
+    for id in expected {
+        ws.send(Message::Text(
+            json!({"id":id,"method":"thread/read","params":{"threadId":id,"includeTurns":true}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(reply["result"]["thread"]["id"], id);
+        assert_eq!(
+            reply["result"]["thread"]["turns"][0]["items"][0]["text"],
+            "history ".repeat(1024 * 1024)
+        );
+    }
+    ws.close(None).await.unwrap();
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_supports_native_clients_and_rejects_all_browser_origins() {
     let temp = tempfile::tempdir().unwrap();
     let (mut child, address) = start(temp.path(), "ws://127.0.0.1:0").await;
