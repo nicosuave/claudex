@@ -88,11 +88,55 @@ fn codex_desktop_runtime_overrides_do_not_block_claude_requests() {
         .unwrap();
         assert!(disabled.get("config").is_none());
     }
-    // Keep rejecting unrelated settings instead of dropping arbitrary MCP or
-    // memory configuration merely because the desktop supplies some of it.
+    // Unrecognized settings are reported by name rather than silently dropped.
     for key in ["mcp_servers.other", "memories.unknown"] {
-        let error =
-            normalize("thread/start", &json!({"config":{key:{"enabled":true}}})).unwrap_err();
-        assert!(error.message.contains(key));
+        let (_, warnings) =
+            normalize("thread/start", &json!({"config":{key:{"enabled":true}}})).unwrap();
+        assert!(warnings.iter().any(|w| w.contains(key)), "{warnings:?}");
     }
+}
+
+#[test]
+fn new_desktop_config_keys_do_not_block_resuming_chats() {
+    for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
+        let (params, warnings) = normalize(
+            method,
+            &json!({"config":{
+                "apps.connector_openai_search_service.omit_tools_from":["codex"],
+                "web_search":"live",
+                "model_reasoning_effort":"high"
+            }}),
+        )
+        .unwrap();
+        assert!(params.get("config").is_none());
+        assert_eq!(params["effort"], "high");
+        let warning = warnings
+            .iter()
+            .find(|w| w.starts_with("Codex configuration not applied"))
+            .unwrap();
+        assert!(warning.contains("apps.connector_openai_search_service.omit_tools_from"));
+        assert!(warning.contains("web_search"));
+    }
+}
+
+#[test]
+fn config_overrides_of_model_sandbox_or_approvals_still_fail() {
+    for key in [
+        "model",
+        "model_provider",
+        "model_providers.openai.base_url",
+        "sandbox_mode",
+        "sandbox_workspace_write.network_access",
+        "approval_policy",
+        "approvals_reviewer",
+    ] {
+        let error = normalize("thread/resume", &json!({"config":{key:"x"}})).unwrap_err();
+        assert!(error.message.contains(key), "{}", error.message);
+    }
+    // Prefix matching stays on key-segment boundaries.
+    normalize(
+        "thread/resume",
+        &json!({"config":{"model_verbosity":"low"}}),
+    )
+    .unwrap();
 }
