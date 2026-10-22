@@ -224,6 +224,16 @@ model request. `service status` prints installed, loaded, and ready separately.
 The service label is `com.claude-codex.desktop`; logs are in
 `~/Library/Application Support/claude-codex/logs/server.log`.
 
+Native Claude authentication can differ between the macOS login security session
+and a separate service security session. New installations use the login session;
+upgrades preserve the existing service's choice. To change it, run
+`claudex install --auth-session login` or `claudex install --auth-session isolated`.
+The choice is saved for later reinstalls and shown by `service status`. This does
+not copy credentials or change Claude's login. If a native request works in your
+terminal but the service reports expired OAuth, try the other session and retry
+the chat. `doctor` checks native auth status in its caller's context; it does not
+prove that a service model request can authenticate.
+
 To upgrade, run `brew upgrade nicosuave/tap/claudex`, then `claudex install`.
 Homebrew updates the command-line tool; the second command refreshes the separate
 stable binary used by the desktop service. Both steps are currently required.
