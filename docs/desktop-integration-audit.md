@@ -74,7 +74,8 @@ automation was unavailable. Reconnect after upgrades to refresh cached host
 permission/capability metadata. These historical runtime probes do not substitute
 for verification of a new release build.
 
-Run the current deterministic suite as documented in [README.md](../README.md).
+Run the current deterministic suite as documented in the
+[app-server guide](app-server.md#verification).
 Native opt-in tests and the examples in [DESKTOP.md](../DESKTOP.md) make real model
 requests. Private local inspection artifacts and transcripts are not distributed.
 The vendored schema and upstream licenses are included; owning implementation

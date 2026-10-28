@@ -1,244 +1,234 @@
 # Claudex
 
-A Rust facade that exposes the Codex app-server thread/turn protocol over Claude Code's bidirectional `claude -p` transport. Clients send Codex JSON-RPC messages; Claude does the inference and tool execution.
+Use Claude Code alongside Codex in the same desktop window. Claudex adds Claude
+models to the model picker, combines both backends' chats in the sidebar, and
+routes each conversation to its native runtime. GPT chats run through genuine
+Codex; Claude chats run through your installed, authenticated Claude Code.
 
-The implementation targets the generated **Codex CLI 0.160.0** schema. The Claude transport was developed against **Claude Code 2.1.288** and the official Claude Agent SDK's subprocess/control implementation. No Node or Python bridge is required.
+The router also lets Codex and Claude delegate work to each other through shared
+agent tools. You can connect from another computer over SSH, use other agents
+through ACP, or run Claudex as a standalone Codex-compatible app-server.
 
-This is a working core implementation, **not complete Codex feature parity**. Unsupported methods return `-32601`; unsupported non-null options return `-32602`. See the [feature support matrix](#feature-support-matrix) below for a summary and [COMPATIBILITY.md](COMPATIBILITY.md) for the exact surface and behavioral differences.
+Claudex is written in Rust. It does not modify the desktop app bundle or replace
+either agent's authentication.
 
-## Feature support matrix
-
-Status: **Supported** works through the Codex protocol; **Partial** works with the stated gap; **Claude-native** is provided by Claude's own runtime rather than the Codex feature; **Unsupported** is rejected or absent. Details are in [COMPATIBILITY.md](COMPATIBILITY.md).
-
-| Area | Feature | Status | Notes |
-| --- | --- | --- | --- |
-| Conversation | Start, resume, list, archive, rename | Supported | Facade-owned records plus native Claude transcripts |
-| Conversation | Fork, revert, rollback | Supported | Exact native transcript prefix; files and external effects are not undone |
-| Conversation | Steer, queue, interrupt | Supported | One active turn per thread |
-| Conversation | Ephemeral threads | Partial | One turn only; cannot be forked |
-| Conversation | Model and effort selection | Supported | Claude CLI catalog; `low` through `max` |
-| Conversation | Context usage, compaction | Supported | Usage from latest top-level request; compaction is Claude's |
-| Conversation | Reasoning summaries | Partial | Exposed thinking only; `concise`/`detailed` lengths not enforced |
-| Conversation | Structured output (`outputSchema`) | Supported | Final assistant message containing JSON |
-| Conversation | Collaboration modes, plan mode | Unsupported | Default mode only |
-| Conversation | Review mode | Unsupported | |
-| Subagents | Claude subagents (`Agent` tool) | Claude-native | Run inside the turn; output folded into the parent tool result. No Codex child threads, so the desktop agent tree stays empty |
-| Subagents | Background agents and workflows | Claude-native | Turn stays open until Claude reports idle |
-| Subagents | Codex multi-agent (child thread spawn) | Unsupported | `subAgentThreadSpawn` lists return no threads |
-| Subagents | Guardian/auto approval reviewer | Partial | Mapped to Claude native auto review, not a Codex reviewer |
-| Tools | Shell | Supported | `Bash` → `commandExecution`; output arrives with the result, not streamed |
-| Tools | File edits | Partial | `Write`/`Edit`/`MultiEdit` → `fileChange` with best-effort diffs; edits made via shell commands produce no file-change item |
-| Tools | `apply_patch` | Claude-native | Claude edit tools instead |
-| Tools | Web search and fetch | Claude-native | Claude `WebSearch`/`WebFetch` as `dynamicToolCall`; no `webSearch` item |
-| Tools | Image viewing | Claude-native | Claude `Read` on image files; no image-view item |
-| Tools | Image generation | Partial | Only through an installed Codex plugin |
-| Tools | Plan/todo updates | Supported | `TodoWrite` → `turn/plan/updated` |
-| Tools | User questions | Supported | Single-select → `requestUserInput`; multi-select → desktop option picker |
-| Tools | Other Claude tools | Partial | `dynamicToolCall` in namespace `claude`; generic approval via question fallback |
-| Tools | Desktop dynamic tools | Supported | Reverse `item/tool/call` through the turn owner |
-| Tools | Multimodal tool results | Partial | Rendered as text; native MCP result metadata dropped |
-| MCP | Claude-configured MCP servers | Claude-native | Shown as `mcpToolCall`; outside the Bash sandbox |
-| MCP | Codex plugin MCP/app tools | Supported | Executed by genuine Codex; metadata preserved |
-| MCP | Interactive elicitation | Unsupported | Authenticate in Codex settings |
-| Plugins, skills, hooks | Codex plugin administration | Supported | Forwarded to genuine Codex when configured |
-| Plugins, skills, hooks | Codex plugin skills | Supported | Listed with real `SKILL.md` paths |
-| Plugins, skills, hooks | Standalone skills, Claude plugins | Claude-native | Loaded by Claude; skill input items unsupported |
-| Plugins, skills, hooks | Codex hooks | Partial | Manageable; not executed around Claude turns. Claude hooks run normally |
-| Permissions | Workspace-write, full access | Supported | Claude OS-enforced Bash sandbox and scoped file permissions |
-| Permissions | Read-only, external sandbox | Unsupported | |
-| Permissions | Command/file approvals, session grants | Supported | Session grants match exact tool input and cwd |
-| Permissions | `never` approval policy | Partial | Maps to `dontAsk`: denies, does not bypass |
-| Input | Text, images | Supported | Data/HTTP(S) URLs, local PNG/JPEG/GIF/WebP |
-| Input | Audio, video, file IDs, mentions, skill items | Unsupported | |
-| Desktop host | Filesystem, `command/exec`, `process/*` | Supported | Privileged; trusted local clients only |
-| Desktop host | Attachments, worktrees | Partial | Metadata stored; desktop Git worker owns checkouts; UI orchestration unverified |
-| Desktop host | SSH reconnect | Supported | Live turn survives; facade restart interrupts it |
-| Account | Login, quotas, account management | Unsupported | Claude's own authentication |
-| Other | Realtime voice, remote control, cloud tasks, transcript import | Unsupported | |
-| Platform | macOS / Windows | Supported / Unsupported | |
-
-## macOS desktop installation
-
-Install Codex desktop and Claude Code, run `claude auth login`, and enable
-**System Settings > General > Sharing > Remote Login** for your user first.
-
-1. Install the command-line tool:
-
-   ```sh
-   brew install nicosuave/tap/claudex
-   ```
-
-2. Set up the desktop connection as your login user, without `sudo`:
-
-   ```sh
-   claudex install
-   ```
-
-   This copies the binary to a stable per-user location, creates its LaunchAgent
-   and SSH connection, and checks service readiness.
-   It also enables mixed GPT/Claude models for desktop SSH connections from
-   another computer. Reconnect an existing remote connection after installation.
-
-3. Select `claude-codex-local` in Codex **Settings > Connections**.
-
-To use Claude models beside Codex in the desktop's ordinary local window instead,
-without SSH, see
-[One local window without SSH](DESKTOP.md#one-local-window-without-ssh).
-
-If you need to diagnose a connection problem, run `claudex doctor`. It checks
-the setup; it does not install or upgrade anything.
-
-See [DESKTOP.md](DESKTOP.md) for prerequisites, upgrades,
-service commands, uninstall behavior, and the precise local trust boundary.
-
-Prebuilt macOS (Apple Silicon/Intel) and Linux (ARM64/x86-64) binaries and SHA-256
-checksums are on [GitHub Releases](https://github.com/nicosuave/claudex/releases).
-macOS binaries are Developer ID signed and notarized. The desktop installer is
-macOS-only; Linux can run `claudex app-server --stdio`.
-
-### Upgrade
-
-Wait for active chats to finish. Update the Homebrew binary, then copy that
-updated binary into the desktop service and restart it:
+## Install
 
 ```sh
-brew upgrade nicosuave/tap/claudex
-claudex install
+brew install nicosuave/tap/claudex
 ```
 
-The second command refreshes an existing installation and preserves conversations
-and the SSH identity. It is currently required because the service runs its own
-stable copy of the binary; `brew upgrade` alone does not update that copy.
+You need macOS, the Codex desktop app, and Claude Code. Sign in with
+`claude auth login` before setting up the desktop connection. Workspace-write
+sessions require Claude Code 2.1.294 or newer.
 
-## Build and run
+Prebuilt macOS and Linux binaries for ARM64 and x86-64, with SHA-256 checksums,
+are on [GitHub Releases](https://github.com/nicosuave/claudex/releases).
+macOS binaries are Developer ID signed and notarized. Desktop installation is
+macOS-only; Linux can run the standalone app-server.
 
-Requires Rust with edition 2024 support and an installed, authenticated `claude` executable. Claude uses its normal configured authentication. The facade neither reads credentials nor changes login settings.
+## Quickstart
+
+Set up the Claude service and local desktop router as your login user, without
+`sudo`:
 
 ```sh
-mbx build --locked --bin claude-codex-server
-./target/debug/claude-codex-server app-server --stdio
+claudex install --no-ssh
 ```
 
-Use `cargo build` if Boxington (`mbx`) is unavailable. The default model is `sonnet`; override it with `--model opus` or a Claude model identifier.
+Quit and reopen the desktop app once so it picks up the router. Stay on the
+ordinary local connection, start a new chat, and choose a Claude model such as
+`opus` or `sonnet`. GPT models and existing Codex chats remain available in the
+same window. This setup does not require Remote Login.
 
-For a client that lets you configure its app-server command, set the executable to the built `claude-codex-server` binary and arguments to `app-server --stdio`. For a separate Codex desktop SSH connection, see [DESKTOP.md](DESKTOP.md). Desktop transport and startup compatibility are implemented; the actual desktop UI still needs a manual connection test.
+To also create a separate Claude-only connection, enable **System Settings >
+General > Sharing > Remote Login** for your user and run `claudex install`
+without `--no-ssh`. Select `claude-codex-local` in **Settings > Connections**.
+See [desktop setup](DESKTOP.md#install) for identity-file selection and other
+connection settings.
 
-Other transports:
+## Ways to use Claudex
 
-```sh
-./target/debug/claude-codex-server --listen ws://127.0.0.1:4510
-./target/debug/claude-codex-server --listen unix:///tmp/claude-codex.sock
-```
-
-WebSockets accept loopback IP bindings only. All browser Origin headers are rejected. `unix://` carries WebSockets as Codex desktop expects; the previous newline JSON framing is available as `unix-lines:///absolute/path`. Unix sockets use mode `0600`; only stale sockets owned by the current user may be removed; live sockets, files, and symlinks are retained. All transports are intended for trusted local clients, with no network authentication layer. Logs go to stderr; stdout carries only protocol frames in stdio mode.
-
-Useful options:
-
-| Option | Purpose |
+| Mode | Use it for |
 | --- | --- |
-| `--claude /absolute/path/to/claude` | Backend executable; also `CLAUDE_CODE_EXECUTABLE` |
-| `--state-dir /absolute/path` | Facade persistence; also `CLAUDE_CODEX_HOME` |
-| `--model sonnet` | Default model alias or identifier |
-| `--claude-arg=--safe-mode` | Forward an administrator-selected argument; repeat as needed |
-| `--initialize-timeout-seconds 60` | Claude control handshake deadline |
-| `--approval-timeout-seconds 300` | Deny unanswered permission requests after this much connected time |
-| `--acp-agent opencode` | Serve an [Agent Client Protocol](https://agentclientprotocol.com) agent instead of Claude (see below) |
-| `--acp-arg=acp` | Forward an argument to the ACP agent; repeat as needed |
-| `--provider-id`, `--provider-name` | Model provider reported to Codex for an ACP agent (default: the executable name) |
-| `--auto-review-model sonnet` | Claude model that reviews an ACP agent's permission requests when a thread selects automatic review |
-| `--idle-session-timeout-seconds 3600` | Keep a thread's Claude process between turns so its prompt cache stays valid; `0` starts a process per turn |
-| `--max-idle-sessions 8` | Idle Claude processes kept across threads; the oldest closes first |
+| [Desktop router](#desktop-router) | GPT and Claude models, chats, and cross-harness agents in one window |
+| [Remote desktop over SSH](#connect-from-another-computer) | The combined model picker on another Mac |
+| [Dedicated Claude connection](DESKTOP.md#install) | A separate Claude-only desktop connection |
+| [Other agents over ACP](#other-agents-over-acp) | OpenCode, Gemini CLI, and other ACP v1 agents |
+| [Standalone app-server](#standalone-app-server) | Claude behind the Codex thread/turn protocol for your own client |
 
-State defaults to `~/.local/state/claude-codex-server` (`claude-codex-server-<provider-id>` for an ACP agent), independently of `CODEX_HOME`. Only one facade process may use a state directory. The facade stores its own thread/item history there, while Claude retains its own native session transcripts. Both are needed for durable conversation recall. Deleting facade metadata does not delete Claude's transcripts.
+## Desktop router
+
+The router sits between the desktop and two backends: genuine Codex and the
+Claude service. It combines their model catalogs and chat lists. Codex owns
+configuration and project administration; each backend keeps its own
+conversations and executes its own tools.
+
+- **Choose a model when starting a chat.** GPT models go to Codex; Claude models
+  go to Claude Code. The router honors saved model defaults and moves an empty,
+  prewarmed Codex chat to Claude if you choose a Claude model before its first
+  message. Project and Git metadata are preserved.
+- **Continue on the same backend.** Once a chat has messages, it stays with its
+  backend. To move from GPT to Claude or vice versa, start a new chat. The router
+  rejects a cross-backend model change in an existing conversation.
+- **Browse both histories together.** Model discovery, sorted and paginated chat
+  lists, and sidebar sections span both backends. Within a shared section,
+  Claude chats follow Codex chats; ordering cannot interleave the two backends.
+- **Recover after a service restart.** The router reconnects to Claude while
+  keeping Codex running. Claude requests receive a temporary reconnect error;
+  submitted messages are never automatically replayed or sent to Codex.
+  Restarting the Claude service interrupts its active turns. Requests for
+  threads whose backend is not yet known wait for ownership to be resolved.
+
+The installer configures `CODEX_CLI_PATH` for the desktop login session and
+restores it at each login. The generated launcher at
+`~/Library/Application Support/claude-codex/router/codex` runs `claudex route`
+for desktop app-server launches and genuine Codex for other commands. The
+default is the Codex binary bundled with the desktop;
+`CLAUDE_CODEX_ROUTER_CODEX` can select another executable.
+
+See [local desktop routing](DESKTOP.md#one-local-window-without-ssh) for launch
+details and [the router contract](docs/router-desktop-flow.md) for thread
+creation, model selection, metadata, and reconnection behavior. Claude
+[prompt-bar predictions](docs/prompt-predictions.md) also use the router.
+
+## Cross-harness agents
+
+In a routed chat, Codex can delegate a task to Claude, and Claude can delegate to
+Codex. Both receive the `claudex_agents` tools: `spawn_agent`, `list_agents`,
+`wait_agent`, `send_message`, `followup_task`, and `interrupt_agent`.
+
+For example, ask a Codex chat:
+
+> Use claudex_agents to spawn a Claude agent with model opus to review the parser
+> changes without editing files. Wait for its report, then address the findings.
+
+Children are native sessions linked to the parent's task tree. They receive a
+fresh task briefing and inherit the parent's working directory and permissions;
+delegation fails if the target cannot reproduce those permissions. You can open
+the child chats and continue them directly. Native same-harness delegation is
+also available.
+
+Shared delegation requires the router; a direct Claude-only facade connection
+does not provide it. See [shared delegation](docs/shared-delegation.md) for tool
+arguments, permission boundaries, and lifecycle behavior.
+
+## Connect from another computer
+
+On the remote Mac, install Claudex and run `claudex install` as the user you
+connect to. Enable Remote Login there, then reconnect that Mac's ordinary SSH
+connection in the client desktop. GPT and Claude models appear together using
+your existing SSH authentication and Codex home.
+
+The installer adds a managed shell block that selects the router for desktop SSH
+launches. Ordinary SSH shells and CLI commands keep their existing behavior;
+remote routing currently supports zsh and bash login shells. See
+[remote desktop setup](DESKTOP.md#connect-from-another-computer) for details.
 
 ## Other agents over ACP
 
-The same facade can put any [Agent Client Protocol](https://agentclientprotocol.com) v1 agent behind Codex desktop instead of Claude: OpenCode, Gemini CLI, Goose, Claude Code's ACP adapter, and others. Each agent runs as its own facade with its own threads:
+Claudex can expose [Agent Client Protocol](https://agentclientprotocol.com) v1
+agents through the same Codex-compatible interface. Sign in with the agent's own
+CLI first, then install a separate desktop connection, for example:
+
+```sh
+claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+```
+
+Select `claude-codex-opencode` in **Settings > Connections**. Each agent gets its
+own service, state, SSH identity, and connection. Pass the same `--acp-agent` or
+`--provider-id` flags to `doctor`, `service`, and `uninstall` to select it.
+
+ACP agents execute their own tools and require full access. Their permission
+requests become desktop approvals; optional automatic review uses Claude.
+Models, effort, and fork support depend on the agent. Workspace sandboxing,
+rollback, and structured output are unsupported. See
+[agent setup](DESKTOP.md#other-agents) and the
+[ACP compatibility mapping](COMPATIBILITY.md#acp-agents).
+
+## Feature support matrix
+
+Claude support covers a subset of the Codex protocol. Genuine Codex chats retain
+their native behavior; the router does not give Claude every Codex capability.
+
+| Area | Claude support |
+| --- | --- |
+| Conversations | Start, resume, rename, archive, delete, search, fork, revert, and rollback; recovery does not undo files or external effects |
+| Turns | Streaming, steering, queues, interruption, context usage, and native compaction |
+| Models | Installed Claude catalog, per-model effort, and Fast mode where advertised by Claude |
+| Tools and input | Native Claude tools, text and images, desktop dynamic tools, and structured output; shell output arrives with native tool results |
+| Plugins and MCP | Claude-native integrations plus Codex plugin services through genuine Codex; no Codex hook execution around Claude turns or interactive MCP elicitation |
+| Subagents | Claude `Agent` activity appears as linked, read-only child threads; router-delegated native sessions accept direct input |
+| Permissions | Workspace-write, native automatic or manual review, and full access; read-only and external sandbox profiles are unsupported |
+| Desktop | Combined models and history, project placement, sections, SSH reconnect, and best-effort prompt predictions |
+| Unsupported | Plan/review modes, realtime voice, audio/video input, transcript import, and Claude account/quota management through Codex |
+
+**Workspace write** uses Claude's OS-enforced Bash sandbox and scoped native file
+permissions. **Approve for me** uses Claude's native automatic reviewer. Full
+access with `never` uses `bypassPermissions`; `never` within the workspace sandbox
+uses `dontAsk`. MCP integrations and hooks remain trusted services outside the
+Bash sandbox. See [sandbox settings](DESKTOP.md#development-sandbox-settings)
+and [COMPATIBILITY.md](COMPATIBILITY.md) for exact behavior and limitations.
+
+## Updates and troubleshooting
+
+Wait for active chats to finish, then update both the Homebrew command and the
+separate binary used by the service:
+
+```sh
+brew upgrade nicosuave/tap/claudex
+claudex install --no-ssh
+```
+
+If you use the dedicated SSH connection, run `claudex install` without
+`--no-ssh` instead. Reconnect remote desktop connections after upgrading.
+Reinstallation preserves conversations and the dedicated SSH identity.
+
+```sh
+claudex doctor             # Check the installed setup; makes no model request
+claudex service status     # Show installed, loaded, and ready state
+claudex service restart    # Restart an idle service
+```
+
+If Claude models are missing after the first install, quit and reopen the
+desktop app. Logs live under
+`~/Library/Application Support/claude-codex/logs/`: `router.log` for routing and
+`server.log` for the Claude service. `claudex uninstall` removes the managed
+service and routing setup while retaining conversations, binaries, logs, and
+identity files. See [service management](DESKTOP.md#manage-the-service).
+
+## Standalone app-server
+
+For a client that accepts an app-server command:
+
+```sh
+claudex app-server --stdio
+```
+
+This serves Claude directly, without the combined Codex router. Other agents can
+use the same interface:
 
 ```sh
 claudex app-server --stdio --acp-agent opencode --acp-arg=acp --provider-name OpenCode
 claudex app-server --stdio --acp-agent gemini --acp-arg=--experimental-acp --provider-name Gemini
 ```
 
-For the desktop, install one connection per agent. Each gets its own LaunchAgent, state, SSH key and host, `claude-codex-<provider-id>`, next to the Claude connection:
+The facade targets the vendored Codex CLI **0.160.0** schema. Unsupported methods
+return `-32601`; unsupported non-null options return `-32602`. See the
+[app-server guide](docs/app-server.md) for source builds, transports, options,
+state storage, a JSON-RPC client exchange, and verification commands.
 
-```sh
-claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
-# then select claude-codex-opencode in Codex Settings > Connections
-```
+## Reference
 
-`doctor`, `service` and `uninstall` take the same `--acp-agent`/`--provider-id` flags to select the instance. Sign in with the agent's own CLI first; a turn that needs authentication fails with the sign-in methods the agent advertises.
-
-The agent runs its own tools, so threads use full access and the agent's permission requests become Codex approvals. Models and reasoning effort come from the agent's session config options, and desktop dynamic tools reach the agent as a stdio MCP server. Fork works only at the latest turn and only for agents that support it; rollback, workspace sandboxing and structured output are refused. Automatic approval review works for ACP agents too: Claude reviews each agent permission request against the Codex guardian policy (`--auto-review-model`, default `sonnet`). See [COMPATIBILITY.md](COMPATIBILITY.md#acp-agents) for the full mapping.
-
-## Minimal client exchange
-
-Stdio and `unix-lines://` use one JSON object per line. TCP and Unix WebSockets use one JSON object per text frame. As with Codex, outgoing messages omit `jsonrpc`. String and integer request IDs are preserved.
-
-Send `initialize`, await its response, then send `initialized`:
-
-```json
-{"id":1,"method":"initialize","params":{"clientInfo":{"name":"my-client","version":"1"},"capabilities":{"experimentalApi":true}}}
-{"method":"initialized"}
-```
-
-Start a thread, read `result.thread.id`, then substitute that ID into the turn request:
-
-```json
-{"id":2,"method":"thread/start","params":{"model":"sonnet","sandbox":"danger-full-access","approvalPolicy":"on-request"}}
-{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"Hello","text_elements":[]}]}}
-```
-
-The client receives `turn/started`, item start/delta/completion events, and exactly one `turn/completed` for an accepted turn. Responses and notifications can interleave. Wait for `turn/completed` before starting another turn on that thread; separate threads may run concurrently.
-
-A permission request is a **server-initiated request** with its own ID. For commands and file changes, respond using the exact ID:
-
-```json
-{"id":"<approval-request-id>","result":{"decision":"accept"}}
-```
-
-The supported decisions are `accept`, `acceptForSession`, `decline`, and `cancel`. Session grants apply only to identical tool input and cwd within the same thread; broader permission amendments are rejected. Multi-select native questions use the installed desktop option-picker extension. See [COMPATIBILITY.md](COMPATIBILITY.md) for request and recovery semantics.
-
-Workspace-write uses Claude's OS-enforced Bash sandbox and scoped file permissions; startup verifies the resolved native restrictions before sending user input. Desktop **Approve for me** selects native Claude auto review. Manual review remains supported. Full access (`danger-full-access` with `never`) selects Claude's `bypassPermissions`; `never` inside the workspace sandbox selects `dontAsk`. Eligible unsandboxed retries use the selected reviewer: native automatic review under **Approve for me**, or desktop approval under manual review. Explicit native ask/deny rules remain authoritative. MCP integrations and hooks remain trusted services outside the Bash sandbox. Read-only/external profiles are rejected. The generated desktop launcher also enables genuine Codex plugin services using the existing plugin registry and authentication; see [plugin integration](docs/plugins-design.md).
-
-## Verification
-
-```sh
-mbx test --locked --all-targets --features test-backend
-mbx clippy --locked --all-targets --features test-backend -- -D warnings
-cargo fmt --all -- --check
-```
-
-The deterministic suite drives the real facade executable with a fake Claude subprocess. It checks emitted responses, notifications, and approval requests against the vendored upstream schema, plus stream reconciliation, approvals, interruption, background continuations, restart, fork metadata, history pagination, and socket transports. The fake backend is available only with the `test-backend` feature.
-
-Current verification results and live transport evidence are recorded in the [desktop integration audit](docs/desktop-integration-audit.md).
-
-On a heavily loaded host, use `RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=2`. If the local `mbx` test launcher stalls, compile with `mbx test --no-run --all-targets --features test-backend`, then run the reported test executables directly; this preserves compiler caching.
-
-The live smoke example exercises inference, recall after restarting the facade process, and a fork that remains anchored while the source conversation advances:
-
-```sh
-mbx build --locked --bin claude-codex-server --example smoke
-./target/debug/examples/smoke ./target/debug/claude-codex-server
-```
-
-To also verify a real command approval, add `--exercise-approval`. The example approves only the exact command `printf FACADE_TOOL_OK`, denies other tool requests, and uses a temporary workspace with Claude safe mode. It makes real model calls and leaves native Claude session records in Claude's normal storage.
-
-**Live verification status (October 8, 2026):** inference, recall after a server restart, fork snapshot isolation, and a real command approval all passed. The smoke example adds an explicit Bash ask rule so its harmless `printf` command requires a callback. The previous expired-OAuth blocker is resolved. Desktop UI behavior remains unverified because the computer-use tool does not allow access to the Codex app.
-
-## Design and references
-
-`transport.rs` owns framing and connections; `server.rs` owns RPC ordering, subscriptions, turns, and approvals; `backend.rs` owns Claude subprocess/control I/O; `translate.rs` owns item lifecycles; `store.rs` owns atomic facade persistence. A completed turn is published only after backend cleanup and process reaping. A Claude background-agent continuation is kept within its initiating Codex turn until Claude reports idle. `subagents.rs` maps Claude subagents to Codex child threads.
-
-Primary references:
-
-- [Codex app-server protocol](https://developers.openai.com/codex/app-server)
-- [Codex source](https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol)
-- [Claude Agent SDK control implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py)
-- [Claude Agent SDK subprocess implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
-
-The checked-in schema was generated with `codex app-server generate-json-schema --experimental` from the installed version, rather than fetched from a moving branch. See [NOTICE](NOTICE) for attribution.
-
-CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
-[releasing](docs/releasing.md) for the tagged Linux workflow, local macOS signing,
-and Homebrew update process.
+| Guide | Contents |
+| --- | --- |
+| [Desktop setup](DESKTOP.md) | Local and SSH installation, launch configuration, sandbox settings, authentication, service management, and uninstall |
+| [Compatibility](COMPATIBILITY.md) | Supported methods, tool mappings, permissions, lifecycle, and ACP limitations |
+| [Router contract](docs/router-desktop-flow.md) | Task creation, saved defaults, metadata, backend ownership, and reconnect behavior |
+| [Shared delegation](docs/shared-delegation.md) | Cross-harness agent tools, inherited permissions, task trees, and recovery |
+| [Prompt predictions](docs/prompt-predictions.md) | Native Claude prediction forks, cache behavior, and desktop compatibility |
+| [Plugins](docs/plugins-design.md) | Codex plugin services, skills, authentication, and tool execution |
+| [Native loading and permissions](docs/native-skill-settings-boundary.md) | Claude skills, settings, file guards, and sandbox boundaries |
+| [App-server development](docs/app-server.md) | Source builds, protocol examples, transports, tests, and implementation references |
+| [Desktop integration audit](docs/desktop-integration-audit.md) | Recorded transport and live-model evidence, with validation limits |
+| [Releasing](docs/releasing.md) | CI, release artifacts, macOS signing, and Homebrew delivery |
