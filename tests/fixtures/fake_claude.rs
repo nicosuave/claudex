@@ -206,8 +206,13 @@ fn main() {
                                 .append(true)
                                 .open(path)
                                 .unwrap();
-                            writeln!(log, "{}", json!({"kind":"start","requestId":request_id}))
-                                .unwrap();
+                            writeln!(
+                                log,
+                                "{}",
+                                json!({"kind":"start","requestId":request_id,
+                                    "question":value["request"]["question"]})
+                            )
+                            .unwrap();
                         }
                         let question = value["request"]["question"].as_str().unwrap();
                         if question.starts_with("hang-prediction") {

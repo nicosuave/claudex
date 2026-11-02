@@ -1,9 +1,7 @@
 # Desktop integration boundaries
 
-The facade implements a subset of the Codex app-server contract. It advertises
-CLI 0.160.0 features and validates messages against the CLI 0.166.0 schema, so
-newer desktops' added request fields are accepted where they apply to Claude.
-Schema validation establishes message shape; deterministic tests establish
+The facade implements a subset of the Codex app-server contract pinned to CLI
+0.166.0. Schema validation establishes message shape; deterministic tests establish
 facade behavior; live Claude and SSH probes establish their runtime paths. None
 of these alone proves every native desktop interaction or rendered result.
 

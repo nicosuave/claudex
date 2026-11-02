@@ -498,6 +498,8 @@ fn main() {
             "thread/loaded/list" => Ok(
                 json!({"data": threads.iter().map(|t| t["id"].clone()).collect::<Vec<_>>(), "nextCursor": null}),
             ),
+            // Fake Codex threads own no attachments.
+            "thread/attachmentOwner/list" => Ok(json!({"data": [], "nextCursor": null})),
             "app/list" | "app/installed" | "app/read" => {
                 app_params.push(p.clone());
                 Ok(json!({"data": [], "nextCursor": null}))

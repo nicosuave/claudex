@@ -190,11 +190,8 @@ Primary references:
 The checked-in schema was generated with
 `codex app-server generate-json-schema --experimental` from Codex CLI 0.166.0,
 rather than fetched from a moving branch. See [NOTICE](../NOTICE) for attribution.
-The facade still advertises 0.160.0 in `initialize`: the desktop enables
-features by app-server version, and the facade does not serve several later
-additions, such as `thread/sample`, attached threads and memory summaries. The
-router advertises genuine Codex's version and serves `thread/sample` for Claude
-threads itself.
+See the [0.166 conformance checklist](codex-0.166-conformance.md) for every
+protocol change since 0.160.0.
 
 CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
 [releasing](releasing.md) for the tagged Linux workflow, local macOS signing,

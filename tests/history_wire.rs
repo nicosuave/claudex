@@ -344,6 +344,48 @@ async fn predictions_skip_cold_stale_and_oversized_context_without_a_new_process
 }
 
 #[tokio::test]
+async fn structured_prediction_turns_answer_in_their_schema() {
+    let state = tempfile::tempdir().unwrap();
+    let log = state.path().join("prediction.jsonl");
+    let arg = format!("--claude-arg=--fake-prediction-log={}", log.display());
+    let mut peer = Peer::open_with_args(state.path(), &[&arg]).await;
+    let parent = peer.thread("legacy").await;
+    peer.say(&parent, "parent history").await;
+    // The desktop's title refresh: a prediction fork whose turn has a schema.
+    let fork = peer
+        .ok(
+            "thread/fork",
+            json!({
+                "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,
+                "excludeTurns":true,"threadSource":"thread_title"
+            }),
+        )
+        .await;
+    let fork = fork["thread"]["id"].as_str().unwrap();
+    let schema = json!({"type":"object","properties":{"suggestion":{"type":"string"}},
+        "required":["suggestion"],"additionalProperties":false});
+    let turn = peer
+        .ok(
+            "turn/start",
+            json!({"threadId":fork,"outputSchema":schema,
+                "input":[{"type":"text","text":"Title this chat","text_elements":[]}]}),
+        )
+        .await["turn"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completed = peer.complete(&turn).await;
+    let value: Value = serde_json::from_str(answer(&completed)).unwrap();
+    assert!(value["suggestion"].as_str().unwrap().contains("prediction"));
+    let question = std::fs::read_to_string(&log).unwrap();
+    let question: Value = serde_json::from_str(question.lines().next().unwrap()).unwrap();
+    let question = question["question"].as_str().unwrap();
+    assert!(question.starts_with("Title this chat"), "{question}");
+    assert!(question.contains(&schema.to_string()), "{question}");
+    peer.close().await;
+}
+
+#[tokio::test]
 async fn cancelling_a_prediction_keeps_the_parent_usable() {
     let state = tempfile::tempdir().unwrap();
     let log = state.path().join("prediction.jsonl");

@@ -8,11 +8,9 @@ use std::{
 use serde_json::{Value, json};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The Codex release whose features the facade advertises. The desktop enables
-/// features by app-server version, so this stays below the vendored schema
-/// until the facade serves what newer releases add (thread/sample, attached
-/// threads, memory summaries). Requests are validated against the schema.
-pub const CODEX_VERSION: &str = "0.160.0";
+/// The Codex release whose protocol the facade implements and advertises. The
+/// desktop enables features by app-server version.
+pub const CODEX_VERSION: &str = "0.166.0";
 /// Facade-only extension: `{threadId, params}` starts a thread with that id.
 pub const ADOPT_THREAD_METHOD: &str = "claudex/thread/adopt";
 /// Facade-only extension for the router: genuine Codex renamed (`section`) or
@@ -49,6 +47,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/attachment/add",
     "thread/attachment/list",
     "thread/attachment/remove",
+    "thread/attachmentOwner/list",
     "plugin/list",
     "plugin/installed",
     "plugin/search",
@@ -56,10 +55,12 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "plugin/install",
     "plugin/uninstall",
     "thread/read",
+    "thread/readState/update",
     "thread/list",
     "thread/loaded/list",
     "thread/turns/list",
     "thread/items/list",
+    "thread/items/read",
     "thread/timeline/list",
     "thread/name/set",
     "thread/metadata/update",
@@ -69,6 +70,11 @@ pub const SUPPORTED_METHODS: &[&str] = &[
     "thread/delete",
     "thread/unsubscribe",
     "thread/goal/get",
+    "thread/sample",
+    "thread/sample/cancel",
+    "thread/memory/read",
+    "thread/prediction/request",
+    "feedback/save",
     "thread/searchOccurrences",
     "thread/section/move",
     "turn/start",

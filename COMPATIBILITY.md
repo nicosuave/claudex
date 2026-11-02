@@ -1,6 +1,6 @@
 # Compatibility with Codex app-server 0.166.0
 
-This document describes implemented behavior, not full protocol equivalence or a guarantee about future Codex/Claude releases. The wire schema is `protocol/codex-0.166.0.json`. The facade advertises the 0.160.0 feature level in `initialize`, because the desktop enables later features by version; the router serves `thread/sample` for Claude threads.
+This document describes implemented behavior, not full protocol equivalence or a guarantee about future Codex/Claude releases. The wire schema is `protocol/codex-0.166.0.json`. The facade advertises 0.166.0 in `initialize`; [the 0.166 conformance checklist](docs/codex-0.166-conformance.md) records every protocol change since 0.160.0 and how it is served.
 
 ## Client methods
 
@@ -11,15 +11,22 @@ Accepted requests are validated against the pinned schema before execution, with
 | `initialize` | `clientInfo`, `capabilities.experimentalApi`, `capabilities.optOutNotificationMethods`; requests accepted immediately after reply; optional `initialized` |
 | `thread/start` | `cwd`, `model`, `modelProvider`, `approvalPolicy`, `sandbox`, `baseInstructions`, `developerInstructions`, `ephemeral`, `historyMode`, `projectId`, `threadSource` |
 | `thread/resume` | `threadId` or returned `path`, `cwd`, `model`, `modelProvider`, `approvalPolicy`, `sandbox`, `baseInstructions`, `developerInstructions`, `excludeTurns`, `initialTurnsPage`; snapshot cursors and unchanged active settings supported |
-| `thread/fork` | `threadId`, `cwd`, `model`, `modelProvider`, `approvalPolicy`, `sandbox`, `baseInstructions`, `developerInstructions`, `ephemeral`, `excludeTurns`, `threadSource`, `beforeTurnId` (exclusive), `lastTurnId` (inclusive); exact native transcript snapshots |
+| `thread/fork` | `threadId`, `cwd`, `model`, `modelProvider`, `approvalPolicy`, `sandbox`, `baseInstructions`, `developerInstructions`, `ephemeral`, `excludeTurns`, `threadSource`, `beforeTurnId` (exclusive), `lastTurnId` (inclusive), `attachToSource` (a persistent side chat of a paginated source, hidden from ordinary lists; the source cannot be deleted while it has one); exact native transcript snapshots. Prediction forks also accept `experimentalDisablePredictionMcp` and `config.thread_unload_delay_secs`, both ignored |
 | `thread/inject_items` | Idle thread; user messages containing `input_text` only; queued model-visible context before the next user input, without starting a turn |
 | `thread/revert`, `thread/rollback` | Idle loaded thread; retain the prefix before `beforeTurnId` (paginated) or remove `numTurns` (legacy); next native turn forks at the retained UUID |
 | `thread/attachment/{add,list,remove}` | Durable arbitrary attachment type/identity/payload metadata; notification only after save; desktop Git worker owns checkout creation/archive/restore |
-| `thread/read` | `threadId`, `includeTurns` |
-| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `sectionId`, `cwd`, `searchTerm`, `useStateDbOnly`, `parentThreadId`, `ancestorThreadId`, `excludedThreadIds` (at most 100), `attachedToThreadId` (always empty: Claude threads are never attached forks); all records come from facade state. As in Codex, a null `sectionId` selects threads in no section, `sortKey: section_position` lists one `sectionId` in its own order, and subagent child threads are excluded by default and selected by `parentThreadId` (direct children), `ancestorThreadId` (all descendants), or `sourceKinds` `subAgent`/`subAgentThreadSpawn`; a relation filter without `sourceKinds` spans all sources |
+| `thread/read` | `threadId`, `includeTurns`; `readState` as below. Items carry `startedAtMs`/`completedAtMs`, as everywhere history is returned |
+| `thread/readState/update` | `threadId`, `operation` (`read`/`unread`), `expectedRevision`. As in Codex: durable user threads only; a stale revision fails with `data.reason: readStateConflict` and the current state; a completed answer, failure, or interrupted turn with output publishes `firstUnread` and `thread/readState/changed`. `thread/list` reports `readStates` for its page |
+| `thread/list` | `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `projectId`, `sectionId`, `cwd`, `searchTerm`, `useStateDbOnly`, `parentThreadId`, `ancestorThreadId`, `excludedThreadIds` (at most 100), `attachedToThreadId` (that source's side chats, including empty ones); all records come from facade state. As in Codex, a null `sectionId` selects threads in no section, `sortKey: section_position` lists one `sectionId` in its own order, and attached side chats are listed only by `attachedToThreadId`; subagent child threads are excluded by default and selected by `parentThreadId` (direct children), `ancestorThreadId` (all descendants), or `sourceKinds` `subAgent`/`subAgentThreadSpawn`; a relation filter without `sourceKinds` spans all sources |
 | `thread/loaded/list` | `cursor`, `limit` |
 | `thread/turns/list` | `threadId`, `cursor`, `limit`, `sortDirection`, `itemsView` |
 | `thread/items/list` | `threadId`, optional `turnId`, `cursor`, `limit`, `sortDirection` |
+| `thread/items/read` | `threadId`, `turnId`, 1 to 100 `itemIds`; stored order, unknown ids omitted |
+| `thread/attachmentOwner/list` | `attachmentType`, `identityKey`, `archived`, `cursor`, `limit`; persisted owners. Behind the router, Claude owners follow Codex's |
+| `thread/sample`, `thread/sample/cancel` | A read-only question on the loaded parent's warm process at its latest settled `expectedTurnId`; `null` text when the parent is not eligible. See [prompt predictions](docs/prompt-predictions.md) |
+| `thread/memory/read` | `threadId`; `summary: null`, since Codex memories are not part of a Claude thread |
+| `thread/prediction/request` | `-32601`, as genuine Codex 0.166 answers |
+| `feedback/save` | Delegated to genuine Codex, which writes the archive; a Claude thread adds its saved record as an extra log file |
 | `thread/timeline/list` | `threadId`, `cursor`, `limit`; newest bounded page in chronological order, earlier pages via cursor |
 | `thread/name/set` | `threadId`, `name` |
 | `thread/metadata/update` | `threadId`, `projectId` (empty clears), partial `gitInfo` (null fields clear), `daybreakEnabled`; persistent metadata saved atomically; project updates notify subscribers |
@@ -67,7 +74,7 @@ After a turn finishes cleanly, the thread keeps its Claude process (and Codex pl
 
 ## Notifications and tool translation
 
-Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/deleted`, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, and `error`.
+Implemented notifications include `thread/started`, name/archive/unarchive/status changes, `thread/deleted`, `thread/tokenUsage/updated`, `turn/started`, `turn/completed`, `turn/plan/updated`, `item/started`, `item/completed`, assistant/reasoning/command deltas, `serverRequest/resolved`, `thread/reverted`, attachment updates, `thread/readState/changed`, and `error`.
 
 | Claude content | Codex representation |
 | --- | --- |
@@ -117,7 +124,7 @@ File diffs are previews, not an OS audit; command-mediated file edits do not syn
 ## Explicit limitations
 
 - Workspace-write enforces Claude’s native Bash sandbox and scoped file permissions. Native auto review accepts installed desktop guardian payloads. MCP and hooks are trusted integrations outside the Bash sandbox; read-only and external profiles are unsupported. Resolved restrictions are checked before model input.
-- No raw transcript import, realtime audio, remote control, login, quotas, remote environments, collaboration modes, or other unlisted RPCs. Codex skills/hooks management and MCP services are forwarded when configured; Codex hook execution around Claude turns and interactive MCP elicitation are unsupported.
+- No raw transcript import, realtime audio, remote control, login, quotas, remote environments, collaboration modes, or other unlisted RPCs. Codex skills/hooks management and MCP services are forwarded when configured; a `threadId` on these requests selects the thread's working directory for `hooks/list` and is otherwise dropped; Codex hook execution around Claude turns and interactive MCP elicitation are unsupported.
 - Inputs: text, supported image data/HTTP(S) URLs, and local PNG/JPEG/GIF/WebP paths. Behind the desktop router, local paths in turn, steer and queue input are read by the router and sent to the facade as data URLs, because files such as screenshots dragged from the capture thumbnail can be opened only by the desktop's process tree. No OpenAI file IDs, image detail selection, audio, video, skill, or mention input mapping.
 - Ephemeral threads use `--no-session-persistence` and remain out of disk/list history. A durable parent can fork into an ephemeral side chat with instruction overrides and an injected boundary. Follow-ups retain its Claude process until the chat is archived or its last subscriber unsubscribes; idle cache limits and expiry do not discard temporary history. Launch-setting changes and a lost process fail explicitly instead of restarting without history. Ephemeral threads cannot be a fork source or recover their history.
 - Model listing is the installed Claude CLI's catalog, not an inference entitlement check. Config reads declare the Claude custom provider; model/effort default writes and Codex plugin enable edits are supported. Plugin configuration and authentication remain owned by genuine Codex.

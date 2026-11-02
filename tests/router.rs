@@ -714,7 +714,37 @@ async fn native_shared_delegation() {
 }
 
 #[tokio::test]
-async fn desktop_samples_claude_threads_through_hidden_prediction_forks() {
+async fn attachment_owners_include_claude_threads() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let owner = desktop
+        .thread(json!({"model":"fake-claude","sandbox":"danger-full-access"}))
+        .await;
+    desktop
+        .ok(
+            "thread/attachment/add",
+            json!({"threadId":owner,"attachmentType":"worktree","identityKey":"/repo/worktree",
+                "payload":{"root":"/repo/worktree"}}),
+        )
+        .await;
+    // The desktop's archive cleanup query for a managed worktree.
+    let query = json!({"attachmentType":"worktree","identityKey":"/repo/worktree",
+        "archived":false,"cursor":null,"limit":100});
+    let owners = desktop
+        .ok("thread/attachmentOwner/list", query.clone())
+        .await;
+    assert_eq!(
+        owners,
+        json!({"data":[{"threadId":owner,"archived":false}],"nextCursor":null})
+    );
+    let mut other = query;
+    other["identityKey"] = json!("/repo/other");
+    let none = desktop.ok("thread/attachmentOwner/list", other).await;
+    assert_eq!(none["data"], json!([]));
+}
+
+#[tokio::test]
+async fn desktop_samples_claude_threads_on_their_warm_process() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
     let parent = desktop
@@ -762,7 +792,7 @@ async fn desktop_samples_claude_threads_through_hidden_prediction_forks() {
     desktop
         .send(json!({"id":"hanging-sample","method":"thread/sample","params":hanging}))
         .await;
-    // Give the hidden fork time to start its turn, so cancel interrupts it.
+    // Give the side question time to start, so cancel interrupts it.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let cancel = desktop
         .ok(
@@ -781,10 +811,10 @@ async fn desktop_samples_claude_threads_through_hidden_prediction_forks() {
             .contains("cancelled"),
         "{cancelled}"
     );
-    // The parent stays sampleable once the cancelled fork is released.
+    // The parent stays sampleable after a cancelled question.
     let again = desktop.ok("thread/sample", request).await;
     assert!(again["text"].as_str().unwrap().contains("prediction"));
-    // Sample forks are internal: the desktop never hears about them.
+    // A sample creates no thread, so the desktop hears only about the parent.
     for message in &desktop.history {
         if let Some(thread) = message["params"]["threadId"]
             .as_str()
