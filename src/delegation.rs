@@ -193,6 +193,8 @@ pub fn permissions(snapshot: &Value) -> Result<Value> {
     } else {
         reviewer
     };
+    let cwd = std::path::Path::new(snapshot["cwd"].as_str().context("Missing effective cwd")?)
+        .canonicalize()?;
     let sandbox = &snapshot["sandbox"];
     let sandbox = match sandbox["type"].as_str() {
         Some("dangerFullAccess") => json!({"type":"dangerFullAccess"}),
@@ -206,6 +208,9 @@ pub fn permissions(snapshot: &Value) -> Result<Value> {
                     *root = json!(std::path::Path::new(path).canonicalize()?);
                 }
             }
+            // Both harnesses always grant cwd and omit it from reported roots,
+            // while desktop requests list it explicitly.
+            roots.push(json!(cwd));
             roots.sort_by_key(Value::to_string);
             roots.dedup();
             json!({"type":"workspaceWrite","writableRoots":roots,
@@ -218,8 +223,6 @@ pub fn permissions(snapshot: &Value) -> Result<Value> {
         }
         _ => bail!("Missing or unsupported effective sandbox policy"),
     };
-    let cwd = std::path::Path::new(snapshot["cwd"].as_str().context("Missing effective cwd")?)
-        .canonicalize()?;
     Ok(json!({"cwd":cwd,"approvalPolicy":policy,
         "approvalsReviewer":reviewer,"sandbox":sandbox}))
 }

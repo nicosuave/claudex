@@ -65,6 +65,17 @@ tool callbacks on that path. If permission settings change without a fresh
 native settings report, Codex delegation fails until its settings are refreshed
 between turns. Requests alone are not treated as effective settings.
 
+Codex reports settings only when they change, while the desktop restates every
+turn's settings. Requests are therefore compared with the snapshot after the
+same normalization as the child check: canonical roots, cwd as an implicit
+writable root, and `guardian_subagent` as `auto_review`. A restatement keeps the
+snapshot confirmed; any other difference, or a different permissions profile
+id, waits for the native report.
+
+Child turns are started on behalf of the calling turn, so they carry its id as
+`parentTurnId` and its causal root as `rootTurnId`. Claude turns record that
+root, and are otherwise their own root, as in Codex.
+
 Agent control is scoped to the caller's task tree. Unrelated chats cannot message,
 wait for or interrupt each other's agents through these tools. Maximum depth is
 8; at most 10 delegated agents may be starting or running in one tree.

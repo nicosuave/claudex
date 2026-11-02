@@ -4,7 +4,10 @@ The native Claude backend accepts `thread/fork` with
 `experimentalPredictionMode: true`, `ephemeral: true`, and optional
 `excludeTurns` and `threadSource` fields. The parent must be loaded, persisted,
 and idle. Configuration overrides and history-boundary overrides are rejected.
-ACP agents do not support this mode.
+Desktop 0.165 also sends `experimentalDisablePredictionMcp` and
+`config.thread_unload_delay_secs`; both are accepted and ignored, because the
+fork keeps the parent's native tools for its cache and is discarded after its
+one turn. ACP agents do not support this mode.
 
 A prediction uses Claude's native read-only `side_question` against the parent's
 parked process. That preserves the parent's model, instructions, tools, effort,
@@ -56,6 +59,16 @@ its baseline protocol version and native provider; use the combined router for
 predictions. Plan-mode exclusion, unsupported-model filtering, prediction
 settings, and remote feature configuration retain their existing behavior.
 
+From app-server 0.164, the desktop requests predictions with `thread/sample`
+instead of a fork, and does not fall back. For a Claude thread, the router
+checks that `expectedTurnId` is the parent's latest settled turn, then runs the
+fork transaction above on its own facade connection: one prediction fork, one
+turn with the prompt, and `thread/unsubscribe`. It answers with the turn's final
+text, the source turn and any reported token usage. The fork's events and
+server requests never reach the desktop; its server requests are declined.
+`thread/sample/cancel` interrupts the fork's turn and fails the sample.
+`effort` and `disableMcp` are ignored for the reasons above.
+
 Install or upgrade Claudex normally and reconnect the desktop's app-server
 connection to load the updated router. The ChatGPT app bundle and signature
 are unchanged.
@@ -66,8 +79,9 @@ are unchanged.
 coalescing, cold and stale suppression, prompt limits, cancellation, temporary
 cleanup, parent isolation, and rejection of overrides and unsupported parents.
 `tests/router.rs` covers the compatibility
-provider, its echoed value, preserved thread metadata, and the routed prediction
-fork/turn/unsubscribe transaction.
+provider, its echoed value, preserved thread metadata, the routed prediction
+fork/turn/unsubscribe transaction, and `thread/sample` with stale-source
+rejection, cancellation and hidden fork events.
 
 The native test makes real Claude requests and requires a normal authenticated
 Claude installation:

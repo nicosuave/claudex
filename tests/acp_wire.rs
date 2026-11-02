@@ -16,7 +16,7 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
     static SCHEMAS: OnceLock<HashMap<String, jsonschema::Validator>> = OnceLock::new();
     SCHEMAS.get_or_init(|| {
         let root: Value =
-            serde_json::from_str(include_str!("../protocol/codex-0.160.0.json")).unwrap();
+            serde_json::from_str(include_str!("../protocol/codex-0.166.0.json")).unwrap();
         let mut validators = HashMap::new();
         for name in [
             "ServerNotification",

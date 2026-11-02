@@ -20,13 +20,28 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
             &[
                 "threadId",
                 "experimentalPredictionMode",
+                "experimentalDisablePredictionMcp",
                 "ephemeral",
                 "excludeTurns",
                 "threadSource",
+                "config",
             ],
         )?;
         if object.get("ephemeral") != Some(&json!(true)) {
             return Err(RpcError::invalid("Prediction forks require ephemeral=true"));
+        }
+        // A prediction fork keeps its parent's native tools so it reuses the
+        // parent's prompt cache, and is discarded after its one turn. Codex's
+        // Responses-specific MCP pruning and unload delay do not apply.
+        object.remove("experimentalDisablePredictionMcp");
+        if let Some(config) = object.remove("config").filter(|v| !v.is_null())
+            && config
+                .as_object()
+                .is_none_or(|config| config.keys().any(|key| key != "thread_unload_delay_secs"))
+        {
+            return Err(RpcError::invalid(
+                "Prediction forks keep their parent's configuration",
+            ));
         }
     }
     let mut warnings = Vec::new();
@@ -99,6 +114,7 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
     // Client analytics do not affect Claude execution.
     object.remove("turnTrigger");
     object.remove("responsesapiClientMetadata");
+    object.remove("responsesapiClientMetadataPatch");
     // Deprecated by the pinned protocol: friendly/pragmatic no longer select a style.
     object.remove("personality");
     if object

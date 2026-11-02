@@ -627,12 +627,16 @@ async fn native_shared_delegation() {
         let prompt = format!(
             "Verify cross-harness delegation. Use the claudex_agents MCP tools, not native subagent tools or shell subprocesses. Call spawn_agent with harness={harness}, model={child_model}, name=Native verification, and message=Reply exactly CROSS_HARNESS_CHILD_OK without using other tools. Then call wait_agent on the returned agent_id until it finishes. Finally reply CROSS_HARNESS_PARENT_OK. Do not edit files or run other tools."
         );
-        // Change the review mode on the turn, as the desktop composer does.
+        // Change the review mode on the turn, as the desktop composer does. It
+        // also restates the workspace with cwd as a writable root, which the
+        // native settings report omits and never re-sends while unchanged.
         let reply = desktop
             .call(
                 "turn/start",
                 json!({"threadId":parent,"model":parent_model,
-            "approvalsReviewer":reviewer,
+            "cwd":scratch.path(),"approvalPolicy":"on-request","approvalsReviewer":reviewer,
+            "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[scratch.path()],
+                "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false},
             "input":[{"type":"text","text":prompt,"text_elements":[]}]}),
             )
             .await;
@@ -678,6 +682,10 @@ async fn native_shared_delegation() {
             .ok("thread/read", json!({"threadId":child,"includeTurns":true}))
             .await;
         assert_eq!(child["thread"]["parentThreadId"], parent);
+        // The child's task is attributed to the turn that delegated it.
+        let root = &completed["params"]["turn"]["rootTurnId"];
+        assert!(root.is_string(), "{completed}");
+        assert_eq!(child["thread"]["turns"][0]["rootTurnId"], *root, "{child}");
         let settings = desktop
             .ok("thread/resume", json!({"threadId":child["thread"]["id"]}))
             .await;
@@ -702,6 +710,88 @@ async fn native_shared_delegation() {
         desktop
             .ok("thread/archive", json!({"threadId":parent}))
             .await;
+    }
+}
+
+#[tokio::test]
+async fn desktop_samples_claude_threads_through_hidden_prediction_forks() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let parent = desktop
+        .thread(json!({"model":"fake-claude","sandbox":"danger-full-access"}))
+        .await;
+    assert!(
+        desktop
+            .turn(&parent, "fake-claude", "parent context")
+            .await
+            .get("error")
+            .is_none()
+    );
+    let turn = desktop.completed(&parent).await["params"]["turn"]["id"].clone();
+    let stale = desktop
+        .call(
+            "thread/sample",
+            json!({"threadId":parent,"expectedTurnId":"earlier","prompt":"next?"}),
+        )
+        .await;
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stale"),
+        "{stale}"
+    );
+    // The desktop 0.165 composer request, including Codex-only options.
+    let request = json!({"threadId":parent,"expectedTurnId":turn,"prompt":"next?",
+        "effort":"low","threadSource":"composer_predictions",
+        "turnTrigger":"composer_predictions","disableMcp":true,
+        "responsesapiClientMetadata":{"prediction_trigger":"live"}});
+    let sample = desktop.ok("thread/sample", request.clone()).await;
+    assert_eq!(sample["sourceTurnId"], turn);
+    assert!(sample["responseId"].is_string());
+    let payload: Value = serde_json::from_str(sample["text"].as_str().unwrap()).unwrap();
+    assert!(
+        payload["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("prediction 1")
+    );
+
+    let mut hanging = request.clone();
+    hanging["prompt"] = json!("hang-prediction");
+    desktop
+        .send(json!({"id":"hanging-sample","method":"thread/sample","params":hanging}))
+        .await;
+    // Give the hidden fork time to start its turn, so cancel interrupts it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let cancel = desktop
+        .ok(
+            "thread/sample/cancel",
+            json!({"requestId":"hanging-sample"}),
+        )
+        .await;
+    assert_eq!(cancel, json!({}));
+    let cancelled = desktop
+        .until(|message| message["id"] == "hanging-sample")
+        .await;
+    assert!(
+        cancelled["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"),
+        "{cancelled}"
+    );
+    // The parent stays sampleable once the cancelled fork is released.
+    let again = desktop.ok("thread/sample", request).await;
+    assert!(again["text"].as_str().unwrap().contains("prediction"));
+    // Sample forks are internal: the desktop never hears about them.
+    for message in &desktop.history {
+        if let Some(thread) = message["params"]["threadId"]
+            .as_str()
+            .or_else(|| message["params"]["thread"]["id"].as_str())
+        {
+            assert_eq!(thread, parent, "{message}");
+        }
     }
 }
 
@@ -737,12 +827,15 @@ async fn desktop_prediction_requests_keep_the_claude_provider_and_route_the_temp
         )
         .await;
     assert_eq!(echoed["thread"]["modelProvider"], "anthropic");
+    // Desktop 0.165 adds the MCP pruning flag and an unload delay.
     let fork = desktop
         .ok(
             "thread/fork",
             json!({
                 "threadId":parent,"experimentalPredictionMode":true,"ephemeral":true,
-                "excludeTurns":true,"threadSource":"composer_predictions"
+                "excludeTurns":true,"threadSource":"composer_predictions",
+                "experimentalDisablePredictionMcp":true,
+                "config":{"thread_unload_delay_secs":10}
             }),
         )
         .await;

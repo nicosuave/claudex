@@ -85,6 +85,9 @@ macro_rules! note {
 
 #[path = "router_delegation.rs"]
 mod agents;
+#[path = "router_sample.rs"]
+mod sample;
+use sample::SampleStep;
 
 /// Whether `args` (everything after the codex executable) is the desktop's
 /// stdio app-server launch. Anything else runs genuine Codex unchanged.
@@ -147,6 +150,8 @@ enum Continuation {
     StartDefault { request: Value },
     Merge { merge: u64, side: Side },
     Delegation { side: Side, step: agents::Step },
+    Sample { key: String, step: SampleStep },
+    SampleReleased { fork: String },
 }
 
 enum MergeKind {
@@ -219,6 +224,7 @@ pub struct Router {
     draining: bool,
     redrain: bool,
     agents: agents::State,
+    samples: sample::Samples,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -690,6 +696,7 @@ impl Router {
             draining: false,
             redrain: false,
             agents: agents::State::default(),
+            samples: sample::Samples::default(),
         }
     }
 
@@ -1024,6 +1031,11 @@ impl Router {
                     ),
                 }
             }
+            "thread/sample/cancel" => {
+                if !self.cancel_sample(&message) {
+                    self.forward(Side::Codex, message);
+                }
+            }
             "thread/start" => match selected_model(&params) {
                 Some(model) => match self.is_claude_model(model) {
                     None => {
@@ -1124,6 +1136,10 @@ impl Router {
         }
         if method == "thread/section/move" {
             self.move_to_section(side, message);
+            return;
+        }
+        if side == Side::Claude && method == "thread/sample" {
+            self.start_sample(message);
             return;
         }
         if side == Side::Codex && method == "turn/start" {
@@ -1514,6 +1530,9 @@ impl Router {
         match (method, id) {
             (None, Some(id)) => self.backend_response(side, id, message),
             (Some(_), Some(id)) => {
+                if side == Side::Claude && self.sample_server_request(&message) {
+                    return;
+                }
                 self.learn(side, &message);
                 if self.agent_dynamic_call(side, &message) {
                     return;
@@ -1529,6 +1548,9 @@ impl Router {
                 self.send_client(message);
             }
             (Some(method), None) => {
+                if side == Side::Claude && self.sample_notification(&message) {
+                    return;
+                }
                 let ids = thread_ids(&message);
                 if side == Side::Claude && ids.is_empty() {
                     // Facade-wide plugin events duplicate genuine Codex's own.
@@ -1839,6 +1861,8 @@ impl Router {
             }
             Continuation::Merge { merge, side } => self.merge_part(merge, side, result),
             Continuation::Delegation { side, step } => self.agent_continue(side, step, result),
+            Continuation::Sample { key, step } => self.sample_continue(key, step, result),
+            Continuation::SampleReleased { fork } => self.sample_released(&fork),
         }
     }
 
@@ -1876,11 +1900,15 @@ impl Router {
                 | Some(Continuation::Adopt { .. }) => self.internal.remove(&id).unwrap(),
                 Some(Continuation::Delegation {
                     side: Side::Claude, ..
-                }) => self.internal.remove(&id).unwrap(),
+                })
+                | Some(Continuation::Sample { .. })
+                | Some(Continuation::SampleReleased { .. }) => self.internal.remove(&id).unwrap(),
                 _ => continue,
             };
             self.continue_with(continuation, Err(failure.clone()));
         }
+        // Samples whose turn is running have no pending request to fail.
+        self.fail_samples("The Claude facade disconnected");
         // The facade ends its turns on shutdown, but that notification cannot
         // reach the desktop once the connection is gone, and a crash sends none.
         // Its saved record marks the same turns interrupted when it restarts.

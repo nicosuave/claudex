@@ -392,7 +392,7 @@ async fn prediction_forks_reject_overrides_unloaded_and_temporary_parents() {
         json!({"ephemeral":false}),
         json!({"experimentalPredictionMode":"yes"}),
         json!({"model":"haiku"}),
-        json!({"config":{}}),
+        json!({"config":{"model_reasoning_effort":"high"}}),
         json!({"baseInstructions":"replace parent"}),
         json!({"beforeTurnId":"earlier"}),
         json!({"permissions":":danger-full-access"}),
@@ -741,7 +741,7 @@ async fn injected_context_rejects_unsupported_items_without_partial_mutation() {
 }
 
 fn validate_revert(value: &Value) {
-    let root: Value = serde_json::from_str(include_str!("../protocol/codex-0.160.0.json")).unwrap();
+    let root: Value = serde_json::from_str(include_str!("../protocol/codex-0.166.0.json")).unwrap();
     let mut schema = root["definitions"]["v2"]["ThreadRevertResponse"].clone();
     schema["definitions"] = root["definitions"].clone();
     let validator = jsonschema::validator_for(&schema).unwrap();

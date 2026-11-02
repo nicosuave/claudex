@@ -1019,7 +1019,7 @@ impl Server {
             }
         };
         let turn_id = protocol::id();
-        let turn = protocol::new_turn(&turn_id);
+        let turn = protocol::new_turn(&turn_id, None);
         record.turns.push(turn.clone());
         record.thread["status"] = json!({"type": "active", "activeFlags": []});
         record.touch();
@@ -2554,15 +2554,33 @@ impl Server {
                 "ancestorThreadId",
                 "parentThreadId",
                 "sectionId",
+                "excludedThreadIds",
+                "attachedToThreadId",
             ],
         )?;
-        let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
-            (Some(_), Some(_)) => {
+        let excluded = match &p["excludedThreadIds"] {
+            Value::Null => vec![],
+            Value::Array(ids) if ids.len() <= 100 && ids.iter().all(Value::is_string) => {
+                ids.clone()
+            }
+            _ => {
                 return Err(RpcError::invalid(
-                    "parentThreadId and ancestorThreadId are mutually exclusive",
+                    "excludedThreadIds must list at most 100 thread ids",
                 ));
             }
-            (Some(parent), None) => Some((parent, false)),
+        };
+        let relations = ["parentThreadId", "ancestorThreadId", "attachedToThreadId"];
+        if relations.iter().filter(|key| !p[**key].is_null()).count() > 1 {
+            return Err(RpcError::invalid(
+                "parentThreadId, ancestorThreadId and attachedToThreadId are mutually exclusive",
+            ));
+        }
+        // Claude threads are never forked as attached threads.
+        if !p["attachedToThreadId"].is_null() {
+            return page(vec![], p, true, "threads");
+        }
+        let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
+            (Some(parent), _) => Some((parent, false)),
             (None, Some(ancestor)) => Some((ancestor, true)),
             (None, None) => None,
         };
@@ -2597,6 +2615,7 @@ impl Server {
                 };
                 related
                     && source
+                    && !excluded.contains(&r.thread["id"])
                     && r.archived == p["archived"].as_bool().unwrap_or(false)
                     && !r.ephemeral()
                     && p.get("projectId")
@@ -2907,6 +2926,7 @@ impl Server {
                 "clientUserMessageId",
                 "additionalContext",
                 "responsesapiClientMetadata",
+                "responsesapiClientMetadataPatch",
             ],
         )?;
         let id = required_str(p, "threadId")?;
@@ -3161,6 +3181,8 @@ impl Server {
                 "additionalContext",
                 "environmentOverrides",
                 "disabledPluginIds",
+                "parentTurnId",
+                "rootTurnId",
             ],
         )?;
         let id = required_str(p, "threadId")?;
@@ -3295,7 +3317,8 @@ impl Server {
             }
         }
         let turn_id = protocol::id();
-        let turn = protocol::new_turn(&turn_id);
+        // `parentTurnId` is provenance only; the root is what turns record.
+        let turn = protocol::new_turn(&turn_id, p["rootTurnId"].as_str());
         // As in Codex, a compaction turn has no user message.
         let item = (!compaction).then(|| json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input}));
         if record.thread["preview"] == "" {
@@ -3951,10 +3974,19 @@ impl Server {
             self.subscribe(client, &thread);
         }
         self.loaded.insert(thread.clone());
+        let root_turn = self.active.get(root).and_then(|active| {
+            self.records
+                .get(root)?
+                .turns
+                .iter()
+                .find(|turn| turn["id"] == active.id.as_str())?["rootTurnId"]
+                .as_str()
+                .map(str::to_owned)
+        });
         let Some(record) = self.records.get_mut(&thread) else {
             return;
         };
-        let (turn, item) = crate::subagents::new_turn(record, prompt);
+        let (turn, item) = crate::subagents::new_turn(record, prompt, root_turn.as_deref());
         let turn_id = turn["id"].as_str().unwrap().to_owned();
         let child_turn = crate::subagents::child_turn(&thread, &turn_id, record);
         self.persist(&thread);

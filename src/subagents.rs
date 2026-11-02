@@ -168,9 +168,15 @@ pub fn source_matches(record: &Record, kind: &str) -> bool {
     own == kind || (kind == "subAgent" && own == "subAgentThreadSpawn")
 }
 
-pub fn new_turn(record: &mut Record, prompt: Option<&str>) -> (Value, Option<Value>) {
+/// A child turn does work on behalf of the calling turn, so it shares that
+/// turn's causal root.
+pub fn new_turn(
+    record: &mut Record,
+    prompt: Option<&str>,
+    root_turn_id: Option<&str>,
+) -> (Value, Option<Value>) {
     let turn_id = protocol::id();
-    let turn = protocol::new_turn(&turn_id);
+    let turn = protocol::new_turn(&turn_id, root_turn_id);
     record.turns.push(turn.clone());
     record.thread["status"] = json!({"type": "active", "activeFlags": []});
     let item = prompt.filter(|p| !p.is_empty()).map(|prompt| {

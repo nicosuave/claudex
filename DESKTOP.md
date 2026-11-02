@@ -291,7 +291,8 @@ seconds, the service logs a warning and keeps the minimal PATH.
 
 ## Verification and limitations
 
-The protocol is pinned to Codex CLI 0.160.0. It is a supported subset, not complete
+Requests are validated against the Codex CLI 0.166.0 schema, and the facade
+advertises the 0.160.0 feature level. It is a supported subset, not complete
 feature parity. See [COMPATIBILITY.md](COMPATIBILITY.md) and the
 [desktop integration audit](docs/desktop-integration-audit.md). Native desktop
 pixels/menu interaction have not been automatically verified. Transport/RPC

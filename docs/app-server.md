@@ -188,8 +188,13 @@ Primary references:
 - [Claude Agent SDK subprocess implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
 
 The checked-in schema was generated with
-`codex app-server generate-json-schema --experimental` from Codex CLI 0.160.0,
+`codex app-server generate-json-schema --experimental` from Codex CLI 0.166.0,
 rather than fetched from a moving branch. See [NOTICE](../NOTICE) for attribution.
+The facade still advertises 0.160.0 in `initialize`: the desktop enables
+features by app-server version, and the facade does not serve several later
+additions, such as `thread/sample`, attached threads and memory summaries. The
+router advertises genuine Codex's version and serves `thread/sample` for Claude
+threads itself.
 
 CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
 [releasing](releasing.md) for the tagged Linux workflow, local macOS signing,
