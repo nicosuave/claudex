@@ -1161,8 +1161,33 @@ fn genuine_codex() -> Result<PathBuf> {
 }
 
 async fn check_claude(claude: &Path) -> Result<()> {
-    let help = run(claude.as_os_str(), &["--help".into()]).await?;
-    if !String::from_utf8_lossy(&help).contains("--system-prompt-snapshot") {
+    // Claude can exit before its long help text drains into a pipe, which
+    // truncated it during installs over SSH. A file receives all of it.
+    let path = std::env::temp_dir().join(format!("claudex-claude-help-{}", uuid::Uuid::new_v4()));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(claude)
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    let help = fs::read_to_string(&path);
+    let _ = fs::remove_file(&path);
+    let status = status
+        .with_context(|| format!("{} --help timed out", claude.display()))?
+        .with_context(|| format!("run {}", claude.display()))?;
+    if !status.success() {
+        bail!("{} --help failed", claude.display());
+    }
+    if !help?.contains("--system-prompt-snapshot") {
         bail!("Update Claude Code: this build requires --system-prompt-snapshot support");
     }
     Ok(())
@@ -1407,6 +1432,25 @@ mod tests {
         assert_eq!(install.selected_auth_session().unwrap(), AuthSession::Login);
         install.auth_session = None;
         assert!(install.selected_auth_session().is_err());
+    }
+
+    #[tokio::test]
+    async fn claude_check_reads_its_whole_help_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude = temp.path().join("claude");
+        // The supported option is listed far past a pipe's first buffer.
+        let padding = "x".repeat(200_000);
+        for (help, supported) in [
+            (
+                format!("{padding}\n  --system-prompt-snapshot <on|off>"),
+                true,
+            ),
+            (padding.clone(), false),
+        ] {
+            fs::write(&claude, format!("#!/bin/sh\nprintf '%s\\n' '{help}'\n")).unwrap();
+            fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(check_claude(&claude).await.is_ok(), supported);
+        }
     }
 
     #[tokio::test]
