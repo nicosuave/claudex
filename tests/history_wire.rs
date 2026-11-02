@@ -856,7 +856,14 @@ async fn reverted_prefix_survives_restart_and_rollback_can_clear_everything() {
     let page = peer.ok("thread/turns/list", json!({"threadId":thread,"cursor":response["turnsBackwardsCursor"],"sortDirection":"desc"})).await;
     assert_eq!(page["data"][0]["id"], first["id"]);
     let recovered = record(state.path(), &thread);
-    assert_eq!(recovered["turns"], json!([first]));
+    // The record keeps item times apart from its stored items.
+    let mut stored = first.clone();
+    for item in stored["items"].as_array_mut().unwrap() {
+        let item = item.as_object_mut().unwrap();
+        item.remove("startedAtMs");
+        item.remove("completedAtMs");
+    }
+    assert_eq!(recovered["turns"], json!([stored]));
     assert_eq!(recovered["turn_anchors"].as_object().unwrap().len(), 1);
     assert_eq!(recovered["has_session"], false);
     assert_ne!(recovered["session_id"], before["session_id"]);
