@@ -1396,10 +1396,12 @@ async fn manual_compaction_runs_claude_compact_as_its_own_turn() {
     );
     let completed = client.completed(&turn).await;
     assert_eq!(completed["status"], "completed");
-    assert_eq!(
-        completed["items"],
-        json!([{"type":"contextCompaction","id":started["params"]["item"]["id"]}])
-    );
+    let items = completed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "contextCompaction");
+    assert_eq!(items[0]["id"], started["params"]["item"]["id"]);
+    // As in Codex 0.166, the completed item carries its recorded times.
+    assert!(items[0]["startedAtMs"].is_u64() && items[0]["completedAtMs"].is_u64());
     let lifecycle: Vec<_> = client
         .history
         .iter()
