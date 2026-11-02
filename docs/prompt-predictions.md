@@ -4,7 +4,10 @@ The native Claude backend accepts `thread/fork` with
 `experimentalPredictionMode: true`, `ephemeral: true`, and optional
 `excludeTurns` and `threadSource` fields. The parent must be loaded, persisted,
 and idle. Configuration overrides and history-boundary overrides are rejected.
-ACP agents do not support this mode.
+Desktop 0.165 also sends `experimentalDisablePredictionMcp` and
+`config.thread_unload_delay_secs`; both are accepted and ignored, because the
+fork keeps the parent's native tools for its cache and is discarded after its
+one turn. ACP agents do not support this mode.
 
 A prediction uses Claude's native read-only `side_question` against the parent's
 parked process. That preserves the parent's model, instructions, tools, effort,
@@ -52,9 +55,23 @@ capability keep their provider unchanged.
 
 The router uses genuine Codex's initialization/version response, so its desktop
 version gate reflects the installed Codex executable. The direct facade keeps
-its baseline protocol version and native provider; use the combined router for
-predictions. Plan-mode exclusion, unsupported-model filtering, prediction
-settings, and remote feature configuration retain their existing behavior.
+its native provider; use the combined router for predictions. Plan-mode
+exclusion, unsupported-model filtering, prediction settings, and remote feature
+configuration retain their existing behavior.
+
+From app-server 0.164, the desktop requests predictions with `thread/sample`
+instead of a fork, and does not fall back. The facade serves it directly: it
+checks that `expectedTurnId` is the loaded parent's latest settled turn, then
+asks the same read-only `side_question` on the parent's warm process, under the
+same eligibility rules. It answers with the question's text, or `null` text when
+the parent is not eligible, which the desktop treats as no prediction. No
+thread is created. `thread/sample/cancel` cancels only the side question, and a
+new parent turn cancels running samples. `effort` and `disableMcp` are ignored
+for the reasons above, and usage is unknown.
+
+The desktop's title refresh uses a prediction fork whose turn carries
+`outputSchema`. Such a turn asks the side question for a JSON value matching the
+schema and answers with that value; the desktop validates it against its schema.
 
 Install or upgrade Claudex normally and reconnect the desktop's app-server
 connection to load the updated router. The ChatGPT app bundle and signature
@@ -66,8 +83,10 @@ are unchanged.
 coalescing, cold and stale suppression, prompt limits, cancellation, temporary
 cleanup, parent isolation, and rejection of overrides and unsupported parents.
 `tests/router.rs` covers the compatibility
-provider, its echoed value, preserved thread metadata, and the routed prediction
-fork/turn/unsubscribe transaction.
+provider, its echoed value, preserved thread metadata, the routed prediction
+fork/turn/unsubscribe transaction, and `thread/sample` with stale-source
+rejection and cancellation. `tests/history_wire.rs` also covers structured
+prediction turns.
 
 The native test makes real Claude requests and requires a normal authenticated
 Claude installation:

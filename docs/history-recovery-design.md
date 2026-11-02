@@ -36,7 +36,7 @@ recovery by changing only its displayed turns.
 
 ## Evidence
 
-- `protocol/codex-0.160.0.json`, `ThreadForkParams`: `beforeTurnId` excludes its
+- `protocol/codex-0.166.0.json`, `ThreadForkParams`: `beforeTurnId` excludes its
   turn; `lastTurnId` includes its turn, cannot be combined with `beforeTurnId`,
   and cannot target an in-progress turn.
 - Same schema, `ThreadRevertParams` and `ThreadRevertResponse`: revert replaces

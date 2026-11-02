@@ -153,6 +153,7 @@ enum MergeKind {
     Models,
     Threads { search: bool },
     Loaded,
+    Owners,
 }
 
 struct Merge {
@@ -164,6 +165,8 @@ struct Merge {
     codex: Option<Result<Value, Value>>,
     codex_pages: Vec<Value>,
     claude: Vec<Value>,
+    /// Read receipts reported with the Claude pages, by thread id.
+    claude_read_states: serde_json::Map<String, Value>,
     claude_done: bool,
 }
 
@@ -592,6 +595,12 @@ fn encode_cursor(codex: &Value, boundary: Option<i64>) -> String {
     )
 }
 
+/// Every Claude owner, independent of the desktop's Codex-driven page.
+fn claude_owner_query(params: &Value, cursor: Option<Value>) -> Value {
+    json!({"attachmentType":params["attachmentType"],"identityKey":params["identityKey"],
+        "archived":params["archived"],"limit":1000,"cursor":cursor})
+}
+
 /// Router cursors carry Codex's cursor and the sort value where the previous
 /// page ended. Foreign cursors are passed to Codex unchanged.
 fn decode_cursor(cursor: &Value) -> (Value, Option<i64>) {
@@ -1002,6 +1011,9 @@ impl Router {
             "thread/loaded/list" if self.claude_available() => {
                 self.start_merge(id, MergeKind::Loaded, params);
             }
+            "thread/attachmentOwner/list" if self.claude_available() => {
+                self.start_merge(id, MergeKind::Owners, params);
+            }
             "thread/list" | "thread/search" if self.claude_available() => {
                 let related = params["parentThreadId"]
                     .as_str()
@@ -1023,6 +1035,16 @@ impl Router {
                         params,
                     ),
                 }
+            }
+            "thread/sample/cancel" => {
+                // A cancel names only the sample's request id, which tells
+                // which backend received that sample.
+                let claude = self
+                    .forwarded
+                    .get(&(Side::Claude, id_key(&params["requestId"])))
+                    .is_some_and(|forwarded| forwarded.method == "thread/sample");
+                let side = if claude { Side::Claude } else { Side::Codex };
+                self.forward(side, message);
             }
             "thread/start" => match selected_model(&params) {
                 Some(model) => match self.is_claude_model(model) {
@@ -1251,6 +1273,7 @@ impl Router {
         let codex_method = match kind {
             MergeKind::Models => "model/list",
             MergeKind::Loaded => "thread/loaded/list",
+            MergeKind::Owners => "thread/attachmentOwner/list",
             MergeKind::Threads { search: true } => "thread/search",
             MergeKind::Threads { search: false } => "thread/list",
         };
@@ -1282,6 +1305,18 @@ impl Router {
                 );
                 false
             }
+            MergeKind::Owners => {
+                self.internal_request(
+                    Side::Claude,
+                    "thread/attachmentOwner/list",
+                    claude_owner_query(&params, None),
+                    Continuation::Merge {
+                        merge,
+                        side: Side::Claude,
+                    },
+                );
+                false
+            }
             MergeKind::Threads { .. } => {
                 let query = claude_list_query(&params, None);
                 self.internal_request(
@@ -1306,6 +1341,7 @@ impl Router {
                 codex: None,
                 codex_pages: vec![],
                 claude: vec![],
+                claude_read_states: serde_json::Map::new(),
                 claude_done,
             },
         );
@@ -1339,6 +1375,9 @@ impl Router {
                 state
                     .claude
                     .extend(page["data"].as_array().cloned().unwrap_or_default());
+                if let Some(read_states) = page["readStates"].as_object() {
+                    state.claude_read_states.extend(read_states.clone());
+                }
                 match page["nextCursor"].as_str() {
                     Some(cursor) => {
                         let cursor = json!(cursor);
@@ -1346,6 +1385,10 @@ impl Router {
                             MergeKind::Loaded => (
                                 "thread/loaded/list",
                                 json!({"limit": 1000, "cursor": cursor}),
+                            ),
+                            MergeKind::Owners => (
+                                "thread/attachmentOwner/list",
+                                claude_owner_query(&state.params, Some(cursor)),
                             ),
                             _ => (
                                 "thread/list",
@@ -1410,6 +1453,19 @@ impl Router {
                     data.extend(state.claude);
                     let mut seen = HashSet::new();
                     data.retain(|id| seen.insert(id.to_string()));
+                }
+            }
+            MergeKind::Owners => {
+                for owner in &state.claude {
+                    if let Some(id) = owner["threadId"].as_str() {
+                        self.threads.insert(id.to_owned(), Side::Claude);
+                    }
+                }
+                // Claude's owners follow Codex's, like other combined lists.
+                if last_page && let Some(data) = result["data"].as_array_mut() {
+                    data.extend(state.claude);
+                    let mut seen = HashSet::new();
+                    data.retain(|owner| seen.insert(owner["threadId"].to_string()));
                 }
             }
             MergeKind::Threads { .. } => {
@@ -1487,6 +1543,22 @@ impl Router {
                         let value = sort_value(item, field);
                         if descending { -value } else { value }
                     });
+                }
+                // Receipts come from each thread's own backend, for this page's
+                // threads only. Null still means Codex's receipts are unavailable.
+                if !state.claude_read_states.is_empty() || result["readStates"].is_object() {
+                    let mut read_states = result["readStates"]
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default();
+                    for thread in &merged {
+                        if let Some(id) = list_thread(thread)["id"].as_str()
+                            && let Some(read_state) = state.claude_read_states.get(id)
+                        {
+                            read_states.insert(id.to_owned(), read_state.clone());
+                        }
+                    }
+                    result["readStates"] = json!(read_states);
                 }
                 result["data"] = json!(merged);
                 self.decorate_agent_listing(&state.params, &mut result);

@@ -17,7 +17,7 @@ per-turn processes. See `cli/structuredIO.ts` and
 ## Native question picker contract
 
 The installed desktop bundle supports `item/tool/requestOptionPicker` despite its
-absence from the vendored Codex 0.160.0 schema. This is a desktop extension, not a
+absence from the vendored Codex 0.166.0 schema. This is a desktop extension, not a
 claim about all app-server clients. The inspected bundle was
 `/Applications/ChatGPT.app/Contents/Resources/app.asar`:
 

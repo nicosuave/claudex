@@ -36,6 +36,8 @@ enum Reply {
 struct Call {
     parent: String,
     parent_turn: String,
+    /// The causal root of `parent_turn`, which child turns are attributed to.
+    parent_root: String,
     side: Side,
     name: String,
     arguments: Value,
@@ -104,6 +106,8 @@ pub(super) struct State {
     stale_snapshots: HashSet<String>,
     bridges: HashMap<String, Bridge>,
     active: HashMap<String, String>,
+    /// Root turn ids of the `active` turns that reported one.
+    roots: HashMap<String, String>,
     pending: HashMap<String, Call>,
     early: Vec<EarlyCall>,
     owned: HashSet<String>,
@@ -346,11 +350,20 @@ impl Router {
         } else {
             120_000
         };
+        let parent_turn = self.agents.active[&parent].clone();
+        // A turn without a reported root (older backends) is its own root.
+        let parent_root = self
+            .agents
+            .roots
+            .get(&parent)
+            .cloned()
+            .unwrap_or_else(|| parent_turn.clone());
         self.agents.pending.insert(
             id.clone(),
             Call {
                 parent: parent.clone(),
-                parent_turn: self.agents.active[&parent].clone(),
+                parent_turn,
+                parent_root,
                 side,
                 name: name.clone(),
                 arguments: arguments.clone(),
@@ -685,11 +698,12 @@ impl Router {
                     return;
                 };
                 pending.child = Some(child.clone());
-                let input = text_input(pending.arguments["message"].as_str().unwrap());
+                let params =
+                    pending.child_turn(&child, pending.arguments["message"].as_str().unwrap());
                 self.agent_request(
                     side,
                     "turn/start",
-                    json!({"threadId":child,"input":input}),
+                    params,
                     Step::TurnStarted { call, child },
                 );
             }
@@ -750,11 +764,12 @@ impl Router {
                 agent.report = None;
                 agent.turn_id = None;
                 agent.owner_pid = std::process::id();
+                let params = pending.child_turn(&child, &messages.join("\n\n"));
                 self.agents.owned.insert(child.clone());
                 self.agent_request(
                     side,
                     "turn/start",
-                    json!({"threadId":child,"input":text_input(&messages.join("\n\n"))}),
+                    params,
                     Step::TurnStarted { call, child },
                 );
             }
@@ -885,6 +900,10 @@ impl Router {
             Some("turn/started") => {
                 if let Some(turn) = p["turn"]["id"].as_str() {
                     self.agents.active.insert(thread.into(), turn.into());
+                    match p["turn"]["rootTurnId"].as_str() {
+                        Some(root) => self.agents.roots.insert(thread.into(), root.into()),
+                        None => self.agents.roots.remove(thread),
+                    };
                     let (ready, waiting) = std::mem::take(&mut self.agents.early)
                         .into_iter()
                         .partition(|call| call.parent == thread);
@@ -916,6 +935,7 @@ impl Router {
                     .is_some_and(|turn| p["turn"]["id"] == *turn)
                 {
                     self.agents.active.remove(thread);
+                    self.agents.roots.remove(thread);
                 }
                 if self.agents.registry.agents.contains_key(thread) {
                     let status = match p["turn"]["status"].as_str() {
@@ -1055,7 +1075,12 @@ impl Router {
         // Backend relation indexes cannot traverse another harness. The shared
         // registry supplies those edges while native indexes retain native ones.
         for agent in self.agents.registry.agents.values() {
-            if parent.is_some_and(|parent| agent.parent != parent)
+            // Delegated children are ordinary threads, never attached ones.
+            if !params["attachedToThreadId"].is_null()
+                || params["excludedThreadIds"]
+                    .as_array()
+                    .is_some_and(|ids| ids.contains(&json!(agent.id)))
+                || parent.is_some_and(|parent| agent.parent != parent)
                 || ancestor
                     .is_some_and(|ancestor| !self.agents.registry.related(agent, ancestor, true))
                 || agent.archived != params["archived"].as_bool().unwrap_or(false)
@@ -1323,6 +1348,10 @@ impl Router {
     /// Rejoining an active Codex parent can invalidate its tool callbacks. Use
     /// the native snapshot only while its permission settings remain unchanged;
     /// never synthesize effective permissions from requested ones.
+    ///
+    /// Codex reports settings only when they change, so a request that restates
+    /// the effective permissions in another form must not invalidate them: the
+    /// desktop resends every turn's settings, including cwd as a writable root.
     pub(super) fn invalidate_agent_snapshot(&mut self, message: &Value) {
         let p = &message["params"];
         let Some(thread) = p["threadId"].as_str() else {
@@ -1337,24 +1366,26 @@ impl Router {
         let Some(snapshot) = self.agents.snapshots.get(thread) else {
             return;
         };
-        for field in [
-            "cwd",
-            "approvalPolicy",
-            "approvalsReviewer",
-            "sandboxPolicy",
-            "permissions",
-            "sandbox",
+        let mut requested = snapshot.clone();
+        for (field, saved) in [
+            ("cwd", "cwd"),
+            ("approvalPolicy", "approvalPolicy"),
+            ("approvalsReviewer", "approvalsReviewer"),
+            ("sandboxPolicy", "sandbox"),
         ] {
             if let Some(value) = p.get(field).filter(|v| !v.is_null()) {
-                let saved = if field == "sandboxPolicy" {
-                    &snapshot["sandbox"]
-                } else {
-                    &snapshot[field]
-                };
-                if value != saved {
-                    self.agents.stale_snapshots.insert(thread.into());
-                }
+                requested[saved] = value.clone();
             }
+        }
+        // A profile selection resolves natively; only its id can be compared.
+        let profile_changed = p
+            .get("permissions")
+            .filter(|v| !v.is_null())
+            .is_some_and(|profile| *profile != snapshot["activePermissionProfile"]["id"]);
+        if profile_changed
+            || delegation::permissions(&requested).ok() != delegation::permissions(snapshot).ok()
+        {
+            self.agents.stale_snapshots.insert(thread.into());
         }
     }
 
@@ -1381,6 +1412,15 @@ impl Router {
 
 fn text_input(text: &str) -> Value {
     json!([{"type":"text","text":text,"text_elements":[]}])
+}
+
+impl Call {
+    /// A child task is work started on behalf of the calling turn in another
+    /// thread, which the native turn lineage records.
+    fn child_turn(&self, child: &str, text: &str) -> Value {
+        json!({"threadId":child,"input":text_input(text),
+            "parentTurnId":self.parent_turn,"rootTurnId":self.parent_root})
+    }
 }
 
 pub(super) fn shared_listing(params: &Value) -> bool {
@@ -1520,6 +1560,40 @@ mod tests {
                 "user"
             );
         }
+    }
+
+    #[test]
+    fn restated_desktop_permissions_keep_the_native_snapshot_confirmed() {
+        let (client, _client_rx) = mpsc::channel(32);
+        let (codex, _codex_rx) = mpsc::channel(32);
+        let mut router = Router::new(client, codex, None, true);
+        let cwd = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let (cwd, extra) = (cwd.path().to_str().unwrap(), extra.path().to_str().unwrap());
+        // Codex reports writable roots without the implicit cwd.
+        router.remember_agent_snapshot(&json!({"thread":{"id":"parent"},"cwd":cwd,
+            "approvalPolicy":"on-request","approvalsReviewer":"auto_review",
+            "activePermissionProfile":null,"sandbox":{"type":"workspaceWrite",
+            "writableRoots":[extra],"networkAccess":true,
+            "excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}));
+        // The desktop resends each turn's settings with cwd as a writable root.
+        let mut desktop = json!({"method":"turn/start","params":{"threadId":"parent",
+            "cwd":cwd,"approvalPolicy":"on-request","approvalsReviewer":"guardian_subagent",
+            "permissions":null,"sandboxPolicy":{"type":"workspaceWrite",
+            "writableRoots":[cwd,extra],"networkAccess":true,
+            "excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}});
+        router.invalidate_agent_snapshot(&desktop);
+        assert!(!router.agents.stale_snapshots.contains("parent"));
+        // Native settings are reported only on change, so a real change must
+        // still wait for that report.
+        desktop["params"]["sandboxPolicy"]["writableRoots"] = json!([cwd]);
+        router.invalidate_agent_snapshot(&desktop);
+        assert!(router.agents.stale_snapshots.contains("parent"));
+        router.agents.stale_snapshots.clear();
+        desktop["params"]["sandboxPolicy"]["writableRoots"] = json!([cwd, extra]);
+        desktop["params"]["permissions"] = json!(":workspace");
+        router.invalidate_agent_snapshot(&desktop);
+        assert!(router.agents.stale_snapshots.contains("parent"));
     }
 
     #[test]

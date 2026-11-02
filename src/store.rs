@@ -241,6 +241,20 @@ pub struct Record {
     /// Order within `thread.section`; lower positions list first.
     #[serde(default)]
     pub section_position: Option<i64>,
+    /// Codex's durable read receipt: `None` is read, and an empty turn id
+    /// marks the whole thread unread.
+    #[serde(default)]
+    pub first_unread_turn: Option<String>,
+    /// Guards read-state edits against results the editor has not seen.
+    #[serde(default)]
+    pub read_revision: Option<String>,
+    /// The last terminal result published as needing attention.
+    #[serde(default)]
+    pub last_published_turn: Option<String>,
+    /// The source of a persistent side chat (`thread/fork` `attachToSource`),
+    /// which ordinary listings hide.
+    #[serde(default)]
+    pub attached_to: Option<String>,
 }
 
 impl Record {
@@ -293,6 +307,10 @@ impl Record {
             approved_actions: vec![],
             pending_context: vec![],
             section_position: None,
+            first_unread_turn: None,
+            read_revision: None,
+            last_published_turn: None,
+            attached_to: None,
         }
     }
     pub fn id(&self) -> &str {
@@ -356,10 +374,26 @@ impl Record {
     pub fn ephemeral(&self) -> bool {
         self.thread["ephemeral"].as_bool().unwrap_or(false)
     }
+    /// The turns with each item's recorded lifecycle times.
+    pub fn timed_turns(&self) -> Vec<Value> {
+        self.turns
+            .iter()
+            .map(|turn| self.timed_turn(turn))
+            .collect()
+    }
+    pub fn timed_turn(&self, turn: &Value) -> Value {
+        let mut turn = turn.clone();
+        if let Some(items) = turn["items"].as_array_mut() {
+            for item in items {
+                *item = self.timed_item(item);
+            }
+        }
+        turn
+    }
     pub fn view(&self, include_turns: bool, loaded: bool) -> Value {
         let mut thread = self.thread.clone();
         thread["turns"] = if include_turns {
-            json!(self.turns)
+            json!(self.timed_turns())
         } else {
             json!([])
         };
@@ -443,6 +477,65 @@ impl Record {
             response["itemsBackwardsCursor"] = Value::Null;
         }
         response
+    }
+    /// As in Codex, only durable user threads have read state; subagent and
+    /// other-source threads have no notification policy to apply.
+    pub fn read_state(&self) -> Option<Value> {
+        let user = matches!(self.thread["threadSource"].as_str(), None | Some("user"));
+        if self.ephemeral() || crate::subagents::is_child(self) || !user {
+            return None;
+        }
+        let first_unread = self.first_unread_turn.as_deref().map(|turn| match turn {
+            "" => json!({"type": "threadStart"}),
+            turn => json!({"type": "turn", "turnId": turn}),
+        });
+        // An unedited thread's revision is bound to it, so it cannot edit another.
+        let revision = self
+            .read_revision
+            .clone()
+            .unwrap_or_else(|| format!("initial:{}", self.id()));
+        Some(json!({"firstUnread": first_unread, "revision": revision}))
+    }
+    /// Marks a newly delivered terminal result as needing attention, once.
+    /// Every new result changes the revision, so older acknowledgements fail.
+    pub fn publish_attention(&mut self, turn_id: &str) -> bool {
+        if self.read_state().is_none() || self.last_published_turn.as_deref() == Some(turn_id) {
+            return false;
+        }
+        self.first_unread_turn
+            .get_or_insert_with(|| turn_id.to_owned());
+        self.read_revision = Some(uuid::Uuid::new_v4().to_string());
+        self.last_published_turn = Some(turn_id.to_owned());
+        true
+    }
+    /// Applies a read or unread mark made against `expected_revision`. A stale
+    /// edit returns the current state and is never retried.
+    pub fn mark_read_state(
+        &mut self,
+        expected_revision: &str,
+        unread: bool,
+    ) -> Result<Value, Value> {
+        let current = self.read_state().ok_or(Value::Null)?;
+        if current["revision"] != expected_revision {
+            return Err(current);
+        }
+        self.first_unread_turn = unread.then(String::new);
+        self.read_revision = Some(uuid::Uuid::new_v4().to_string());
+        Ok(self.read_state().unwrap())
+    }
+    /// As in Codex 0.166, an item carries its recorded lifecycle times.
+    pub fn timed_item(&self, item: &Value) -> Value {
+        let mut item = item.clone();
+        let times = item["id"].as_str().and_then(|id| self.item_times.get(id));
+        item["startedAtMs"] = json!(times.map(|t| t.0));
+        item["completedAtMs"] = json!(times.and_then(|t| t.1));
+        item
+    }
+    /// A `ThreadItemEntry`: the timed item and its turn.
+    pub fn item_entry(&self, turn_id: &Value, item: &Value) -> Value {
+        let item = self.timed_item(item);
+        json!({"turnId": turn_id, "startedAtMs": item["startedAtMs"],
+            "completedAtMs": item["completedAtMs"], "item": item})
     }
     pub fn update_item(&mut self, item: Value, completed: bool) {
         let Some(turn) = self.turns.last_mut() else {

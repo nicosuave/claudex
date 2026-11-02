@@ -171,6 +171,10 @@ struct ActiveTurn {
     cancel: CancellationToken,
 }
 
+/// Running `thread/sample` requests by (client, request id), with their
+/// source thread.
+type Samples = Arc<Mutex<HashMap<(u64, String), (String, CancellationToken)>>>;
+
 struct Pending {
     owner: Option<u64>,
     request: Value,
@@ -252,6 +256,9 @@ pub struct Server {
     /// model/list requests waiting for the catalog probe.
     catalog_waiters: Vec<(u64, Value, Value)>,
     events: mpsc::Sender<Event>,
+    /// Running `thread/sample` requests. A request is answered by whoever
+    /// removes its entry.
+    samples: Samples,
 }
 
 impl Server {
@@ -288,6 +295,7 @@ impl Server {
             closing: HashMap::new(),
             catalog_waiters: Vec::new(),
             events,
+            samples: Arc::default(),
         })
     }
 
@@ -869,14 +877,22 @@ impl Server {
     fn prediction_client(&self, record: &Record) -> Option<crate::backend::PredictionClient> {
         let parent_id = record.thread["forkedFromId"].as_str()?;
         let parent = self.records.get(parent_id)?;
-        if parent.archived
-            || self.active.contains_key(parent_id)
-            || record.fork_from.as_deref() != Some(parent.session_id.as_str())
+        if record.fork_from.as_deref() != Some(parent.session_id.as_str())
             || record.backend_message_id != parent.backend_message_id
             || !changed_settings(&record.settings, &parent.settings)
                 .ok()?
                 .is_empty()
         {
+            return None;
+        }
+        self.warm_question_client(parent)
+    }
+
+    /// A read-only question client on the parent's parked process, only while
+    /// its cached prefix is warm and small enough to reuse.
+    fn warm_question_client(&self, parent: &Record) -> Option<crate::backend::PredictionClient> {
+        let parent_id = parent.id();
+        if parent.archived || self.active.contains_key(parent_id) {
             return None;
         }
         // Cache TTL starts when the API request starts, not when output ends.
@@ -907,6 +923,11 @@ impl Server {
     }
 
     fn cancel_predictions(&mut self, parent: &str) {
+        for (thread, cancel) in self.samples.lock().unwrap().values() {
+            if thread == parent {
+                cancel.cancel();
+            }
+        }
         for active in self
             .active
             .values_mut()
@@ -934,6 +955,7 @@ impl Server {
         let worker = if record.prediction_mode {
             tokio::spawn(run_prediction(PredictionTurn {
                 client: self.prediction_client(record),
+                output_schema: turn.output_schema,
                 thread_id: id.clone(),
                 turn_id: turn.turn_id.clone(),
                 session_id: record.session_id.clone(),
@@ -1019,7 +1041,7 @@ impl Server {
             }
         };
         let turn_id = protocol::id();
-        let turn = protocol::new_turn(&turn_id);
+        let turn = protocol::new_turn(&turn_id, None);
         record.turns.push(turn.clone());
         record.thread["status"] = json!({"type": "active", "activeFlags": []});
         record.touch();
@@ -1040,6 +1062,7 @@ impl Server {
             &record,
             LaunchedTurn {
                 turn_id,
+                output_schema: None,
                 options,
                 warm: Some(session),
                 launch_key: Some(key),
@@ -1424,21 +1447,25 @@ impl Server {
                     });
                     return Ok(None);
                 }
-                if !p["threadId"].is_null() && method != "mcpServer/resource/read" {
-                    return Err(RpcError::invalid(
-                        "This Codex plugin operation does not support facade thread identifiers",
-                    ));
-                }
-                if method == "mcpServer/resource/read" && !p["threadId"].is_null() {
-                    self.record(required_str(p, "threadId")?)?;
+                let mut params = p.clone();
+                // Genuine Codex does not know facade threads. As in Codex, a
+                // thread's hooks are those of its working directory; the
+                // shared Codex process otherwise answers with its own config.
+                if !p["threadId"].is_null() {
+                    let cwd = self
+                        .record(required_str(p, "threadId")?)?
+                        .settings
+                        .cwd
+                        .clone();
+                    params.as_object_mut().unwrap().remove("threadId");
+                    if method == "hooks/list" && params["cwds"].as_array().is_none_or(Vec::is_empty)
+                    {
+                        params["cwds"] = json!([cwd]);
+                    }
                 }
                 let output = self.connections[&client].output.clone();
                 let rpc_id = rpc_id.clone();
                 let method = method.to_owned();
-                let mut params = p.clone();
-                if method == "mcpServer/resource/read" {
-                    params.as_object_mut().unwrap().remove("threadId");
-                }
                 let manager = self.plugin_manager.clone();
                 let events = self.events.clone();
                 tokio::spawn(async move {
@@ -1678,10 +1705,18 @@ impl Server {
                         "environmentOverrides",
                         "baseInstructions",
                         "developerInstructions",
+                        "attachToSource",
                     ],
                 )?;
                 let source_id = required_str(p, "threadId")?;
                 let prediction_mode = p["experimentalPredictionMode"] == true;
+                // As in Codex: a persistent side chat of a paginated source.
+                let attach = p["attachToSource"] == true;
+                if attach && (p["ephemeral"] == true || prediction_mode) {
+                    return Err(RpcError::invalid(
+                        "Attached forks are persistent and cannot be ephemeral",
+                    ));
+                }
                 if prediction_mode {
                     if self.acp() {
                         return Err(RpcError::invalid(
@@ -1746,7 +1781,13 @@ impl Server {
                     p,
                     &self.connections[&client].originator,
                 );
+                if attach && source.thread["historyMode"] != "paginated" {
+                    return Err(RpcError::invalid(
+                        "Attached forks require a paginated source",
+                    ));
+                }
                 record.prediction_mode = prediction_mode;
+                record.attached_to = attach.then(|| source_id.to_owned());
                 record.thread["forkedFromId"] = json!(source_id);
                 record.thread["sessionId"] = source.thread["sessionId"].clone();
                 record.thread["preview"] = source.thread["preview"].clone();
@@ -1884,9 +1925,41 @@ impl Server {
             "thread/read" => {
                 supported_fields(p, &["threadId", "includeTurns"])?;
                 let id = required_str(p, "threadId")?;
+                let record = self.record(id)?;
                 Ok(Some(
-                    json!({"thread": self.record(id)?.view(p["includeTurns"].as_bool().unwrap_or(false), self.loaded.contains(id))}),
+                    json!({"thread": record.view(p["includeTurns"].as_bool().unwrap_or(false), self.loaded.contains(id)),
+                        "readState": record.read_state()}),
                 ))
+            }
+            "thread/readState/update" => {
+                supported_fields(p, &["threadId", "operation", "expectedRevision"])?;
+                let id = required_str(p, "threadId")?;
+                let unread = p["operation"]["type"] == "unread";
+                let mut record = self.record(id)?.clone();
+                let read_state =
+                    match record.mark_read_state(required_str(p, "expectedRevision")?, unread) {
+                        Ok(read_state) => read_state,
+                        Err(Value::Null) => {
+                            return Err(RpcError::invalid("thread read state unavailable"));
+                        }
+                        // As in Codex, a stale edit reports what changed instead.
+                        Err(current) => {
+                            let mut error = RpcError::invalid("read state changed");
+                            error.data =
+                                Some(json!({"reason":"readStateConflict","readState":current}));
+                            return Err(error);
+                        }
+                    };
+                self.store.save(&record).map_err(RpcError::internal)?;
+                self.records.insert(id.to_owned(), record);
+                self.emit(
+                    id,
+                    notification(
+                        "thread/readState/changed",
+                        json!({"threadId": id, "readState": read_state}),
+                    ),
+                );
+                Ok(Some(json!({"readState": read_state})))
             }
             "thread/list" => self.list_threads(p).map(Some),
             "thread/loaded/list" => {
@@ -1922,11 +1995,17 @@ impl Server {
                 {
                     return Err(RpcError::invalid("Turn not found"));
                 }
-                let mut items: Vec<Value> = record.turns.iter()
-                    .flat_map(|turn| turn["items"].as_array().unwrap().iter().map(|item| {
-                        let times = record.item_times.get(item["id"].as_str().unwrap());
-                        json!({"turnId": turn["id"], "item": item, "startedAtMs": times.map(|t| t.0), "completedAtMs": times.and_then(|t| t.1)})
-                    })).collect();
+                let mut items: Vec<Value> = record
+                    .turns
+                    .iter()
+                    .flat_map(|turn| {
+                        turn["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| record.item_entry(&turn["id"], item))
+                    })
+                    .collect();
                 let mut options = p.clone();
                 apply_resume_boundary(&mut items, &mut options, id, "items")?;
                 items.retain(|item| p["turnId"].is_null() || p["turnId"] == item["turnId"]);
@@ -1937,6 +2016,28 @@ impl Server {
                     &format!("items:{id}:{}", p["turnId"]),
                 )
                 .map(Some)
+            }
+            "thread/items/read" => {
+                supported_fields(p, &["threadId", "turnId", "itemIds"])?;
+                let ids = p["itemIds"].as_array().unwrap();
+                if !(1..=100).contains(&ids.len()) {
+                    return Err(RpcError::invalid("itemIds must contain 1 to 100 IDs"));
+                }
+                let record = self.record(required_str(p, "threadId")?)?;
+                let turn = record
+                    .turns
+                    .iter()
+                    .find(|turn| turn["id"] == p["turnId"])
+                    .ok_or_else(|| RpcError::invalid("Turn not found"))?;
+                // As in Codex: stored order, and unknown ids are omitted.
+                let data: Vec<Value> = turn["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| ids.contains(&item["id"]))
+                    .map(|item| record.item_entry(&turn["id"], item))
+                    .collect();
+                Ok(Some(json!({"data": data})))
             }
             "thread/metadata/update" => {
                 supported_fields(p, &["threadId", "projectId", "gitInfo", "daybreakEnabled"])?;
@@ -2067,6 +2168,196 @@ impl Server {
                 self.record(required_str(p, "threadId")?)?;
                 // Goals are a Codex runtime feature; Claude threads never have one.
                 Ok(Some(json!({"goal": null})))
+            }
+            "feedback/save" => {
+                supported_fields(
+                    p,
+                    &[
+                        "classification",
+                        "reason",
+                        "threadId",
+                        "includeLogs",
+                        "extraLogFiles",
+                        "tags",
+                        "savePath",
+                    ],
+                )?;
+                // Genuine Codex writes the diagnostics archive with its logs.
+                // A facade thread contributes its saved record instead of a
+                // Codex rollout.
+                let Some(config) =
+                    crate::plugin_runtime::configured(self.config.default_cwd.clone())
+                else {
+                    return Err(RpcError::invalid(
+                        "Saving diagnostics requires the genuine Codex executable",
+                    ));
+                };
+                let mut params = p.clone();
+                let thread_id = p["threadId"].as_str().map(str::to_owned);
+                if let Some(id) = &thread_id {
+                    let record = self.record(id)?;
+                    params.as_object_mut().unwrap().remove("threadId");
+                    if let Some(path) = record.thread["path"].as_str() {
+                        let mut files = params["extraLogFiles"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        files.push(json!(path));
+                        params["extraLogFiles"] = json!(files);
+                    }
+                }
+                let output = self.connections[&client].output.clone();
+                let rpc_id = rpc_id.clone();
+                let manager = self.plugin_manager.clone();
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let result = manager
+                        .request(config, "feedback/save", params, events)
+                        .await
+                        .map(|mut saved| {
+                            if let Some(id) = thread_id {
+                                saved["threadId"] = json!(id);
+                            }
+                            saved
+                        });
+                    let _ = output
+                        .send(match result {
+                            Ok(value) => response(rpc_id, value),
+                            Err(error) => error.response(rpc_id),
+                        })
+                        .await;
+                });
+                Ok(None)
+            }
+            "thread/memory/read" => {
+                supported_fields(p, &["threadId"])?;
+                self.record(required_str(p, "threadId")?)?;
+                // Codex memories are not part of a Claude thread's context.
+                Ok(Some(json!({"summary": null})))
+            }
+            // Genuine Codex 0.166 answers the same way.
+            "thread/prediction/request" => Err(RpcError::new(
+                -32601,
+                "thread/prediction/request is not implemented yet",
+            )),
+            "thread/attachmentOwner/list" => {
+                supported_fields(
+                    p,
+                    &[
+                        "attachmentType",
+                        "identityKey",
+                        "archived",
+                        "cursor",
+                        "limit",
+                    ],
+                )?;
+                let (kind, key) = (
+                    required_str(p, "attachmentType")?,
+                    required_str(p, "identityKey")?,
+                );
+                // Every persisted owner, including threads without user messages.
+                let owners: Vec<Value> = self
+                    .records
+                    .values()
+                    .filter(|record| {
+                        !record.ephemeral()
+                            && p["archived"].as_bool().is_none_or(|a| a == record.archived)
+                            && record
+                                .attachments
+                                .iter()
+                                .any(|a| a.attachment_type == kind && a.identity_key == key)
+                    })
+                    .map(|record| json!(record.id()))
+                    .collect();
+                let mut result = page(owners, p, false, &format!("owners:{kind}:{key}"))?;
+                result.as_object_mut().unwrap().remove("backwardsCursor");
+                result["data"] = result["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| json!({"threadId": id, "archived": self.records[id.as_str().unwrap()].archived}))
+                    .collect();
+                Ok(Some(result))
+            }
+            "thread/sample" => {
+                supported_fields(
+                    p,
+                    &[
+                        "threadId",
+                        "expectedTurnId",
+                        "prompt",
+                        "effort",
+                        "threadSource",
+                        "turnTrigger",
+                        "responsesapiClientMetadata",
+                        "disableMcp",
+                    ],
+                )?;
+                let id = required_str(p, "threadId")?;
+                let prompt = required_str(p, "prompt")?.to_owned();
+                if prompt.trim().is_empty() || prompt.len() > PREDICTION_PROMPT_BYTES {
+                    return Err(RpcError::invalid(
+                        "thread/sample requires a nonempty prompt of at most 8 KiB",
+                    ));
+                }
+                let record = self.record(id)?;
+                // As in Codex, only the loaded source's latest settled turn.
+                if !self.loaded.contains(id)
+                    || self.active.contains_key(id)
+                    || record.turns.last().is_none_or(|turn| {
+                        turn["id"] != p["expectedTurnId"] || turn["status"] == "inProgress"
+                    })
+                {
+                    return Err(RpcError::invalid(
+                        "The sample source turn is stale or still active",
+                    ));
+                }
+                // A read-only question on the parent's warm process keeps its
+                // model, tools and cached prefix; effort and MCP options would
+                // invalidate that cache. A cold parent is not sampled at all.
+                let question = self.warm_question_client(record);
+                let cancel = CancellationToken::new();
+                let key = (client, rpc_id.to_string());
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), (id.to_owned(), cancel.clone()));
+                let samples = self.samples.clone();
+                let output = self.connections[&client].output.clone();
+                let rpc_id = rpc_id.clone();
+                let source_turn = p["expectedTurnId"].clone();
+                tokio::spawn(async move {
+                    let answer = match question {
+                        Some(question) => question.ask(&prompt, &cancel).await.ok(),
+                        None => None,
+                    };
+                    // Cancellation already answered the request.
+                    if samples.lock().unwrap().remove(&key).is_none() {
+                        return;
+                    }
+                    let text = answer
+                        .filter(|answer| answer["synthetic"] != true)
+                        .and_then(|answer| answer["response"].as_str().map(str::to_owned));
+                    // Native side questions report no per-request usage.
+                    let result = json!({"responseId": protocol::id(), "sourceTurnId": source_turn,
+                        "text": text, "inputTokens": null, "cachedInputTokens": null,
+                        "outputTokens": null});
+                    let _ = output.send(response(rpc_id, result)).await;
+                });
+                Ok(None)
+            }
+            "thread/sample/cancel" => {
+                supported_fields(p, &["requestId"])?;
+                let key = (client, p["requestId"].to_string());
+                let Some((_, cancel)) = self.samples.lock().unwrap().remove(&key) else {
+                    return Err(RpcError::invalid("No running sample has this request id"));
+                };
+                cancel.cancel();
+                self.send(
+                    client,
+                    RpcError::invalid("The sample was cancelled").response(p["requestId"].clone()),
+                );
+                Ok(Some(json!({})))
             }
             "thread/searchOccurrences" => {
                 supported_fields(p, &["threadId", "searchTerm", "cursor", "limit"])?;
@@ -2554,15 +2845,29 @@ impl Server {
                 "ancestorThreadId",
                 "parentThreadId",
                 "sectionId",
+                "excludedThreadIds",
+                "attachedToThreadId",
             ],
         )?;
-        let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
-            (Some(_), Some(_)) => {
+        let excluded = match &p["excludedThreadIds"] {
+            Value::Null => vec![],
+            Value::Array(ids) if ids.len() <= 100 && ids.iter().all(Value::is_string) => {
+                ids.clone()
+            }
+            _ => {
                 return Err(RpcError::invalid(
-                    "parentThreadId and ancestorThreadId are mutually exclusive",
+                    "excludedThreadIds must list at most 100 thread ids",
                 ));
             }
-            (Some(parent), None) => Some((parent, false)),
+        };
+        let relations = ["parentThreadId", "ancestorThreadId", "attachedToThreadId"];
+        if relations.iter().filter(|key| !p[**key].is_null()).count() > 1 {
+            return Err(RpcError::invalid(
+                "parentThreadId, ancestorThreadId and attachedToThreadId are mutually exclusive",
+            ));
+        }
+        let relation = match (p["parentThreadId"].as_str(), p["ancestorThreadId"].as_str()) {
+            (Some(parent), _) => Some((parent, false)),
             (None, Some(ancestor)) => Some((ancestor, true)),
             (None, None) => None,
         };
@@ -2595,8 +2900,12 @@ impl Server {
                     (Some(_), None) => true,
                     _ => !crate::subagents::is_child(r),
                 };
+                // Side chats list only under their source, as in Codex.
+                let attached = r.attached_to.as_deref() == p["attachedToThreadId"].as_str();
                 related
                     && source
+                    && attached
+                    && !excluded.contains(&r.thread["id"])
                     && r.archived == p["archived"].as_bool().unwrap_or(false)
                     && !r.ephemeral()
                     && p.get("projectId")
@@ -2636,7 +2945,19 @@ impl Server {
             .map(|r| r.view(false, self.loaded.contains(r.id())))
             .collect();
         // Timestamps default to newest first; section positions to first placed.
-        page(threads, p, sort_key.is_some(), "threads")
+        let mut result = page(threads, p, sort_key.is_some(), "threads")?;
+        // As in Codex: receipts for the eligible threads on this page only.
+        let read_states: serde_json::Map<String, Value> = result["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|thread| {
+                let id = thread["id"].as_str()?;
+                Some((id.to_owned(), self.records.get(id)?.read_state()?))
+            })
+            .collect();
+        result["readStates"] = json!(read_states);
+        Ok(result)
     }
 
     /// Whether `record` is a (transitive, when `any_depth`) child of `ancestor`.
@@ -2665,6 +2986,16 @@ impl Server {
             return Err(RpcError::invalid(format!(
                 "Thread is not persisted and cannot be deleted: {id}"
             )));
+        }
+        // As in Codex; the desktop deletes a source's side chats first.
+        if self
+            .records
+            .values()
+            .any(|record| record.attached_to.as_deref() == Some(id))
+        {
+            return Err(RpcError::invalid(
+                "Delete this thread's attached threads before deleting it",
+            ));
         }
         let subtree = self.subtree(id);
         // Codex shuts a running thread down first. A subagent's work runs in
@@ -2907,6 +3238,7 @@ impl Server {
                 "clientUserMessageId",
                 "additionalContext",
                 "responsesapiClientMetadata",
+                "responsesapiClientMetadataPatch",
             ],
         )?;
         let id = required_str(p, "threadId")?;
@@ -3161,6 +3493,8 @@ impl Server {
                 "additionalContext",
                 "environmentOverrides",
                 "disabledPluginIds",
+                "parentTurnId",
+                "rootTurnId",
             ],
         )?;
         let id = required_str(p, "threadId")?;
@@ -3199,7 +3533,16 @@ impl Server {
             }
         }
         if record.prediction_mode {
-            supported_fields(p, &["threadId", "input", "clientUserMessageId", "effort"])?;
+            supported_fields(
+                p,
+                &[
+                    "threadId",
+                    "input",
+                    "clientUserMessageId",
+                    "effort",
+                    "outputSchema",
+                ],
+            )?;
             if p["input"].as_array().is_none_or(|input| {
                 input.is_empty() || input.iter().any(|part| part["type"] != "text")
             }) {
@@ -3295,7 +3638,8 @@ impl Server {
             }
         }
         let turn_id = protocol::id();
-        let turn = protocol::new_turn(&turn_id);
+        // `parentTurnId` is provenance only; the root is what turns record.
+        let turn = protocol::new_turn(&turn_id, p["rootTurnId"].as_str());
         // As in Codex, a compaction turn has no user message.
         let item = (!compaction).then(|| json!({"type": "userMessage", "id": protocol::id(), "clientId": p["clientUserMessageId"], "content": codex_input}));
         if record.thread["preview"] == "" {
@@ -3339,6 +3683,7 @@ impl Server {
             &record,
             LaunchedTurn {
                 turn_id: turn_id.clone(),
+                output_schema: p.get("outputSchema").filter(|v| !v.is_null()).cloned(),
                 options,
                 warm,
                 launch_key,
@@ -3705,10 +4050,30 @@ impl Server {
         self.unsaved.remove(id);
         let record = self.records.get_mut(id).unwrap();
         let turn = record.turns.last_mut().unwrap();
+        // As in Codex, a terminal result needs the user's attention when it
+        // failed or answered; an interrupted turn only with output or an error.
+        let final_text = turn["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .rev()
+                    .find(|item| item["type"] == "agentMessage")
+            })
+            .and_then(|item| item["text"].as_str())
+            .map(str::to_owned);
+        let visible = match status {
+            "failed" => true,
+            "completed" => final_text.as_deref().is_some_and(|text| {
+                !text.trim().is_empty() && !text.contains("<decision>DONT_NOTIFY</decision>")
+            }),
+            _ => error.is_some() || final_text.is_some(),
+        };
         turn["status"] = json!(status);
         turn["completedAt"] = json!(protocol::now());
         turn["durationMs"] = json!(now_ms().saturating_sub(active.started_ms));
         turn["error"] = error.map(|message| json!({"message": message, "codexErrorInfo": null, "additionalDetails": null, "misalignment": null})).unwrap_or(Value::Null);
+        let attention = visible && record.publish_attention(&active.id);
         record.thread["status"] = json!({"type": "idle"});
         record.touch();
         if let Err(error) = self.store.save(record) {
@@ -3716,7 +4081,8 @@ impl Server {
             turn["status"] = json!("failed");
             turn["error"] = json!({"message": format!("Cannot persist completed turn: {error}"), "codexErrorInfo": null, "additionalDetails": null, "misalignment": null});
         }
-        let turn = record.turns.last().unwrap().clone();
+        let turn = record.timed_turn(record.turns.last().unwrap());
+        let read_state = record.read_state().filter(|_| attention);
         if !self
             .connections
             .values()
@@ -3731,6 +4097,15 @@ impl Server {
             id,
             notification("turn/completed", json!({"threadId": id, "turn": turn})),
         );
+        if let Some(read_state) = read_state {
+            self.emit(
+                id,
+                notification(
+                    "thread/readState/changed",
+                    json!({"threadId": id, "readState": read_state}),
+                ),
+            );
+        }
         self.emit(
             id,
             notification(
@@ -3951,10 +4326,19 @@ impl Server {
             self.subscribe(client, &thread);
         }
         self.loaded.insert(thread.clone());
+        let root_turn = self.active.get(root).and_then(|active| {
+            self.records
+                .get(root)?
+                .turns
+                .iter()
+                .find(|turn| turn["id"] == active.id.as_str())?["rootTurnId"]
+                .as_str()
+                .map(str::to_owned)
+        });
         let Some(record) = self.records.get_mut(&thread) else {
             return;
         };
-        let (turn, item) = crate::subagents::new_turn(record, prompt);
+        let (turn, item) = crate::subagents::new_turn(record, prompt, root_turn.as_deref());
         let turn_id = turn["id"].as_str().unwrap().to_owned();
         let child_turn = crate::subagents::child_turn(&thread, &turn_id, record);
         self.persist(&thread);
@@ -5160,7 +5544,7 @@ fn apply_resume_boundary(
 }
 
 fn turns_page(record: &Record, options: &Value) -> RpcResult<Value> {
-    let mut turns = record.turns.clone();
+    let mut turns = record.timed_turns();
     let mut options = options.clone();
     apply_resume_boundary(&mut turns, &mut options, record.id(), "turns")?;
     if options["itemsView"] == "notLoaded" {
@@ -5255,6 +5639,7 @@ fn append_additional_context(input: &mut Vec<Value>, context: &Value) {
 
 struct PredictionTurn {
     client: Option<crate::backend::PredictionClient>,
+    output_schema: Option<Value>,
     thread_id: String,
     turn_id: String,
     session_id: String,
@@ -5282,6 +5667,12 @@ async fn run_prediction(mut turn: PredictionTurn) {
     if question.trim().is_empty() {
         turn.client = None;
     }
+    // A structured request, such as a title refresh, answers in its schema.
+    if let Some(schema) = &turn.output_schema {
+        question.push_str(&format!(
+            "Reply with only a JSON value that matches this JSON Schema:\n{schema}\n"
+        ));
+    }
     let result = if let Some(client) = turn.client {
         let query_cancel = turn.cancel.child_token();
         let query = client.ask(&question, &query_cancel);
@@ -5303,12 +5694,18 @@ async fn run_prediction(mut turn: PredictionTurn) {
     } else {
         None
     };
-    let suggestion = result
+    let answer = result
         .filter(|value| value["synthetic"] != true)
-        .and_then(|value| serde_json::from_str::<Value>(value["response"].as_str()?).ok())
-        .and_then(|value| value["suggestion"].as_str().map(str::to_owned))
-        .filter(|text| !text.trim().is_empty() && text.len() <= 512);
-    let text = json!({"suggestion":suggestion}).to_string();
+        .and_then(|value| serde_json::from_str::<Value>(value["response"].as_str()?.trim()).ok());
+    let text = if turn.output_schema.is_some() {
+        // The caller validates the value against its schema.
+        answer.map(|value| value.to_string()).unwrap_or_default()
+    } else {
+        let suggestion = answer
+            .and_then(|value| value["suggestion"].as_str().map(str::to_owned))
+            .filter(|text| !text.trim().is_empty() && text.len() <= 512);
+        json!({"suggestion":suggestion}).to_string()
+    };
     // Native side_question does not return a per-request usage object. Leave
     // prediction usage unknown rather than reporting the parent's cumulative bill.
     for message in [
@@ -5335,6 +5732,8 @@ async fn run_prediction(mut turn: PredictionTurn) {
 
 struct LaunchedTurn {
     turn_id: String,
+    /// A prediction turn's structured-output schema.
+    output_schema: Option<Value>,
     options: SessionOptions,
     warm: Option<crate::warm::WarmSession>,
     launch_key: Option<Value>,

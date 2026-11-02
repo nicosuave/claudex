@@ -1,7 +1,7 @@
 # Desktop workspace and attachment boundary
 
-Evidence is from development-time inspection of the installed desktop, pinned
-`protocol/codex-0.160.0.json`, and upstream Codex source. Bundle locations below
+Evidence is from development-time inspection of the installed desktop, the
+then-pinned Codex 0.160.0 schema, and upstream Codex source. Bundle locations below
 are byte offsets in the inspected version. Extracted desktop code is not shipped.
 
 ## Owning path

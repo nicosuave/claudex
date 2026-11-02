@@ -21,7 +21,7 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
     static SCHEMAS: OnceLock<HashMap<String, jsonschema::Validator>> = OnceLock::new();
     SCHEMAS.get_or_init(|| {
         let root: Value =
-            serde_json::from_str(include_str!("../protocol/codex-0.160.0.json")).unwrap();
+            serde_json::from_str(include_str!("../protocol/codex-0.166.0.json")).unwrap();
         let mut validators = HashMap::new();
         for name in [
             "InitializeResponse",
@@ -52,6 +52,13 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
             "ThreadLoadedListResponse",
             "ThreadTurnsListResponse",
             "ThreadItemsListResponse",
+            "ThreadItemsReadResponse",
+            "HooksListResponse",
+            "FeedbackSaveResponse",
+            "ThreadMemoryReadResponse",
+            "ThreadAttachmentOwnerListResponse",
+            "ListMcpServerStatusResponse",
+            "ThreadReadStateUpdateResponse",
             "ThreadSetNameResponse",
             "ThreadMetadataUpdateResponse",
             "ThreadSettingsUpdateResponse",
@@ -136,6 +143,13 @@ fn response_schema(method: &str) -> &'static str {
         "thread/loaded/list" => "ThreadLoadedListResponse",
         "thread/turns/list" => "ThreadTurnsListResponse",
         "thread/items/list" => "ThreadItemsListResponse",
+        "thread/items/read" => "ThreadItemsReadResponse",
+        "hooks/list" => "HooksListResponse",
+        "feedback/save" => "FeedbackSaveResponse",
+        "thread/memory/read" => "ThreadMemoryReadResponse",
+        "thread/attachmentOwner/list" => "ThreadAttachmentOwnerListResponse",
+        "mcpServerStatus/list" => "ListMcpServerStatusResponse",
+        "thread/readState/update" => "ThreadReadStateUpdateResponse",
         "thread/name/set" => "ThreadSetNameResponse",
         "thread/metadata/update" => "ThreadMetadataUpdateResponse",
         "thread/settings/update" => "ThreadSettingsUpdateResponse",
@@ -264,6 +278,10 @@ impl Client {
     }
 
     async fn spawn_with_args(state: &Path, extra: &[&str]) -> Self {
+        Self::spawn_with_env(state, extra, &[]).await
+    }
+
+    async fn spawn_with_env(state: &Path, extra: &[&str], env: &[(&str, &Path)]) -> Self {
         schemas();
         let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
             .args([
@@ -281,6 +299,7 @@ impl Client {
             .args(extra)
             .arg("--state-dir")
             .arg(state)
+            .envs(env.iter().copied())
             .current_dir(state)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -971,6 +990,287 @@ async fn text_turn_has_exactly_one_complete_lifecycle() {
         )
         .await;
     assert_eq!(items["data"].as_array().unwrap().len(), 2);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn items_are_timed_and_read_state_follows_terminal_results() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let read = client.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(
+        read["readState"],
+        json!({"firstUnread":null,"revision":format!("initial:{thread}")})
+    );
+    let turn = client.start(&thread, "hello").await;
+    let completed = client.completed(&turn).await;
+    let items = completed["items"].as_array().unwrap().clone();
+    for item in &items {
+        assert!(item["startedAtMs"].is_u64(), "{item}");
+        assert!(item["completedAtMs"].is_u64(), "{item}");
+    }
+    // A completed answer needs attention until the user marks it read.
+    let changed = client
+        .until(|v| v["method"] == "thread/readState/changed" && v["params"]["threadId"] == thread)
+        .await["params"]["readState"]
+        .clone();
+    assert_eq!(changed["firstUnread"], json!({"type":"turn","turnId":turn}));
+    let list = client.ok("thread/list", json!({})).await;
+    assert_eq!(list["readStates"][&thread], changed);
+    let read = client.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["readState"], changed);
+
+    // Stored order, unknown ids omitted, with the item's times.
+    let (first, last) = (&items[0], &items[items.len() - 1]);
+    let entries = client
+        .ok(
+            "thread/items/read",
+            json!({"threadId":thread,"turnId":turn,"itemIds":[last["id"],"missing",first["id"]]}),
+        )
+        .await["data"]
+        .clone();
+    assert_eq!(
+        entries,
+        json!([
+            {"turnId":turn,"startedAtMs":first["startedAtMs"],"completedAtMs":first["completedAtMs"],"item":first},
+            {"turnId":turn,"startedAtMs":last["startedAtMs"],"completedAtMs":last["completedAtMs"],"item":last}
+        ])
+    );
+    for ids in [
+        json!([]),
+        json!((0..101).map(|i| i.to_string()).collect::<Vec<_>>()),
+    ] {
+        let reply = client
+            .request(
+                "thread/items/read",
+                json!({"threadId":thread,"turnId":turn,"itemIds":ids}),
+            )
+            .await;
+        assert!(reply.get("error").is_some(), "{reply}");
+    }
+
+    // An edit made against an older snapshot reports the current state.
+    let stale = client
+        .request(
+            "thread/readState/update",
+            json!({"threadId":thread,"operation":{"type":"read"},
+                "expectedRevision":format!("initial:{thread}")}),
+        )
+        .await;
+    assert_eq!(stale["error"]["data"]["reason"], "readStateConflict");
+    assert_eq!(stale["error"]["data"]["readState"], changed);
+    let marked = client
+        .ok(
+            "thread/readState/update",
+            json!({"threadId":thread,"operation":{"type":"read"},
+                "expectedRevision":changed["revision"]}),
+        )
+        .await["readState"]
+        .clone();
+    assert!(marked["firstUnread"].is_null());
+    assert_ne!(marked["revision"], changed["revision"]);
+    let unread = client
+        .ok(
+            "thread/readState/update",
+            json!({"threadId":thread,"operation":{"type":"unread"},
+                "expectedRevision":marked["revision"]}),
+        )
+        .await["readState"]
+        .clone();
+    assert_eq!(unread["firstUnread"], json!({"type":"threadStart"}));
+    client.close().await;
+
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let read = client.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["readState"], unread);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn attached_side_chats_are_listed_under_their_source_and_deleted_first() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let source = client
+        .ok(
+            "thread/start",
+            json!({"sandbox":"danger-full-access","historyMode":"paginated"}),
+        )
+        .await["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let turn = client.start(&source, "hello").await;
+    client.completed(&turn).await;
+    // The desktop's persistent side chat request.
+    let side = client
+        .ok(
+            "thread/fork",
+            json!({"threadId":source,"attachToSource":true,"excludeTurns":true}),
+        )
+        .await["thread"]
+        .clone();
+    assert_eq!(side["forkedFromId"], source);
+    let side = side["id"].as_str().unwrap().to_owned();
+
+    let ordinary = client.ok("thread/list", json!({})).await;
+    assert!(ids(&ordinary).contains(&source));
+    assert!(!ids(&ordinary).contains(&side));
+    let attached = client
+        .ok(
+            "thread/list",
+            json!({"attachedToThreadId":source,"archived":false,"limit":100,"useStateDbOnly":true}),
+        )
+        .await;
+    assert_eq!(ids(&attached), vec![side.clone()]);
+    let mixed = client
+        .request(
+            "thread/list",
+            json!({"attachedToThreadId":source,"parentThreadId":source}),
+        )
+        .await;
+    assert!(mixed.get("error").is_some(), "{mixed}");
+
+    for params in [
+        json!({"threadId":source,"attachToSource":true,"ephemeral":true}),
+        json!({"threadId":client.thread().await,"attachToSource":true}),
+    ] {
+        let reply = client.request("thread/fork", params).await;
+        assert!(reply.get("error").is_some(), "{reply}");
+    }
+
+    let blocked = client
+        .request("thread/delete", json!({"threadId":source}))
+        .await;
+    assert!(blocked.get("error").is_some(), "{blocked}");
+    client.ok("thread/delete", json!({"threadId":side})).await;
+    client.ok("thread/delete", json!({"threadId":source})).await;
+    client.close().await;
+}
+
+#[tokio::test]
+async fn thread_scoped_hooks_and_mcp_status_use_the_thread_workspace() {
+    let state = tempfile::tempdir().unwrap();
+    let home = state.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_scope.sh");
+    let mut client = Client::spawn_with_env(
+        state.path(),
+        &[],
+        &[
+            ("CLAUDE_CODEX_PLUGIN_EXECUTABLE", &codex),
+            ("CLAUDE_CODEX_PLUGIN_HOME", &home),
+        ],
+    )
+    .await;
+    client.initialize().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let thread = client
+        .ok(
+            "thread/start",
+            json!({"sandbox":"danger-full-access","cwd":workspace.path()}),
+        )
+        .await["thread"]["id"]
+        .clone();
+    // Desktop 0.166 scopes these to the open chat.
+    client.ok("hooks/list", json!({"threadId":thread})).await;
+    client
+        .ok(
+            "mcpServerStatus/list",
+            json!({"threadId":thread,"detail":"full"}),
+        )
+        .await;
+    let unknown = client
+        .request("hooks/list", json!({"threadId":"missing"}))
+        .await;
+    assert!(unknown.get("error").is_some(), "{unknown}");
+    let requests: Vec<Value> = std::fs::read_to_string(home.join("requests"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(request["params"].get("threadId").is_none(), "{request}");
+    }
+    assert_eq!(
+        requests[0]["params"]["cwds"],
+        json!([workspace.path().canonicalize().unwrap()])
+    );
+    assert_eq!(requests[1]["params"]["detail"], "full");
+
+    // Genuine Codex writes the archive; the thread contributes its record.
+    let archive = state.path().join("diagnostics.zip");
+    let saved = client
+        .ok(
+            "feedback/save",
+            json!({"threadId":thread,"classification":"bug","includeLogs":true,
+                "savePath":archive}),
+        )
+        .await;
+    assert_eq!(saved["savedPath"], json!(archive));
+    assert_eq!(saved["threadId"], thread);
+    let requests = std::fs::read_to_string(home.join("requests")).unwrap();
+    let feedback: Value = serde_json::from_str(requests.lines().last().unwrap()).unwrap();
+    assert!(feedback["params"].get("threadId").is_none(), "{feedback}");
+    let record = state
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("threads")
+        .join(format!("{}.json", thread.as_str().unwrap()));
+    assert_eq!(feedback["params"]["extraLogFiles"], json!([record]));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn codex_0_166_thread_methods_answer_like_codex() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let thread = client.thread().await;
+    let memory = client
+        .ok("thread/memory/read", json!({"threadId":thread}))
+        .await;
+    assert_eq!(memory, json!({"summary":null}));
+    // Genuine Codex 0.166 has not implemented this either.
+    let prediction = client
+        .request(
+            "thread/prediction/request",
+            json!({"threadId":thread,"sourceTurnId":"turn"}),
+        )
+        .await;
+    assert_eq!(prediction["error"]["code"], -32601);
+    client
+        .ok(
+            "thread/attachment/add",
+            json!({"threadId":thread,"attachmentType":"worktree","identityKey":"/w",
+                "payload":{}}),
+        )
+        .await;
+    client
+        .ok("thread/archive", json!({"threadId":thread}))
+        .await;
+    let owners = client
+        .ok(
+            "thread/attachmentOwner/list",
+            json!({"attachmentType":"worktree","identityKey":"/w"}),
+        )
+        .await;
+    assert_eq!(
+        owners,
+        json!({"data":[{"threadId":thread,"archived":true}],"nextCursor":null})
+    );
+    let active_only = client
+        .ok(
+            "thread/attachmentOwner/list",
+            json!({"attachmentType":"worktree","identityKey":"/w","archived":false}),
+        )
+        .await;
+    assert_eq!(active_only["data"], json!([]));
     client.close().await;
 }
 

@@ -213,7 +213,7 @@ claudex app-server --stdio --acp-agent opencode --acp-arg=acp --provider-name Op
 claudex app-server --stdio --acp-agent gemini --acp-arg=--experimental-acp --provider-name Gemini
 ```
 
-The facade targets the vendored Codex CLI **0.160.0** schema. Unsupported methods
+The facade targets the vendored Codex CLI **0.166.0** schema. Unsupported methods
 return `-32601`; unsupported non-null options return `-32602`. See the
 [app-server guide](docs/app-server.md) for source builds, transports, options,
 state storage, a JSON-RPC client exchange, and verification commands.

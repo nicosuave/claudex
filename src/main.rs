@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(
-    version = concat!("0.160.0 (claude-codex-server ", env!("CARGO_PKG_VERSION"), "; core protocol subset)"),
+    version = concat!("0.166.0 (claude-codex-server ", env!("CARGO_PKG_VERSION"), "; core protocol subset)"),
     name = "claude-codex-server",
     about = "Codex app-server protocol over Claude Code's streaming subprocess"
 )]

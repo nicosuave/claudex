@@ -188,8 +188,10 @@ Primary references:
 - [Claude Agent SDK subprocess implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py)
 
 The checked-in schema was generated with
-`codex app-server generate-json-schema --experimental` from Codex CLI 0.160.0,
+`codex app-server generate-json-schema --experimental` from Codex CLI 0.166.0,
 rather than fetched from a moving branch. See [NOTICE](../NOTICE) for attribution.
+See the [0.166 conformance checklist](codex-0.166-conformance.md) for every
+protocol change since 0.160.0.
 
 CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
 [releasing](releasing.md) for the tagged Linux workflow, local macOS signing,

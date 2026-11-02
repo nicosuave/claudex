@@ -1,7 +1,7 @@
 # Desktop integration boundaries
 
 The facade implements a subset of the Codex app-server contract pinned to CLI
-0.160.0. Schema validation establishes message shape; deterministic tests establish
+0.166.0. Schema validation establishes message shape; deterministic tests establish
 facade behavior; live Claude and SSH probes establish their runtime paths. None
 of these alone proves every native desktop interaction or rendered result.
 
