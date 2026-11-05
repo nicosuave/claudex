@@ -5,7 +5,9 @@
 //! `CODEX_CLI_PATH`). Every request goes to genuine Codex unless it concerns a
 //! Claude model or a Claude-owned thread; thread lists and the model picker
 //! merge both backends. The facade itself runs as the separate login-session
-//! service and is reached through its private Unix WebSocket.
+//! service and is reached through its private Unix WebSocket. On macOS the
+//! launcher execs genuine Codex in the desktop's direct child and keeps the
+//! router in a separate process, preserving native browser trust ancestry.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -102,6 +104,59 @@ pub fn is_app_server_launch(args: &[String]) -> bool {
 /// the JSON lines used by a local desktop launch.
 fn is_desktop_proxy(args: &[String]) -> bool {
     args == ["app-server", "proxy"]
+}
+
+/// Keep the desktop's direct child as genuine Codex, with the router alongside
+/// it on private stdio. The browser-access service checks signed process
+/// ancestry; inserting our router above Codex breaks that check.
+///
+/// Returns only in the router child (or for an SSH launch). The original process
+/// replaces itself with Codex, retaining its PID, parent, signals and exit status.
+/// Neither executable nor the desktop's authorization policy is modified.
+///
+/// # Safety
+/// Call before starting any threads, including the Tokio runtime. The forked
+/// child continues running Rust rather than immediately calling exec.
+#[cfg(target_os = "macos")]
+pub unsafe fn prepare_local_launch(
+    codex: &Path,
+    args: &[String],
+) -> Result<Option<std::os::unix::net::UnixStream>> {
+    use std::os::{
+        fd::OwnedFd,
+        unix::{net::UnixStream, process::CommandExt},
+    };
+
+    if is_desktop_proxy(args) || !is_app_server_launch(args) {
+        return Ok(None);
+    }
+    let (router, backend) = UnixStream::pair().context("Cannot create router transport")?;
+    let backend_input = backend.try_clone()?;
+    // SAFETY: the caller guarantees there are no other threads or locked state.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(std::io::Error::last_os_error()).context("Cannot start router process");
+    }
+    if child == 0 {
+        drop(backend_input);
+        drop(backend);
+        return Ok(Some(router));
+    }
+    drop(router);
+    let error = std::process::Command::new(codex)
+        .args(args)
+        .stdin(Stdio::from(OwnedFd::from(backend_input)))
+        .stdout(Stdio::from(OwnedFd::from(backend)))
+        .exec();
+    // An exec failure must not leave a router holding the desktop's pipes open.
+    // SAFETY: child is the exact live process just forked above, not a reused PID.
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        while libc::waitpid(child, std::ptr::null_mut(), 0) < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {}
+    }
+    Err(error).with_context(|| format!("Cannot run {}", codex.display()))
 }
 
 fn config_flags_only(args: &[String], app_server: bool) -> bool {
@@ -240,6 +295,7 @@ pub async fn run(
     args: &[String],
     claude_socket: Option<PathBuf>,
     log: Option<PathBuf>,
+    codex_connection: Option<std::os::unix::net::UnixStream>,
 ) -> Result<()> {
     let websocket = is_desktop_proxy(args);
     let proxy_args = [
@@ -328,23 +384,37 @@ pub async fn run(
         })
     };
 
-    let mut child = Command::new(codex)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("Cannot start {}", codex.display()))?;
-    let codex_input = child.stdin.take().unwrap();
     let (codex_sender, codex_output) = mpsc::channel::<Value>(512);
-    spawn_line_writer(codex_input, codex_output);
-    spawn_lines(
-        child.stdout.take().unwrap(),
-        events.clone(),
-        |message| Input::Backend(Side::Codex, message),
-        Input::BackendClosed(Side::Codex),
-    );
+    let mut child = if let Some(connection) = codex_connection {
+        connection.set_nonblocking(true)?;
+        let connection = tokio::net::UnixStream::from_std(connection)?;
+        let (reader, writer) = connection.into_split();
+        spawn_line_writer(writer, codex_output);
+        spawn_lines(
+            reader,
+            events.clone(),
+            |message| Input::Backend(Side::Codex, message),
+            Input::BackendClosed(Side::Codex),
+        );
+        None
+    } else {
+        let mut child = Command::new(codex)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("Cannot start {}", codex.display()))?;
+        spawn_line_writer(child.stdin.take().unwrap(), codex_output);
+        spawn_lines(
+            child.stdout.take().unwrap(),
+            events.clone(),
+            |message| Input::Backend(Side::Codex, message),
+            Input::BackendClosed(Side::Codex),
+        );
+        Some(child)
+    };
 
     let claude = match &claude_socket {
         Some(path) => match connect_claude(path, events.clone(), false).await {
@@ -409,7 +479,9 @@ pub async fn run(
     }
     // Closing Codex's stdin lets it finish its own shutdown.
     drop(router);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    if let Some(child) = &mut child {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    }
     client_writer.abort();
     Ok(())
 }

@@ -624,7 +624,8 @@ fn main() {
                 Ok(json!({"data": page, "nextCursor": next, "backwardsCursor": "fake-backwards"}))
             }
             "fake/state" => Ok(
-                json!({"unsubscribed": unsubscribed, "requests": requests, "apps": app_params, "threadConfigs":thread_configs}),
+                json!({"unsubscribed": unsubscribed, "requests": requests, "apps": app_params, "threadConfigs":thread_configs,
+                    "pid":std::process::id(), "parentPid":unsafe { libc::getppid() }}),
             ),
             _ => Err("unsupported"),
         };
