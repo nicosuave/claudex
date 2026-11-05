@@ -179,13 +179,43 @@ fn main() -> Result<()> {
             Err(error) => eprintln!("Keeping the inherited PATH: {error:#}"),
         }
     }
-    tokio::runtime::Builder::new_multi_thread()
+    #[cfg(target_os = "macos")]
+    let codex_connection = if let Some(Command::Route {
+        codex,
+        args: codex_args,
+        ..
+    }) = &args.command
+    {
+        // SAFETY: this is before the runtime or any other threads are started.
+        unsafe { claude_codex_server::router::prepare_local_launch(codex, codex_args)? }
+    } else {
+        None
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let codex_connection = None;
+    #[cfg(unix)]
+    let router_child = codex_connection.is_some();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(args))
+        .build()?;
+    let result = runtime.block_on(run(
+        args,
+        #[cfg(unix)]
+        codex_connection,
+    ));
+    // A router child must exit when Codex exits even if the desktop still has
+    // stdin open. Tokio's blocking stdin reader otherwise prevents shutdown.
+    #[cfg(unix)]
+    if router_child {
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    result
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn run(
+    args: Args,
+    #[cfg(unix)] codex_connection: Option<std::os::unix::net::UnixStream>,
+) -> Result<()> {
     let acp = args
         .acp_agent
         .clone()
@@ -236,7 +266,14 @@ async fn run(args: Args) -> Result<()> {
                 Some(path) => Some(path.clone()),
                 None => default_socket().ok(),
             };
-            return claude_codex_server::router::run(codex, codex_args, socket, log.clone()).await;
+            return claude_codex_server::router::run(
+                codex,
+                codex_args,
+                socket,
+                log.clone(),
+                codex_connection,
+            )
+            .await;
         }
         Some(Command::Uninstall { force }) => {
             return claude_codex_server::install::Installation::current(acp.clone())?

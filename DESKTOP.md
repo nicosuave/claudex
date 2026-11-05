@@ -87,6 +87,11 @@ launch gets a router (`claudex route`) which:
 - moves a new, still-empty chat to Claude when its first message uses a Claude
   model (the desktop starts chats before you pick a model).
 
+On macOS, the launcher replaces itself with genuine Codex and runs the router
+alongside it over a private socket. Codex remains the desktop's direct child,
+so native browser and app-tool services can validate its signed process ancestry.
+The desktop, Codex executable, and browser authorization checks remain unchanged.
+
 A chat stays on the backend it started with. Choosing a GPT model in a Claude
 chat, or a Claude model in a Codex chat that already has messages, is refused
 with a message asking you to start a new chat. If the Claude service restarts,

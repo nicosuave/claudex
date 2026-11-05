@@ -225,6 +225,42 @@ impl Desktop {
         self.until(|v| v["method"] == "turn/completed" && v["params"]["threadId"] == thread)
             .await
     }
+
+    async fn crash_router(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            // The desktop's direct child is now Codex. Crash the actual router
+            // worker, preserving coverage of recovery without orderly shutdown.
+            let children = Command::new("pgrep")
+                .args(["-P", &self._child.id().unwrap().to_string()])
+                .output()
+                .await
+                .unwrap();
+            for pid in String::from_utf8_lossy(&children.stdout).split_whitespace() {
+                let args = Command::new("ps")
+                    .args(["-p", pid, "-o", "args="])
+                    .output()
+                    .await
+                    .unwrap();
+                if String::from_utf8_lossy(&args.stdout).contains(" route --codex ") {
+                    let status = Command::new("kill")
+                        .args(["-KILL", pid])
+                        .status()
+                        .await
+                        .unwrap();
+                    assert!(status.success());
+                    tokio::time::timeout(DEADLINE, self._child.wait())
+                        .await
+                        .expect("Codex exited after router crash")
+                        .unwrap();
+                    return;
+                }
+            }
+            panic!("router worker was not found");
+        }
+        #[cfg(not(target_os = "macos"))]
+        self._child.kill().await.unwrap();
+    }
 }
 
 fn ids(page: &Value) -> Vec<String> {
@@ -261,6 +297,72 @@ fn reports(completed: &Value) -> Vec<Value> {
 fn result(report: &Value) -> Value {
     assert_eq!(report["isError"], false, "{report}");
     serde_json::from_str(report["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn local_codex_keeps_the_desktops_child_pid_and_parent() {
+    let missing = tempfile::tempdir().unwrap();
+    let mut desktop = Desktop::connect(&missing.path().join("absent.sock"), 0).await;
+    let backend = desktop.ok("fake/state", json!({})).await;
+    assert_eq!(backend["pid"], desktop._child.id().unwrap());
+    assert_eq!(backend["parentPid"], std::process::id());
+
+    // Killing the app's direct child must also release the router's inherited
+    // stdout, even while the desktop's stdin remains open.
+    desktop._child.kill().await.unwrap();
+    tokio::time::timeout(DEADLINE, async {
+        while desktop.output.next_line().await.unwrap().is_some() {}
+    })
+    .await
+    .expect("router exited after Codex was killed");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn local_router_closes_codex_when_desktop_input_closes() {
+    let missing = tempfile::tempdir().unwrap();
+    let desktop = Desktop::connect(&missing.path().join("absent.sock"), 0).await;
+    let Desktop {
+        mut _child,
+        input,
+        mut output,
+        ..
+    } = desktop;
+    drop(input);
+    let status = tokio::time::timeout(DEADLINE, _child.wait())
+        .await
+        .expect("Codex exited on desktop EOF")
+        .unwrap();
+    assert!(status.success());
+    tokio::time::timeout(DEADLINE, async {
+        while output.next_line().await.unwrap().is_some() {}
+    })
+    .await
+    .expect("router released desktop stdout");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn failed_local_codex_exec_does_not_leave_the_router_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = tokio::time::timeout(
+        DEADLINE,
+        Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+            .arg("--sock")
+            .arg(temp.path().join("absent.sock"))
+            .args(["route", "--codex"])
+            .arg(temp.path().join("missing-codex"))
+            .arg("--")
+            .args(DESKTOP_ARGS)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("failed exec released all inherited pipes")
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot run"));
 }
 
 #[tokio::test]
@@ -1148,7 +1250,7 @@ async fn router_disconnect_and_crash_recovery_stop_native_claude_children() {
                 .unwrap()
                 .unwrap();
         } else {
-            desktop._child.kill().await.unwrap();
+            desktop.crash_router().await;
             drop(desktop);
         }
         let mut desktop = Desktop::connect(&facade.socket, 0).await;
