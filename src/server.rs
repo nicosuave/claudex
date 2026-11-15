@@ -832,6 +832,12 @@ impl Server {
         output_schema: Option<Value>,
         fast_mode: bool,
     ) -> RpcResult<SessionOptions> {
+        record.validate_read_only_helper()?;
+        if record.settings.sandbox.is_read_only() && record.has_session {
+            return Err(RpcError::invalid(
+                "Read-only Claude helpers support one turn; start a fresh ephemeral helper",
+            ));
+        }
         Ok(SessionOptions {
             state_dir: self.store.root().to_path_buf(),
             sandbox: record.settings.sandbox.effective(&record.settings.cwd),
@@ -969,15 +975,16 @@ impl Server {
             tokio::spawn(run_backend(BackendTurn {
                 previous_process: self.closing.remove(&id),
                 config: self.config.backend.clone(),
-                plugins: crate::plugin_runtime::configured(record.settings.cwd.clone()).map(
-                    |config| {
+                plugins: (!record.settings.sandbox.is_read_only())
+                    .then(|| crate::plugin_runtime::configured(record.settings.cwd.clone()))
+                    .flatten()
+                    .map(|config| {
                         (
                             config,
                             record.settings.disabled_plugin_ids.clone(),
                             record.settings.dynamic_tools.clone(),
                         )
-                    },
-                ),
+                    }),
                 options: turn.options,
                 warm: turn.warm,
                 park: turn.launch_key.is_some(),
@@ -1117,6 +1124,11 @@ impl Server {
         if !self.acp() {
             return Ok(());
         }
+        if settings.sandbox.is_read_only() {
+            return Err(RpcError::invalid(
+                "Read-only helpers require the native Claude backend",
+            ));
+        }
         if settings.sandbox.is_workspace() {
             return Err(RpcError::invalid(
                 "ACP agents run their own tools, which this facade cannot confine to a workspace sandbox; use danger-full-access",
@@ -1231,6 +1243,11 @@ impl Server {
         #[cfg(unix)]
         {
             let mut record = self.record(id)?.clone();
+            if record.settings.sandbox.is_read_only() {
+                return Err(RpcError::invalid(
+                    "Read-only helpers cannot attach delegation tools",
+                ));
+            }
             let expected =
                 crate::dynamic_tools::parse(&json!([crate::delegation::dynamic_spec()]))?;
             let current: Vec<_> = record
@@ -1386,6 +1403,11 @@ impl Server {
                 if !p["threadId"].is_null() && method == "mcpServer/tool/call" {
                     let thread_id = required_str(p, "threadId")?;
                     let record = self.record(thread_id)?.clone();
+                    if record.settings.sandbox.is_read_only() {
+                        return Err(RpcError::invalid(
+                            "Read-only helpers cannot execute plugin tools",
+                        ));
+                    }
                     let runtime = self
                         .active
                         .get(thread_id)
@@ -1524,6 +1546,7 @@ impl Server {
                         "ephemeral",
                         "historyMode",
                         "projectId",
+                        "daybreakEnabled",
                         "threadSource",
                     ],
                 )?;
@@ -1552,6 +1575,7 @@ impl Server {
                 if let Some((_, metadata)) = adopted_id {
                     record.patch_metadata(metadata)?;
                 }
+                record.validate_read_only_helper()?;
                 self.store.save(&record).map_err(RpcError::internal)?;
                 let thread_id = record.id().to_owned();
                 let result = record.response(false, false);
@@ -1608,6 +1632,11 @@ impl Server {
                 .to_owned();
                 let id = id.as_str();
                 let mut record = self.record(id)?.clone();
+                if record.settings.sandbox.is_read_only() {
+                    return Err(RpcError::invalid(
+                        "Read-only Claude helpers cannot be resumed; start a fresh ephemeral helper",
+                    ));
+                }
                 if path.is_some() && record.thread["path"].as_str() != path {
                     return Err(RpcError::invalid(
                         "Resume path does not match the active thread",
@@ -1633,7 +1662,7 @@ impl Server {
                         );
                     }
                 } else {
-                    record.settings.apply(p)?;
+                    record.apply_settings(p)?;
                     self.check_backend_settings(&record.settings)?;
                     if !changed_settings(&self.records[id].settings, &record.settings)?.is_empty() {
                         self.cancel_predictions(id);
@@ -2087,7 +2116,7 @@ impl Server {
                 let id = required_str(p, "threadId")?;
                 self.idle(id)?;
                 let mut record = self.record(id)?.clone();
-                record.settings.apply(p)?;
+                record.apply_settings(p)?;
                 self.check_backend_settings(&record.settings)?;
                 record.touch();
                 let settings = record.thread_settings();
@@ -3554,7 +3583,7 @@ impl Server {
             // Keep the parent's native prefix and effort. The desktop's optional
             // effort override cannot be applied without invalidating that cache.
         } else {
-            record.settings.apply(p)?;
+            record.apply_settings(p)?;
             self.check_backend_settings(&record.settings)?;
         }
         // A per-turn tier, including "default", leaves the thread's tier unchanged.

@@ -128,7 +128,9 @@ Use **Workspace write** and **Approve for me** for native Claude auto review.
 Bash uses Claude's OS sandbox; native file tools use scoped permissions. Explicit
 sandbox escapes use the selected automatic or manual reviewer. MCP integrations
 and hooks remain trusted services outside that sandbox. Full access and manual approval modes are also
-available; read-only profiles are unsupported.
+available. General read-only agent profiles are unsupported; desktop background
+helpers can use single-turn ephemeral read-only sessions with all execution
+tools and customizations disabled. See [compatibility](COMPATIBILITY.md).
 
 ### Development sandbox settings
 

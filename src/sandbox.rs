@@ -57,6 +57,11 @@ impl WorkspaceDefaults {
 pub enum Policy {
     #[default]
     DangerFullAccess,
+    /// Tool-free ephemeral desktop helpers, not a general filesystem sandbox.
+    ReadOnly {
+        #[serde(default, rename = "networkAccess")]
+        network_access: bool,
+    },
     WorkspaceWrite {
         #[serde(default, rename = "writableRoots")]
         writable_roots: Vec<PathBuf>,
@@ -81,6 +86,10 @@ impl Policy {
 
     pub fn is_workspace(&self) -> bool {
         matches!(self, Self::WorkspaceWrite { .. })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly { .. })
     }
 
     /// The policy Claude enforces, in one canonical form. Clients spell the same
@@ -123,6 +132,14 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if matches!(
+            self,
+            Self::ReadOnly {
+                network_access: true
+            }
+        ) {
+            bail!("Read-only Claude helpers cannot enable network tools");
+        }
         if let Self::WorkspaceWrite {
             writable_roots,
             exclude_slash_tmp,

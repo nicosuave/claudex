@@ -114,6 +114,18 @@ fn command(config: &BackendConfig, options: &SessionOptions) -> Result<Command> 
 }
 
 fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<PreparedLaunch> {
+    if options.sandbox.is_read_only()
+        && (!options.ephemeral
+            || options.resume
+            || options.fork_from.is_some()
+            || !options.dynamic_tools.is_empty()
+            || options.permission_mode != "dontAsk"
+            || !config.extra_args.is_empty())
+    {
+        bail!(
+            "Read-only helpers require a fresh ephemeral Claude session without tools or launch overrides"
+        );
+    }
     let profile = if options.sandbox.is_workspace() {
         Some(crate::native_profile::NativeProfile::prepare(
             &options.state_dir,
@@ -200,6 +212,18 @@ fn prepare_launch(config: &BackendConfig, options: &SessionOptions) -> Result<Pr
         cmd.arg(format!("--resume-session-at={message_id}"));
     }
     cmd.arg(format!("--permission-mode={}", options.permission_mode));
+    if options.sandbox.is_read_only() {
+        // These helpers receive their entire context in the prompt. Disable
+        // execution surfaces rather than pretending dontAsk is a read-only OS
+        // sandbox. Safe mode retains normal login and managed policy.
+        cmd.args([
+            "--safe-mode",
+            "--tools=",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-chrome",
+        ]);
+    }
     for (flag, value) in [
         ("system-prompt", &options.system_prompt),
         ("append-system-prompt", &options.append_system_prompt),
@@ -380,6 +404,44 @@ fn launch_settings(
     Ok((args, supplied.then_some(settings)))
 }
 
+/// Stop a helper if the native runtime exposes any execution surface. Its
+/// synthetic StructuredOutput tool only returns the requested JSON value.
+fn verify_helper_frame(frame: &Value, structured_output: bool) -> Result<()> {
+    let allowed = |name: &str| structured_output && name == "StructuredOutput";
+    if frame["type"] == "system" && frame["subtype"] == "init" {
+        let tools = frame["tools"]
+            .as_array()
+            .context("read-only helper omitted its tool inventory")?;
+        if tools.iter().any(|tool| !tool.as_str().is_some_and(allowed))
+            || frame["mcp_servers"]
+                .as_array()
+                .is_some_and(|servers| !servers.is_empty())
+        {
+            bail!("Read-only helper exposed tools or MCP servers");
+        }
+    }
+    if frame["type"] == "control_request" {
+        let request = &frame["request"];
+        if request["subtype"] == "mcp_message"
+            || (request["subtype"] == "can_use_tool"
+                && !request["tool_name"].as_str().is_some_and(allowed))
+        {
+            bail!("Read-only helper attempted tool execution");
+        }
+    }
+    if frame["message"]["content"]
+        .as_array()
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_use" && !block["name"].as_str().is_some_and(allowed)
+            })
+        })
+    {
+        bail!("Read-only helper attempted tool execution");
+    }
+    Ok(())
+}
+
 fn merge_settings(target: &mut Value, overlay: Value) {
     match (target, overlay) {
         (Value::Object(target), Value::Object(overlay)) => {
@@ -554,6 +616,8 @@ impl ClaudeBackend {
         let task_alive = alive.clone();
         let task_stdin = stdin.clone();
         let dynamic_tools = options.dynamic_tools.clone();
+        let read_only_helper = options.sandbox.is_read_only();
+        let structured_output = options.output_schema.is_some();
         let task = tokio::spawn(async move {
             let _process_guard = ProcessGroupGuard {
                 id: process_id,
@@ -600,6 +664,9 @@ impl ClaudeBackend {
                             let line = line.context("reading Claude stdout")?;
                             let size = line.len();
                             let Some(value) = parse_frame(&line)? else { continue; };
+                            if read_only_helper {
+                                verify_helper_frame(&value, structured_output)?;
+                            }
                             // Recognize even malformed hook envelopes before generic
                             // control routing can return a permissive protocol error.
                             if crate::file_guard::is_callback(&value) {
