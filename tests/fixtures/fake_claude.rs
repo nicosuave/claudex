@@ -74,6 +74,27 @@ fn finish_with(session: &str, text: &str, error: bool, result: Value) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let read_only_helper = args.iter().any(|arg| arg == "--tools=");
+    if read_only_helper {
+        for required in [
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--permission-mode=dontAsk",
+            "--no-session-persistence",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == required),
+                "missing helper boundary: {required}"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--mcp-config" || arg.starts_with("--resume="))
+        );
+    }
     if args.get(1).is_some_and(|arg| arg == "plugin") {
         emit(json!({"installed":[],"available":[]}));
         return;
@@ -145,7 +166,7 @@ fn main() {
                             json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"commands":[],"models":models}}}),
                         );
                         emit(
-                            json!({"type":"system","subtype":"init","session_id":session,"cwd":std::env::current_dir().unwrap(),"tools":["Bash"],"model":"fake-claude","permissionMode":"default"}),
+                            json!({"type":"system","subtype":"init","session_id":session,"cwd":std::env::current_dir().unwrap(),"tools":if read_only_helper {vec![]} else {vec!["Bash"]},"mcp_servers":[],"model":"fake-claude","permissionMode":if read_only_helper {"dontAsk"} else {"default"}}),
                         );
                     }
                     Some("mcp_status") if args.iter().any(|arg| arg == "--fake-mcp-pending") => {

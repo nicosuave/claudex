@@ -45,6 +45,45 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
         }
     }
     let mut warnings = Vec::new();
+    if let Some(fallback) = object
+        .remove("allowProviderModelFallback")
+        .filter(|value| !value.is_null())
+    {
+        if !fallback.is_boolean() {
+            return Err(RpcError::invalid(
+                "allowProviderModelFallback must be a boolean",
+            ));
+        }
+        if fallback == true {
+            warnings.push("Claude uses native model resolution; Codex model-provider fallback is not applied.".into());
+        }
+    }
+    if method == "thread/start" {
+        // Desktop enrolls new threads in Codex's Daybreak propagation program.
+        // This is distinct from the saved choice and cannot select a Claude model.
+        if let Some(enrolled) = object
+            .remove("daybreakProgramPropagationEnrolled")
+            .filter(|value| !value.is_null())
+        {
+            if !enrolled.is_boolean() {
+                return Err(RpcError::invalid(
+                    "daybreakProgramPropagationEnrolled must be a boolean",
+                ));
+            }
+            if enrolled == true {
+                warnings.push("Daybreak program propagation is not available for Claude; the selected native Claude model is used.".into());
+            }
+        }
+        if object.get("ephemeral") == Some(&json!(true))
+            && object
+                .get("daybreakEnabled")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(RpcError::invalid(
+                "daybreakEnabled is not supported for ephemeral threads",
+            ));
+        }
+    }
     if let Some(profile) = object
         .remove("permissions")
         .filter(|value| !value.is_null())
@@ -52,9 +91,10 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
         let sandbox = match profile.as_str() {
             Some(":workspace") => "workspace-write",
             Some(":danger-full-access") => "danger-full-access",
+            Some(":read-only") => "read-only",
             _ => {
                 return Err(RpcError::invalid(
-                    "Only :workspace and :danger-full-access permission profiles are supported",
+                    "Supported permission profiles are :workspace, :danger-full-access, and :read-only for tool-free ephemeral helpers",
                 ));
             }
         };
@@ -68,10 +108,36 @@ pub fn normalize(method: &str, params: &Value) -> RpcResult<(Value, Vec<String>)
             ));
         }
         if method == "turn/start" || method == "thread/settings/update" {
-            object.insert("sandboxPolicy".into(), json!({"type": if sandbox == "workspace-write" { "workspaceWrite" } else { "dangerFullAccess" }}));
+            object.insert(
+                "sandboxPolicy".into(),
+                match sandbox {
+                    "workspace-write" => json!({"type":"workspaceWrite"}),
+                    "read-only" => json!({"type":"readOnly","networkAccess":false}),
+                    _ => json!({"type":"dangerFullAccess"}),
+                },
+            );
         } else {
             object.insert("sandbox".into(), json!(sandbox));
         }
+    }
+    if object.get("sandbox") == Some(&json!("read-only"))
+        || object
+            .get("sandboxPolicy")
+            .is_some_and(|policy| policy["type"] == "readOnly")
+    {
+        if method == "thread/fork" {
+            return Err(RpcError::invalid(
+                "Read-only Claude helpers cannot fork native sessions",
+            ));
+        }
+        // A running older router still injects its delegation catalog into
+        // helper requests after the facade is upgraded. Remove only that exact
+        // router-owned descriptor; caller-supplied tools remain an error.
+        #[cfg(unix)]
+        if let Some(tools) = object.get_mut("dynamicTools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| *tool != crate::delegation::dynamic_spec());
+        }
+        warnings.push("Read-only Claude helpers have no tools, hooks, skills or plugins. General read-only agent sessions are unsupported.".into());
     }
     if object
         .get("approvalsReviewer")

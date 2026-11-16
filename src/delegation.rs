@@ -146,6 +146,11 @@ pub fn child_params(
             let native: crate::sandbox::Policy = serde_json::from_value(sandbox.clone())
                 .context("Claude cannot reproduce the parent's sandbox policy")?;
             native.validate()?;
+            if native.is_read_only() {
+                bail!(
+                    "Read-only Claude sessions are limited to standalone ephemeral helpers, not delegated agents"
+                );
+            }
             params["sandboxPolicy"] = sandbox.clone();
             if let Some(effort) = effort {
                 params["effort"] = json!(effort);
@@ -531,6 +536,24 @@ mod tests {
         source["thread"]["environments"][0]["environmentId"] = json!("ssh:another-host");
         assert!(child_params(&source, Harness::Claude, "opus", None).is_err());
         assert!(child_params(&source, Harness::Codex, "gpt-fake", None).is_err());
+    }
+
+    #[test]
+    fn read_only_delegation_is_supported_by_codex_but_not_claude() {
+        for ephemeral in [false, true] {
+            let mut source = snapshot();
+            source["sandbox"] = json!({"type":"readOnly","networkAccess":false});
+            source["activePermissionProfile"] = json!({"id":":read-only"});
+            source["thread"]["ephemeral"] = json!(ephemeral);
+            let error = child_params(&source, Harness::Claude, "opus", None).unwrap_err();
+            assert!(
+                error.to_string().contains("not delegated agents"),
+                "{error}"
+            );
+            let codex = child_params(&source, Harness::Codex, "gpt-fake", None).unwrap();
+            assert_eq!(codex["sandbox"], "read-only");
+            assert_eq!(codex["ephemeral"], ephemeral);
+        }
     }
 
     #[test]

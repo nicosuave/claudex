@@ -1941,11 +1941,52 @@ async fn desktop_creation_metadata_settings_and_collaboration_mode_reach_claude(
 }
 
 #[tokio::test]
+async fn desktop_read_only_helper_does_not_receive_delegation_tools() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let thread = desktop
+        .thread(json!({"model":"opus", "ephemeral":true,
+        "permissions":":read-only", "approvalPolicy":"never",
+        "allowProviderModelFallback":true, "dynamicTools":null}))
+        .await;
+    let reply = desktop
+        .call(
+            "turn/start",
+            json!({"threadId":thread,
+        "permissions":":read-only", "approvalPolicy":"never",
+        "input":[{"type":"text","text":"helper","text_elements":[]}]}),
+        )
+        .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let completed = desktop.completed(&thread).await;
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let read = desktop
+        .ok(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await;
+    assert!(read.to_string().contains("Echo: helper"), "{read}");
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start")),
+        "{state}"
+    );
+}
+
+#[tokio::test]
 async fn current_desktop_projectless_task_submits_first_and_followup_messages() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
     let cwd = tempfile::tempdir().unwrap();
     let thread=desktop.thread(json!({"cwd":cwd.path(),"model":"opus",
+        "daybreakEnabled":false,"daybreakProgramPropagationEnrolled":true,
         "permissions":":workspace", "approvalPolicy":"on-request","approvalsReviewer":"auto_review",
         "historyMode":"paginated","threadSource":"user","dynamicTools":[],"runtimeWorkspaceRoots":[cwd.path()],
         "config":{"mcp_servers.node_repl":{"command":"node","args":["desktop-repl.js"]},
@@ -1983,6 +2024,7 @@ async fn current_desktop_projectless_task_submits_first_and_followup_messages() 
         .await;
     assert_eq!(read["thread"]["turns"].as_array().unwrap().len(), 2);
     assert_eq!(read["thread"]["modelProvider"], "anthropic");
+    assert_eq!(read["thread"]["daybreakEnabled"], false);
     let state = desktop.ok("fake/state", json!({})).await;
     assert!(
         !state["requests"]

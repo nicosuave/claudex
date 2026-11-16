@@ -817,6 +817,147 @@ async fn installed_desktop_turn_builder_payload_submits_first_and_followup_turns
 }
 
 #[tokio::test]
+async fn read_only_desktop_helpers_are_tool_free_and_cannot_change_mode() {
+    let state = tempfile::tempdir().unwrap();
+    let home = state.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_scope.sh");
+    let mut client = Client::spawn_with_env(
+        state.path(),
+        &[],
+        &[
+            ("CLAUDE_CODEX_PLUGIN_EXECUTABLE", &codex),
+            ("CLAUDE_CODEX_PLUGIN_HOME", &home),
+        ],
+    )
+    .await;
+    client.initialize().await;
+    let helper = json!({"permissions":":read-only","ephemeral":true,
+        "approvalPolicy":"never","allowProviderModelFallback":true,
+        "dynamicTools":[claude_codex_server::delegation::dynamic_spec()]});
+    for invalid in [
+        json!({"ephemeral":false}),
+        json!({"approvalPolicy":"on-request"}),
+        json!({"dynamicTools":[{"name":"write","description":"Write","inputSchema":{"type":"object"}}]}),
+        json!({"sandboxPolicy":{"type":"readOnly","networkAccess":true},"permissions":null}),
+    ] {
+        let mut params = helper.clone();
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        let reply = client.request("thread/start", params).await;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    }
+    let started = client.ok("thread/start", helper.clone()).await;
+    assert_eq!(
+        started["sandbox"],
+        json!({"type":"readOnly","networkAccess":false})
+    );
+    let thread = &started["thread"]["id"];
+    let plugin = client
+        .request(
+            "mcpServer/tool/call",
+            json!({
+                "threadId":thread,"server":"fixture","tool":"write","arguments":{}
+            }),
+        )
+        .await;
+    assert_eq!(plugin["error"]["code"], -32602, "{plugin}");
+    assert!(
+        plugin["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Read-only helpers")
+    );
+    for params in [
+        json!({"sandboxPolicy":{"type":"workspaceWrite"}}),
+        json!({"sandboxPolicy":{"type":"dangerFullAccess"}}),
+        json!({"approvalPolicy":"on-request"}),
+    ] {
+        let mut params = params;
+        params["threadId"] = thread.clone();
+        let reply = client.request("thread/settings/update", params).await;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    }
+    assert_eq!(
+        client
+            .request("thread/resume", json!({"threadId":thread}))
+            .await["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        client
+            .request("thread/fork", json!({"threadId":thread,"ephemeral":true}))
+            .await["error"]["code"],
+        -32602
+    );
+    let turn = client
+        .ok(
+            "turn/start",
+            json!({"threadId":thread,"permissions":":read-only",
+        "input":[{"type":"text","text":"helper","text_elements":[]}]}),
+        )
+        .await;
+    let turn = turn["turn"]["id"].as_str().unwrap();
+    let completed = client.completed(turn).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_echo_lifecycle(&client, turn, "Echo: helper");
+    assert_eq!(
+        client
+            .request(
+                "turn/start",
+                json!({"threadId":thread,
+        "input":[{"type":"text","text":"again","text_elements":[]}]})
+            )
+            .await["error"]["code"],
+        -32602
+    );
+
+    let unsafe_helper = client.ok("thread/start", helper).await;
+    let turn = client
+        .start(unsafe_helper["thread"]["id"].as_str().unwrap(), "tool")
+        .await;
+    let completed = client.completed(&turn).await;
+    assert_eq!(completed["status"], "failed", "{completed}");
+    assert!(
+        completed
+            .to_string()
+            .contains("Read-only helper attempted tool execution"),
+        "{completed}"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn desktop_initial_daybreak_choice_survives_restart() {
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    let mut threads = Vec::new();
+    for enabled in [json!(true), json!(false), json!(null)] {
+        let started = client
+            .ok(
+                "thread/start",
+                json!({
+                    "daybreakEnabled":enabled, "daybreakProgramPropagationEnrolled":true
+                }),
+            )
+            .await;
+        assert_eq!(started["thread"]["daybreakEnabled"], enabled);
+        threads.push((started["thread"]["id"].clone(), enabled));
+    }
+    client.close().await;
+    let mut client = Client::spawn(state.path()).await;
+    client.initialize().await;
+    for (thread, enabled) in threads {
+        let resumed = client.ok("thread/resume", json!({"threadId":thread})).await;
+        assert_eq!(resumed["thread"]["daybreakEnabled"], enabled);
+    }
+    client.close().await;
+}
+
+#[tokio::test]
 async fn desktop_metadata_and_next_turn_settings_persist_with_schema_checked_notifications() {
     let state = tempfile::tempdir().unwrap();
     let mut client = Client::spawn(state.path()).await;

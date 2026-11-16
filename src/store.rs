@@ -122,6 +122,9 @@ impl Settings {
             self.sandbox = match sandbox.as_str() {
                 Some("danger-full-access") => crate::sandbox::Policy::DangerFullAccess,
                 Some("workspace-write") => crate::sandbox::Policy::workspace(),
+                Some("read-only") => crate::sandbox::Policy::ReadOnly {
+                    network_access: false,
+                },
                 _ => return Err(sandbox_error()),
             };
         }
@@ -158,6 +161,9 @@ impl Settings {
     /// and scoped permissions allow run, and anything that would prompt is
     /// denied, as Codex reports a sandbox failure instead of asking.
     pub fn native_permission_mode(&self) -> &'static str {
+        if self.sandbox.is_read_only() {
+            return "dontAsk";
+        }
         if self.approval_policy == "never" {
             if self.sandbox.is_workspace() {
                 "dontAsk"
@@ -258,6 +264,32 @@ pub struct Record {
 }
 
 impl Record {
+    pub fn validate_read_only_helper(&self) -> RpcResult<()> {
+        if self.settings.sandbox.is_read_only()
+            && (!self.ephemeral()
+                || self.settings.approval_policy != "never"
+                || !self.settings.dynamic_tools.is_empty()
+                || !self.settings.environment_overrides.is_empty()
+                || self.fork_from.is_some())
+        {
+            return Err(RpcError::invalid(
+                "Read-only Claude helpers require ephemeral=true, approvalPolicy=never, no dynamic tools or environment overrides, and no source session; general read-only chats are unsupported",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn apply_settings(&mut self, params: &Value) -> RpcResult<()> {
+        let was_read_only = self.settings.sandbox.is_read_only();
+        self.settings.apply(params)?;
+        if was_read_only != self.settings.sandbox.is_read_only() {
+            return Err(RpcError::invalid(
+                "Read-only helper mode cannot be changed on an existing thread",
+            ));
+        }
+        self.validate_read_only_helper()
+    }
+
     pub fn new(settings: Settings, path: PathBuf, p: &Value, originator: &str) -> Self {
         Self::with_id(protocol::id(), settings, path, p, originator)
     }
@@ -281,7 +313,7 @@ impl Record {
             "cwd": settings.cwd, "cliVersion": protocol::VERSION, "originator": originator,
             "source": "appServer", "canAcceptDirectInput": true, "threadSource": p["threadSource"],
             "agentNickname": null, "agentRole": null, "gitInfo": null, "name": null,
-            "daybreakEnabled": null, "turns": []
+            "daybreakEnabled": p["daybreakEnabled"], "turns": []
         });
         Self {
             format_version: 1,

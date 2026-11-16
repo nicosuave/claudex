@@ -2,6 +2,44 @@ use claude_codex_server::desktop::normalize;
 use serde_json::json;
 
 #[test]
+fn desktop_daybreak_enrollment_does_not_change_claude_execution() {
+    for enabled in [json!(true), json!(false), json!(null)] {
+        for enrolled in [json!(true), json!(false), json!(null)] {
+            let (params, warnings) = normalize(
+                "thread/start",
+                &json!({
+                    "model":"opus", "daybreakEnabled":enabled,
+                    "daybreakProgramPropagationEnrolled":enrolled
+                }),
+            )
+            .unwrap();
+            assert_eq!(params["model"], "opus");
+            assert_eq!(params["daybreakEnabled"], enabled);
+            assert!(params.get("daybreakProgramPropagationEnrolled").is_none());
+            assert_eq!(!warnings.is_empty(), enrolled == true);
+        }
+    }
+    assert!(
+        normalize(
+            "thread/start",
+            &json!({
+                "daybreakProgramPropagationEnrolled":"true"
+            })
+        )
+        .is_err()
+    );
+    assert!(
+        normalize(
+            "thread/start",
+            &json!({
+                "ephemeral":true, "daybreakEnabled":false
+            })
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn workspace_overlay_and_disabled_plugin_selection_survive_normalization() {
     for method in ["thread/start", "thread/resume", "thread/fork", "turn/start"] {
         let (params, _) = normalize(

@@ -141,6 +141,12 @@ impl Router {
         let resume = message["method"] == "thread/resume";
         let params = &mut message["params"];
         if side == Side::Claude {
+            if params["permissions"] == ":read-only"
+                || params["sandbox"] == "read-only"
+                || params["sandboxPolicy"]["type"] == "readOnly"
+            {
+                return Ok(None);
+            }
             // An absent resume catalog means "preserve", not "replace with only
             // delegation". The facade's attach method merges saved descriptors.
             if resume && !params["dynamicTools"].is_array() {
