@@ -70,11 +70,28 @@ fn unsupported_reviewers_and_sandbox_claims_fail_closed() {
     for params in [
         json!({"approvalsReviewer":"bypassPermissions"}),
         json!({"approvalsReviewer":true}),
+        json!({"approvalsReviewer":"auto_review", "sandboxPolicy":{"type":"readOnly","networkAccess":true}}),
+    ] {
+        let mut settings = Settings::new(std::env::temp_dir(), "opus".into());
+        assert!(settings.apply(&params).is_err());
+    }
+    for params in [
         json!({"approvalsReviewer":"auto_review", "sandbox":"read-only"}),
         json!({"approvalsReviewer":"auto_review", "sandboxPolicy":{"type":"readOnly"}}),
     ] {
         let mut settings = Settings::new(std::env::temp_dir(), "opus".into());
-        assert!(settings.apply(&params).is_err());
+        settings.apply(&params).unwrap();
+        let record = Record::new(settings.clone(), std::env::temp_dir(), &json!({}), "test");
+        assert!(record.validate_read_only_helper().is_err());
+        settings.apply(&json!({"approvalPolicy":"never"})).unwrap();
+        assert_eq!(settings.native_permission_mode(), "dontAsk");
+        let helper = Record::new(
+            settings,
+            std::env::temp_dir(),
+            &json!({"ephemeral":true}),
+            "test",
+        );
+        helper.validate_read_only_helper().unwrap();
     }
 }
 
