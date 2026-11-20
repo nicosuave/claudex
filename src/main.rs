@@ -112,6 +112,13 @@ enum Command {
         #[arg(long, value_enum)]
         auth_session: Option<claude_codex_server::install::AuthSession>,
     },
+    /// Add selected ACP models to the existing local desktop router.
+    #[cfg(unix)]
+    LocalAcp {
+        /// Expose another model from the same agent. Repeat to include more.
+        #[arg(long = "include-model", value_name = "MODEL")]
+        include_models: Vec<String>,
+    },
     /// Check executables, service, local SSH, and native Claude authentication.
     #[cfg(unix)]
     Doctor,
@@ -239,6 +246,12 @@ async fn run(
     }
     #[cfg(unix)]
     match &args.command {
+        Some(Command::LocalAcp { include_models }) => {
+            let agent = acp.context("Pass --acp-agent and --model for the desktop connection")?;
+            return claude_codex_server::install::Installation::current(None)?
+                .configure_local_acp(agent, include_models.clone())
+                .await;
+        }
         Some(Command::Install {
             no_ssh,
             auth_session,
@@ -304,6 +317,21 @@ async fn run(
     if args.sock.is_some() {
         bail!("--sock requires app-server proxy");
     }
+    #[cfg(unix)]
+    let local_acp = if !args.stdio && args.listen == "unix://" && acp.is_none() {
+        let socket = default_socket()?;
+        claude_codex_server::local_acp::LocalAcp::root_for_socket(&socket).and_then(|root| {
+            match claude_codex_server::local_acp::LocalAcp::read(root) {
+                Ok(config) => config.map(|config| (root.to_owned(), config)),
+                Err(error) => {
+                    eprintln!("Local ACP configuration is unavailable: {error:#}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
     let endpoint = if args.stdio {
         "stdio://".to_owned()
     } else if args.listen == "unix://" {
@@ -380,6 +408,9 @@ async fn run(
     let termination = termination()?;
     let engine = tokio::spawn(server.run(receiver));
     let shutdown = CancellationToken::new();
+    #[cfg(unix)]
+    let local_acp =
+        local_acp.map(|(root, config)| tokio::spawn(config.supervise(root, shutdown.clone())));
     let result = tokio::select! {
         result = transport::serve(&endpoint, events.clone(), shutdown.clone()) => result,
         _ = termination => Ok(()),
@@ -387,6 +418,10 @@ async fn run(
     shutdown.cancel();
     let _ = events.send(Event::Shutdown).await;
     let _ = engine.await;
+    #[cfg(unix)]
+    if let Some(worker) = local_acp {
+        let _ = worker.await;
+    }
     result
 }
 

@@ -7,7 +7,7 @@ serves the subset listed in [COMPATIBILITY.md](../COMPATIBILITY.md).
 
 | Wire change | Claudex behavior |
 | --- | --- |
-| `model/list.modelProvider` | The router preserves explicit native provider queries. The default query still merges the catalogs. A direct facade client can select the facade's provider ID. |
+| `model/list.modelProvider` | The router preserves explicit native provider queries. The default query combines Codex, Claude, and configured local ACP models. A direct facade client can select the facade's provider ID. |
 | `Thread.attachedToThreadId`, `includeAttachedThreads` | Stored side chats report their parent. An opted-in search includes them. The router emits the upstream result shape for merged searches. Listing side chats by parent still works. |
 | `thread/list.currentAccountOnly` | Native Codex applies its login filter to native threads. Facade history has no ChatGPT login scope. |
 | `thread/section/changed` | The facade broadcasts after a successful section move, including reordering or leaving a section. |

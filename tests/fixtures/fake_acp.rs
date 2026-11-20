@@ -233,7 +233,7 @@ fn config_options(flags: &Flags, session: &Session) -> Value {
     if flags.has("--no-models") || flags.has("--legacy-models") {
         return json!([]);
     }
-    json!([
+    let mut options = json!([
         {"id": "model", "name": "Model", "category": "model", "type": "select",
          "currentValue": session.model,
          "options": [{"group": "main", "name": "Main", "options": [{"value": "fake-a", "name": "Fake A", "description": "First fake model"}]},
@@ -242,7 +242,14 @@ fn config_options(flags: &Flags, session: &Session) -> Value {
          "currentValue": session.effort,
          "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"},
                      {"value": "high", "name": "High"}]}
-    ])
+    ]);
+    if flags.has("--extra-model") {
+        options[0]["options"][1]["options"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"value":"fake-c","name":"Fake C"}));
+    }
+    options
 }
 
 fn session_response(flags: &Flags, session: &Session) -> Value {
