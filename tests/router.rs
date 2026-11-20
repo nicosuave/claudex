@@ -50,6 +50,70 @@ impl Facade {
         }
     }
 
+    async fn start_with_local_acp() -> Self {
+        let state = tempfile::tempdir_in("/tmp").unwrap();
+        let root = state.path();
+        let sockets = root.join("sockets");
+        let socket = sockets.join("app-server-control.sock");
+        std::fs::create_dir(&sockets).unwrap();
+        let config = claude_codex_server::local_acp::LocalAcp {
+            executable: env!("CARGO_BIN_EXE_fake-acp").into(),
+            args: vec![
+                format!("--store={}", root.join("native-acp").display()),
+                "--extra-model".into(),
+            ],
+            provider_id: "fake-provider".into(),
+            provider_name: "Fake Provider".into(),
+            model: "fake-b".into(),
+            include_models: vec!["fake-a".into()],
+            initialize_timeout_seconds: 3,
+        };
+        std::fs::write(
+            claude_codex_server::local_acp::LocalAcp::config_path(root),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        for name in DEPLOYMENT_ENV {
+            command.env_remove(name);
+        }
+        let child = command
+            .args([
+                "app-server",
+                "--listen",
+                "unix://",
+                "--claude",
+                env!("CARGO_BIN_EXE_fake-claude"),
+                "--model",
+                "opus",
+            ])
+            .args(["--initialize-timeout-seconds", "3"])
+            .env("CLAUDE_CODEX_SOCKET_DIR", &sockets)
+            .arg("--state-dir")
+            .arg(root.join("state"))
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let acp_socket = claude_codex_server::local_acp::LocalAcp::socket(root);
+        tokio::time::timeout(DEADLINE, async {
+            for path in [&socket, &acp_socket] {
+                while tokio::net::UnixStream::connect(path).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        })
+        .await
+        .expect("both local facades are listening");
+        Self {
+            _child: child,
+            socket,
+            _state: state,
+        }
+    }
+
     async fn launch(state: &tempfile::TempDir, socket: &Path, claude: &str) -> Child {
         Self::launch_with_model(state, socket, claude, "fake-claude").await
     }
@@ -1504,6 +1568,159 @@ async fn one_picker_and_one_sidebar_span_codex_and_claude() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(loaded.contains(&codex.as_str()) && loaded.contains(&claude.as_str()));
+}
+
+#[tokio::test]
+async fn selected_local_acp_models_join_the_picker_and_adopt_only_their_own_chats() {
+    let mut facade = Facade::start_with_local_acp().await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let catalog = desktop.ok("model/list", json!({})).await;
+    let models = catalog["data"].as_array().unwrap();
+    for model in ["gpt-fake", "opus", "fake-a", "fake-b"] {
+        assert_eq!(
+            models.iter().filter(|entry| entry["id"] == model).count(),
+            1
+        );
+    }
+    assert!(models.iter().all(|entry| entry["id"] != "fake-c"));
+    assert!(
+        models
+            .iter()
+            .any(|entry| entry["id"] == "fake-b" && entry["displayName"] == "Fake B")
+    );
+    let defaults: Vec<_> = models
+        .iter()
+        .filter(|entry| entry["isDefault"] == true)
+        .collect();
+    assert_eq!(defaults.len(), 1);
+    assert_eq!(defaults[0]["id"], "gpt-fake");
+
+    let claude = desktop.thread(json!({"model":"opus"})).await;
+    let denied = desktop
+        .call(
+            "thread/start",
+            json!({"model":"fake-b","permissions":":workspace"}),
+        )
+        .await;
+    assert_eq!(
+        denied["error"]["message"],
+        "Local ACP chats require Full access"
+    );
+    let prewarmed = desktop
+        .thread(json!({"sandbox":"workspace-write","approvalPolicy":"on-request"}))
+        .await;
+    // A permission selection can be acknowledged by Codex before the model
+    // changes. The adoption must respect that selection over stale prewarm data.
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({
+                "threadId":prewarmed, "permissions":":danger-full-access"
+            }),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({
+                "threadId":prewarmed, "model":"fake-b"
+            }),
+        )
+        .await;
+    let turn = desktop.turn(&prewarmed, "fake-b", "history").await;
+    assert!(turn.get("error").is_none(), "{turn}");
+    let reply = desktop
+        .until(|frame| {
+            frame["method"] == "item/completed"
+                && frame["params"]["threadId"] == prewarmed
+                && frame["params"]["item"]["type"] == "agentMessage"
+        })
+        .await;
+    assert!(
+        reply["params"]["item"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("model=fake-b"),
+        "{reply}"
+    );
+    let completed = desktop.completed(&prewarmed).await;
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let native = desktop.ok("fake/state", json!({})).await;
+    assert_eq!(native["unsubscribed"], json!([prewarmed]));
+    assert!(
+        !native["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start"))
+    );
+
+    let wrong = desktop.turn(&prewarmed, "opus", "stay on ACP").await;
+    assert!(
+        wrong["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("start a new chat")
+    );
+    let wrong = desktop.turn(&claude, "fake-b", "stay on Claude").await;
+    assert!(
+        wrong["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("runs on Claude")
+    );
+
+    // A second picked model can use the same ACP provider in the same chat.
+    let turn = desktop.turn(&prewarmed, "fake-a", "history").await;
+    assert!(turn.get("error").is_none(), "{turn}");
+    let completed = desktop.completed(&prewarmed).await;
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let reply = desktop
+        .until(|frame| {
+            frame["method"] == "item/completed"
+                && frame["params"]["threadId"] == prewarmed
+                && frame["params"]["turnId"] == turn["result"]["turn"]["id"]
+                && frame["params"]["item"]["type"] == "agentMessage"
+        })
+        .await;
+    assert!(
+        reply["params"]["item"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("model=fake-a"),
+        "{reply}"
+    );
+
+    // A new desktop connection has no memory of the adoption. Resolve the
+    // persisted thread's owner before consulting any merged thread list.
+    let mut reopened = Desktop::connect(&facade.socket, 0).await;
+    let thread = reopened
+        .ok("thread/read", json!({"threadId":prewarmed}))
+        .await;
+    assert_eq!(thread["thread"]["modelProvider"], "fake-provider");
+    assert_eq!(thread["thread"]["model"], "fake-a");
+    let threads = reopened.ok("thread/list", json!({})).await;
+    let threads = ids(&threads);
+    assert_eq!(threads.iter().filter(|id| **id == prewarmed).count(), 1);
+    assert!(threads.contains(&claude));
+
+    // Stop the parent as launchd would, so the supervised worker also exits.
+    let pid = facade._child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(DEADLINE, facade._child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let socket = claude_codex_server::local_acp::LocalAcp::socket(facade._state.path());
+    assert!(tokio::net::UnixStream::connect(socket).await.is_err());
 }
 
 #[tokio::test]

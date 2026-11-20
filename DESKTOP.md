@@ -107,6 +107,36 @@ Prompt-bar predictions run through the local router and native Claude prediction
 forks. See [prompt predictions](docs/prompt-predictions.md) for the compatibility
 contract and verification. No desktop app patch is needed.
 
+### ACP models in the local picker
+
+With the local Claudex router already installed, sign in to the agent in its
+own CLI and run:
+
+```sh
+claudex local-acp --acp-agent agy --acp-arg=acp \
+  --provider-name Antigravity --model gemini-4-argon \
+  --include-model gemini-4-neon --include-model gemini-4-hydrogen \
+  --include-model gemini-pro-orchestrator-neon \
+  --include-model gemini-pro-orchestrator-g1-pro
+```
+
+This updates the installed Claudex binary and restarts the existing login
+service. That service supervises the ACP facade on a private local Unix socket.
+The command uses the existing desktop launcher and needs neither SSH nor another
+LaunchAgent. The ACP provider has its own saved threads.
+
+Reopen Codex Desktop, start a new local chat, and select **Gemini 4 Argon**.
+Choose **Full access** for the ACP chat. ACP agents execute their own tools and
+Claudex cannot apply Codex's workspace sandbox to them. Codex stays the default in
+the combined picker, and existing chats keep their backend. The picker exposes
+the models selected through `--model` and repeated `--include-model` arguments
+when the agent advertises them in its ACP catalog. Use ACP model identifiers.
+
+To change the selection, rerun `claudex local-acp` with the desired models. To
+disable local ACP, remove the installer's `local-acp.json` from
+`~/Library/Application Support/claude-codex`, restart the idle service, and reopen
+Codex Desktop. The ACP chat store remains under `state/local-acp`.
+
 ### Connect from another computer
 
 On the remote Mac, run `claudex install`, then reconnect that Mac's
