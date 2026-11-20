@@ -1,5 +1,5 @@
 //! Local desktop router: one Codex app-server connection backed by both the
-//! genuine Codex app-server and the Claude facade.
+//! genuine Codex app-server, the Claude facade, and an optional local ACP facade.
 //!
 //! The desktop spawns this process in place of `codex app-server` (through
 //! `CODEX_CLI_PATH`). Every request goes to genuine Codex unless it concerns a
@@ -29,13 +29,17 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 
-use crate::protocol::{ADOPT_THREAD_METHOD, SECTION_CHANGED_METHOD};
+use crate::{
+    local_acp::LocalAcp,
+    protocol::{ADOPT_THREAD_METHOD, SECTION_CHANGED_METHOD},
+};
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Prefix for request ids the router itself sends to a backend.
 const INTERNAL_ID: &str = "claudex-router-";
 /// Prefix for facade server-request ids as presented to the desktop.
 const CLAUDE_REQUEST_ID: &str = "claudex:";
+const ACP_REQUEST_ID: &str = "claudex-acp:";
 const CURSOR_PREFIX: &str = "claudex-router:";
 /// Claude's catalog alias for "whatever Claude Code defaults to"; it would only
 /// duplicate a concrete model in the shared picker.
@@ -178,10 +182,39 @@ fn config_flags_only(args: &[String], app_server: bool) -> bool {
     true
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum Side {
     Codex,
     Claude,
+    Acp,
+}
+
+impl Side {
+    const FACADES: [Self; 2] = [Self::Claude, Self::Acp];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Acp => "local ACP",
+        }
+    }
+
+    fn service(self) -> &'static str {
+        match self {
+            Self::Codex => "The Codex service",
+            Self::Claude => "The Claude service",
+            Self::Acp => "The local ACP service",
+        }
+    }
+
+    fn request_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Codex => None,
+            Self::Claude => Some(CLAUDE_REQUEST_ID),
+            Self::Acp => Some(ACP_REQUEST_ID),
+        }
+    }
 }
 
 enum Input {
@@ -189,19 +222,41 @@ enum Input {
     ClientClosed,
     Backend(Side, Value),
     BackendClosed(Side),
-    ClaudeConnected(mpsc::Sender<Value>),
+    FacadeConnected(Side, mpsc::Sender<Value>),
 }
 
 enum Continuation {
     Ignore,
-    Probe { thread_id: String, request: Value },
-    ClaudeModels,
-    Adopt { thread_id: String, turn: Value },
-    Resume { thread_id: String, request: Value },
-    Section { thread_id: String, request: Value },
-    StartDefault { request: Value },
-    Merge { merge: u64, side: Side },
-    Delegation { side: Side, step: agents::Step },
+    Probe {
+        thread_id: String,
+        request: Value,
+        remaining: VecDeque<Side>,
+    },
+    FacadeModels,
+    Adopt {
+        thread_id: String,
+        turn: Value,
+    },
+    Resume {
+        thread_id: String,
+        request: Value,
+    },
+    Section {
+        side: Side,
+        thread_id: String,
+        request: Value,
+    },
+    StartDefault {
+        request: Value,
+    },
+    Merge {
+        merge: u64,
+        side: Side,
+    },
+    Delegation {
+        side: Side,
+        step: agents::Step,
+    },
 }
 
 enum MergeKind {
@@ -219,10 +274,10 @@ struct Merge {
     boundary: Option<i64>,
     codex: Option<Result<Value, Value>>,
     codex_pages: Vec<Value>,
-    claude: Vec<Value>,
-    /// Read receipts reported with the Claude pages, by thread id.
-    claude_read_states: serde_json::Map<String, Value>,
-    claude_done: bool,
+    facade_items: Vec<(Side, Value)>,
+    /// Read receipts reported with facade pages, by thread id.
+    facade_read_states: serde_json::Map<String, Value>,
+    pending_facades: HashSet<Side>,
 }
 
 struct Forwarded {
@@ -235,35 +290,65 @@ struct Forwarded {
 struct FreshThread {
     params: Value,
     metadata: Value,
+    permissions: Value,
+}
+
+fn remember_permissions(settings: &mut Value, update: &Value) {
+    if ["permissions", "sandboxPolicy"]
+        .iter()
+        .any(|&key| !update[key].is_null())
+    {
+        let settings = settings.as_object_mut().unwrap();
+        settings.remove("permissions");
+        settings.remove("sandboxPolicy");
+    }
+    for key in [
+        "permissions",
+        "sandboxPolicy",
+        "approvalPolicy",
+        "approvalsReviewer",
+    ] {
+        if let Some(value) = update.get(key).filter(|value| !value.is_null()) {
+            settings[key] = value.clone();
+        }
+    }
+}
+
+fn explicit_full_access(params: &Value) -> bool {
+    params["permissions"] == ":danger-full-access" || params["sandbox"] == "danger-full-access"
+}
+
+#[derive(Default)]
+struct Facade {
+    sender: Option<mpsc::Sender<Value>>,
+    initialized: bool,
+    models: Option<Vec<Value>>,
+    models_requested: bool,
 }
 
 pub struct Router {
     client: mpsc::Sender<Value>,
     codex: mpsc::Sender<Value>,
-    claude: Option<mpsc::Sender<Value>>,
-    claude_initialized: bool,
-    claude_configured: bool,
+    facades: HashMap<Side, Facade>,
+    acp_model: Option<String>,
     threads: HashMap<String, Side>,
     /// Codex threads started on this connection that have not run a turn;
     /// the desktop prewarms these before the user picks a model.
     fresh: HashMap<String, FreshThread>,
     initialize_params: Option<Value>,
-    claude_loaded: HashSet<String>,
+    facade_loaded: HashSet<String>,
     /// Actual providers behind the desktop prediction compatibility alias.
     prediction_providers: HashMap<String, String>,
-    /// Claude turns the desktop saw start and not yet finish, by thread. The
+    /// Facade turns the desktop saw start and not yet finish, by thread. The
     /// desktop's connection outlives a facade restart, so if the facade goes
     /// away first, only the router can end them.
-    claude_turns: HashMap<String, Value>,
-    /// Facade server requests (as presented to the desktop) awaiting an answer,
-    /// with their thread.
-    claude_requests: HashMap<String, String>,
+    facade_turns: HashMap<String, Value>,
+    /// Facade server requests awaiting an answer, with backend and thread.
+    facade_requests: HashMap<String, (Side, String)>,
     forwarded: HashMap<(Side, String), Forwarded>,
-    internal: HashMap<String, Continuation>,
+    internal: HashMap<String, (Side, Continuation)>,
     next_internal: u64,
-    claude_models: Option<Vec<Value>>,
     known_claude_models: HashSet<String>,
-    models_requested: bool,
     merges: HashMap<u64, Merge>,
     next_merge: u64,
     /// Client requests waiting for a routing fact, in arrival order.
@@ -416,25 +501,45 @@ pub async fn run(
         Some(child)
     };
 
-    let claude = match &claude_socket {
-        Some(path) => match connect_claude(path, events.clone(), false).await {
+    let mut paths = HashMap::new();
+    let mut acp_model = None;
+    if let Some(path) = &claude_socket {
+        paths.insert(Side::Claude, path.clone());
+        if !websocket && let Some(root) = LocalAcp::root_for_socket(path) {
+            match LocalAcp::read(root) {
+                Ok(Some(config)) => {
+                    paths.insert(Side::Acp, LocalAcp::socket(root));
+                    acp_model = Some(config.model);
+                }
+                Ok(None) => {}
+                Err(error) => note!("Local ACP configuration is unavailable: {error:#}"),
+            }
+        }
+    }
+    let mut facades = HashMap::new();
+    let mut reconnecting = HashSet::new();
+    for side in Side::FACADES {
+        let Some(path) = paths.get(&side) else {
+            continue;
+        };
+        let sender = match connect_facade(side, path, events.clone(), false).await {
             Ok(sender) => Some(sender),
             Err(error) => {
-                note!("Claude models are unavailable ({error:#}); serving Codex only");
+                note!("{} is unavailable ({error:#})", side.name());
+                reconnect_facade(side, path.clone(), events.clone());
+                reconnecting.insert(side);
                 None
             }
-        },
-        None => None,
-    };
-
-    let mut reconnecting = false;
-    if claude.is_none()
-        && let Some(path) = &claude_socket
-    {
-        reconnect_claude(path.clone(), events.clone());
-        reconnecting = true;
+        };
+        facades.insert(
+            side,
+            Facade {
+                sender,
+                ..Facade::default()
+            },
+        );
     }
-    let mut router = Router::new(client, codex_sender, claude, claude_socket.is_some());
+    let mut router = Router::new(client, codex_sender, facades, acp_model);
     let (calls, mut agent_calls) = mpsc::channel(64);
     router.agents.calls = Some(calls);
     if let Some(socket) = &claude_socket {
@@ -451,18 +556,19 @@ pub async fn run(
         match input {
             Input::Client(message) => router.client_message(message),
             Input::Backend(side, message) => router.backend_message(side, message),
-            Input::BackendClosed(Side::Claude) => {
-                router.claude_failed();
-                if !reconnecting && let Some(path) = &claude_socket {
-                    reconnect_claude(path.clone(), events.clone());
-                    reconnecting = true;
+            Input::ClientClosed | Input::BackendClosed(Side::Codex) => break,
+            Input::BackendClosed(side) => {
+                router.facade_failed(side);
+                if let Some(path) = paths.get(&side)
+                    && reconnecting.insert(side)
+                {
+                    reconnect_facade(side, path.clone(), events.clone());
                 }
             }
-            Input::ClaudeConnected(sender) => {
-                reconnecting = false;
-                router.claude_connected(sender);
+            Input::FacadeConnected(side, sender) => {
+                reconnecting.remove(&side);
+                router.facade_connected(side, sender);
             }
-            Input::ClientClosed | Input::BackendClosed(Side::Codex) => break,
         }
     }
     router.stop_agents();
@@ -525,7 +631,8 @@ where
     });
 }
 
-async fn connect_claude(
+async fn connect_facade(
+    side: Side,
     path: &Path,
     events: mpsc::Sender<Input>,
     announce: bool,
@@ -546,7 +653,7 @@ async fn connect_claude(
     // ordered after the connection event, never mistaken for the old socket.
     if announce {
         events
-            .send(Input::ClaudeConnected(sender.clone()))
+            .send(Input::FacadeConnected(side, sender.clone()))
             .await
             .map_err(|_| anyhow::anyhow!("Desktop connection closed"))?;
     }
@@ -569,11 +676,7 @@ async fn connect_claude(
                     let Ok(message) = serde_json::from_str(&text) else {
                         continue;
                     };
-                    if events
-                        .send(Input::Backend(Side::Claude, message))
-                        .await
-                        .is_err()
-                    {
+                    if events.send(Input::Backend(side, message)).await.is_err() {
                         return;
                     }
                 }
@@ -581,20 +684,20 @@ async fn connect_claude(
                 Ok(_) => {}
             }
         }
-        let _ = events.send(Input::BackendClosed(Side::Claude)).await;
+        let _ = events.send(Input::BackendClosed(side)).await;
     });
     Ok(sender)
 }
 
 /// Keep the desktop's Codex connection alive while the login service restarts.
 /// No user requests are replayed: only the handshake and catalog are refreshed.
-fn reconnect_claude(path: PathBuf, events: mpsc::Sender<Input>) {
+fn reconnect_facade(side: Side, path: PathBuf, events: mpsc::Sender<Input>) {
     tokio::spawn(async move {
         while !events.is_closed() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             if let Ok(Ok(sender)) = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                connect_claude(&path, events.clone(), true),
+                connect_facade(side, &path, events.clone(), true),
             )
             .await
             {
@@ -603,6 +706,10 @@ fn reconnect_claude(path: PathBuf, events: mpsc::Sender<Input>) {
             }
         }
     });
+}
+
+pub(crate) fn native_claude_alias(model: &str) -> bool {
+    model.starts_with("claude-") || ["opus", "sonnet", "haiku", "fable"].contains(&model)
 }
 
 /// Collaboration mode settings override the top-level model in both runtimes.
@@ -741,28 +848,25 @@ impl Router {
     fn new(
         client: mpsc::Sender<Value>,
         codex: mpsc::Sender<Value>,
-        claude: Option<mpsc::Sender<Value>>,
-        claude_configured: bool,
+        facades: HashMap<Side, Facade>,
+        acp_model: Option<String>,
     ) -> Self {
         Self {
             client,
             codex,
-            claude,
-            claude_initialized: false,
-            claude_configured,
+            facades,
+            acp_model,
             threads: HashMap::new(),
             fresh: HashMap::new(),
             initialize_params: None,
-            claude_loaded: HashSet::new(),
+            facade_loaded: HashSet::new(),
             prediction_providers: HashMap::new(),
-            claude_turns: HashMap::new(),
-            claude_requests: HashMap::new(),
+            facade_turns: HashMap::new(),
+            facade_requests: HashMap::new(),
             forwarded: HashMap::new(),
             internal: HashMap::new(),
             next_internal: 1,
-            claude_models: None,
             known_claude_models: HashSet::new(),
-            models_requested: false,
             merges: HashMap::new(),
             next_merge: 1,
             queue: VecDeque::new(),
@@ -785,7 +889,10 @@ impl Router {
     fn send_backend_checked(&self, side: Side, message: Value) -> bool {
         let sender = match side {
             Side::Codex => Some(&self.codex),
-            Side::Claude => self.claude.as_ref(),
+            _ => self
+                .facades
+                .get(&side)
+                .and_then(|facade| facade.sender.as_ref()),
         };
         if sender.is_none_or(|sender| sender.try_send(message).is_err()) {
             note!("{side:?} input queue is full or closed");
@@ -807,10 +914,11 @@ impl Router {
     ) {
         let id = format!("{INTERNAL_ID}{}", self.next_internal);
         self.next_internal += 1;
-        self.internal.insert(id.clone(), continuation);
+        self.internal.insert(id.clone(), (side, continuation));
         if !self.send_backend_checked(side, json!({"id": id, "method": method, "params": params})) {
-            let continuation = self.internal.remove(&id).unwrap();
+            let (_, continuation) = self.internal.remove(&id).unwrap();
             self.continue_with(
+                side,
                 continuation,
                 Err(json!({"code":-32000,"message":"Native backend input queue is unavailable"})),
             );
@@ -818,13 +926,26 @@ impl Router {
     }
 
     fn forward(&mut self, side: Side, mut message: Value) {
-        if side == Side::Claude && !self.claude_available() {
+        if side != Side::Codex && !self.facade_available(side) {
             if let Some(id) = message.get("id") {
                 self.send_client(error(
                     id.clone(),
-                    "The Claude service is reconnecting; retry this request shortly",
+                    format!(
+                        "{} is reconnecting; retry this request shortly",
+                        side.service()
+                    ),
                 ));
             }
+            return;
+        }
+        if side == Side::Acp
+            && message["method"] == "thread/start"
+            && !explicit_full_access(&message["params"])
+        {
+            self.send_client(error(
+                message["id"].clone(),
+                "Local ACP chats require Full access",
+            ));
             return;
         }
         if side == Side::Claude
@@ -837,18 +958,18 @@ impl Router {
             // Resolve it only after thread ownership has selected Claude.
             message["params"]["modelProvider"] = json!(provider);
         }
-        if side == Side::Claude
+        if side != Side::Codex
             && matches!(
                 message["method"].as_str(),
                 Some("turn/start" | "turn/steer" | "turn/interrupt" | "thread/compact/start")
             )
             && let Some(thread) = message["params"]["threadId"].as_str()
-            && !self.claude_loaded.contains(thread)
+            && !self.facade_loaded.contains(thread)
         {
             let thread_id = thread.to_owned();
             self.block_thread(&thread_id, Block::Resume);
             self.internal_request(
-                Side::Claude,
+                side,
                 "thread/resume",
                 json!({"threadId":thread_id,"excludeTurns":true}),
                 Continuation::Resume {
@@ -876,7 +997,7 @@ impl Router {
                 )
             });
         }
-        if side == Side::Claude
+        if side != Side::Codex
             && message["method"]
                 .as_str()
                 .is_some_and(|method| INPUT_METHODS.contains(&method))
@@ -913,35 +1034,55 @@ impl Router {
     }
 
     fn claude_available(&self) -> bool {
-        self.claude.is_some() && self.claude_initialized
+        self.facade_available(Side::Claude)
+    }
+
+    fn facade_available(&self, side: Side) -> bool {
+        self.facades
+            .get(&side)
+            .is_some_and(|facade| facade.sender.is_some() && facade.initialized)
+    }
+
+    fn available_facades(&self) -> Vec<Side> {
+        Side::FACADES
+            .into_iter()
+            .filter(|&side| self.facade_available(side))
+            .collect()
     }
 
     /// `None` until the facade's catalog is known.
     fn is_claude_model(&self, model: &str) -> Option<bool> {
-        if self.known_claude_models.contains(model)
-            || model.starts_with("claude-")
-            || ["opus", "sonnet", "haiku", "fable"].contains(&model)
-        {
+        if self.known_claude_models.contains(model) || native_claude_alias(model) {
             return Some(true);
         }
         if !self.claude_available() {
             return Some(false);
         }
-        self.claude_models
+        self.facades[&Side::Claude]
+            .models
             .as_ref()
             .map(|models| models.iter().any(|entry| entry["id"] == model))
     }
 
-    fn request_claude_models(&mut self) {
-        if !self.models_requested && self.claude_available() {
-            self.models_requested = true;
-            self.internal_request(
-                Side::Claude,
-                "model/list",
-                json!({"limit": 1000}),
-                Continuation::ClaudeModels,
-            );
+    fn model_side(&self, model: &str) -> Option<Side> {
+        if self.acp_model.as_deref() == Some(model) {
+            return Some(Side::Acp);
         }
+        self.is_claude_model(model)
+            .map(|owned| if owned { Side::Claude } else { Side::Codex })
+    }
+
+    fn request_facade_models(&mut self, side: Side) {
+        if !self.facade_available(side) || self.facades[&side].models_requested {
+            return;
+        }
+        self.facades.get_mut(&side).unwrap().models_requested = true;
+        self.internal_request(
+            side,
+            "model/list",
+            json!({"limit": 1000}),
+            Continuation::FacadeModels,
+        );
     }
 
     /// Hold client traffic until a routing fact arrives, preserving order.
@@ -1035,17 +1176,17 @@ impl Router {
     }
 
     fn client_response(&mut self, mut message: Value) {
-        if let Some(id) = message["id"].as_str() {
-            self.claude_requests.remove(id);
-        }
-        let decoded = message["id"]
-            .as_str()
-            .and_then(|id| id.strip_prefix(CLAUDE_REQUEST_ID))
-            .and_then(|id| serde_json::from_str::<Value>(id).ok());
+        let decoded = message["id"].as_str().and_then(|id| {
+            self.facade_requests.remove(id);
+            Side::FACADES.into_iter().find_map(|side| {
+                let raw = id.strip_prefix(side.request_prefix()?)?;
+                Some((side, serde_json::from_str::<Value>(raw).ok()?))
+            })
+        });
         match decoded {
-            Some(id) => {
+            Some((side, id)) => {
                 message["id"] = id;
-                self.send_backend(Side::Claude, message);
+                self.send_backend(side, message);
             }
             None => self.send_backend(Side::Codex, message),
         }
@@ -1057,8 +1198,10 @@ impl Router {
             return;
         };
         let Some(id) = message.get("id").cloned() else {
-            if method == "initialized" && self.claude_available() {
-                self.send_backend(Side::Claude, message.clone());
+            if method == "initialized" {
+                for side in self.available_facades() {
+                    self.send_backend(side, message.clone());
+                }
             }
             self.send_backend(Side::Codex, message);
             if method == "initialized" {
@@ -1070,63 +1213,64 @@ impl Router {
         match method.as_str() {
             "initialize" => {
                 self.initialize_params = Some(params.clone());
-                if self.claude.is_some() {
-                    self.claude_initialized = true;
-                    self.internal_request(Side::Claude, "initialize", params, Continuation::Ignore);
+                for side in Side::FACADES {
+                    if let Some(facade) = self.facades.get_mut(&side)
+                        && facade.sender.is_some()
+                    {
+                        facade.initialized = true;
+                        self.internal_request(
+                            side,
+                            "initialize",
+                            params.clone(),
+                            Continuation::Ignore,
+                        );
+                    }
                 }
                 self.forward(Side::Codex, message);
             }
-            "model/list" if self.claude_available() => {
-                self.request_claude_models();
+            "model/list" if !self.available_facades().is_empty() => {
+                for side in self.available_facades() {
+                    self.request_facade_models(side);
+                }
                 self.start_merge(id, MergeKind::Models, params);
             }
-            "thread/loaded/list" if self.claude_available() => {
+            "thread/loaded/list" if !self.available_facades().is_empty() => {
                 self.start_merge(id, MergeKind::Loaded, params);
             }
-            "thread/attachmentOwner/list" if self.claude_available() => {
+            "thread/attachmentOwner/list" if !self.available_facades().is_empty() => {
                 self.start_merge(id, MergeKind::Owners, params);
             }
-            "thread/list" | "thread/search" if self.claude_available() => {
-                let related = params["parentThreadId"]
-                    .as_str()
-                    .or_else(|| params["ancestorThreadId"].as_str())
-                    .map(str::to_owned);
-                match related {
-                    Some(_) => self.start_merge(
-                        id,
-                        MergeKind::Threads {
-                            search: method == "thread/search",
-                        },
-                        params,
-                    ),
-                    None => self.start_merge(
-                        id,
-                        MergeKind::Threads {
-                            search: method == "thread/search",
-                        },
-                        params,
-                    ),
-                }
+            "thread/list" | "thread/search" if !self.available_facades().is_empty() => {
+                self.start_merge(
+                    id,
+                    MergeKind::Threads {
+                        search: method == "thread/search",
+                    },
+                    params,
+                );
             }
             "thread/sample/cancel" => {
                 // A cancel names only the sample's request id, which tells
                 // which backend received that sample.
-                let claude = self
-                    .forwarded
-                    .get(&(Side::Claude, id_key(&params["requestId"])))
-                    .is_some_and(|forwarded| forwarded.method == "thread/sample");
-                let side = if claude { Side::Claude } else { Side::Codex };
+                let request = id_key(&params["requestId"]);
+                let side = Side::FACADES
+                    .into_iter()
+                    .find(|&side| {
+                        self.forwarded
+                            .get(&(side, request.clone()))
+                            .is_some_and(|forwarded| forwarded.method == "thread/sample")
+                    })
+                    .unwrap_or(Side::Codex);
                 self.forward(side, message);
             }
             "thread/start" => match selected_model(&params) {
-                Some(model) => match self.is_claude_model(model) {
+                Some(model) => match self.model_side(model) {
                     None => {
                         // Block first: a failed request completes synchronously.
                         self.block(Block::Models, message);
-                        self.request_claude_models();
+                        self.request_facade_models(Side::Claude);
                     }
-                    Some(true) => self.forward(Side::Claude, message),
-                    Some(false) => self.forward(Side::Codex, message),
+                    Some(side) => self.forward(side, message),
                 },
                 None => {
                     // The desktop saves its picked model as a Codex config
@@ -1155,60 +1299,41 @@ impl Router {
     fn route_by_thread(&mut self, thread: &str, message: Value) {
         let side = match self.threads.get(thread) {
             Some(side) => *side,
-            None if self.claude_available() => {
+            None if !self.facades.is_empty() => {
                 let thread_id = thread.to_owned();
                 self.block_thread(&thread_id, Block::Probe);
-                self.internal_request(
-                    Side::Claude,
-                    "thread/read",
-                    json!({"threadId": thread_id}),
-                    Continuation::Probe {
-                        thread_id: thread_id.clone(),
-                        request: message,
-                    },
-                );
-                return;
-            }
-            None if self.claude_configured => {
-                self.send_client(error(
-                    message["id"].clone(),
-                    "The Claude service is reconnecting; thread ownership cannot be checked yet",
-                ));
+                self.probe_thread(thread_id, message, self.available_facades().into());
                 return;
             }
             None => Side::Codex,
         };
         let method = message["method"].as_str().unwrap_or("").to_owned();
         if let Some(model) = selected_model(&message["params"]).map(str::to_owned) {
-            let Some(claude_model) = self.is_claude_model(&model) else {
+            let Some(target) = self.model_side(&model) else {
                 self.block(Block::Models, message);
-                self.request_claude_models();
+                self.request_facade_models(Side::Claude);
                 return;
             };
-            if claude_model != (side == Side::Claude) {
+            if target != side {
                 if matches!(method.as_str(), "turn/start" | "thread/settings/update")
                     && side == Side::Codex
                     && self.fresh.contains_key(thread)
                 {
-                    self.adopt(thread, message);
+                    self.adopt(target, thread, message);
                 } else {
                     self.send_client(error(
                         message["id"].clone(),
-                        match side {
-                            Side::Claude => {
-                                format!("This chat runs on Claude; start a new chat to use {model}")
-                            }
-                            Side::Codex => {
-                                format!("This chat runs on Codex; start a new chat to use {model}")
-                            }
-                        },
+                        format!(
+                            "This chat runs on {}; start a new chat to use {model}",
+                            side.name()
+                        ),
                     ));
                 }
                 return;
             }
         }
-        if side == Side::Claude && APP_METHODS.contains(&method.as_str()) {
-            // Genuine Codex serves apps; it does not know the Claude thread.
+        if side != Side::Codex && APP_METHODS.contains(&method.as_str()) {
+            // Genuine Codex serves apps; it does not know facade threads.
             let mut message = message;
             if let Some(params) = message["params"].as_object_mut() {
                 params.remove("threadId");
@@ -1224,6 +1349,38 @@ impl Router {
             self.fresh.remove(thread);
         }
         self.forward(side, message);
+    }
+
+    fn probe_thread(&mut self, thread_id: String, request: Value, mut remaining: VecDeque<Side>) {
+        if let Some(side) = remaining.pop_front() {
+            self.internal_request(
+                side,
+                "thread/read",
+                json!({"threadId": thread_id}),
+                Continuation::Probe {
+                    thread_id,
+                    request,
+                    remaining,
+                },
+            );
+            return;
+        }
+        if let Some(side) = Side::FACADES
+            .into_iter()
+            .find(|side| self.facades.contains_key(side) && !self.facade_available(*side))
+        {
+            self.send_client(error(
+                request["id"].clone(),
+                format!(
+                    "{} is reconnecting; thread ownership cannot be checked yet",
+                    side.service()
+                ),
+            ));
+        } else {
+            self.threads.insert(thread_id.clone(), Side::Codex);
+            self.dispatch(request);
+        }
+        self.unblock_thread(&thread_id, Block::Probe);
     }
 
     /// Each backend files its own threads, and neither can place a thread
@@ -1255,6 +1412,7 @@ impl Router {
             "threadSection/list",
             json!({"cursor": null, "limit": 100}),
             Continuation::Section {
+                side,
                 thread_id,
                 request: message,
             },
@@ -1265,17 +1423,20 @@ impl Router {
     fn forget_thread(&mut self, thread: &str) {
         self.threads.remove(thread);
         self.fresh.remove(thread);
-        self.claude_loaded.remove(thread);
+        self.facade_loaded.remove(thread);
         self.prediction_providers.remove(thread);
-        self.claude_turns.remove(thread);
+        self.facade_turns.remove(thread);
         self.agent_thread_deleted(thread);
     }
 
-    /// Claude threads keep their own copy of the section they are filed in.
+    /// Facade threads keep their own copy of the section they are filed in.
     fn section_changed(&mut self, section_id: Value, section: Value) {
-        if self.claude_available() && section_id.is_string() {
+        if !section_id.is_string() {
+            return;
+        }
+        for side in self.available_facades() {
             self.internal_request(
-                Side::Claude,
+                side,
                 SECTION_CHANGED_METHOD,
                 json!({"sectionId": section_id, "section": section}),
                 Continuation::Ignore,
@@ -1283,13 +1444,16 @@ impl Router {
         }
     }
 
-    /// Move the desktop's prewarmed, still-empty Codex thread to Claude under
+    /// Move the desktop's prewarmed, still-empty Codex thread to a facade under
     /// the same id, then run the requested turn there.
-    fn adopt(&mut self, thread: &str, turn: Value) {
-        if !self.claude_available() {
+    fn adopt(&mut self, side: Side, thread: &str, turn: Value) {
+        if !self.facade_available(side) {
             self.send_client(error(
                 turn["id"].clone(),
-                "The Claude service is reconnecting; retry this request shortly",
+                format!(
+                    "{} is reconnecting; retry this request shortly",
+                    side.service()
+                ),
             ));
             return;
         }
@@ -1299,6 +1463,44 @@ impl Router {
             .expect("fresh thread checked before adoption")
             .clone();
         let mut params = fresh.params;
+        if side == Side::Acp {
+            let method = turn["method"].as_str().unwrap_or("turn/start");
+            let mut overrides = fresh.permissions;
+            remember_permissions(&mut overrides, &turn["params"]);
+            let overrides = match crate::desktop::normalize(method, &overrides) {
+                Ok((overrides, _warnings)) => overrides,
+                Err(failure) => {
+                    self.send_client(failure.response(turn["id"].clone()));
+                    return;
+                }
+            };
+            if let Some(policy) = overrides
+                .get("sandboxPolicy")
+                .filter(|value| !value.is_null())
+            {
+                if policy["type"] != "dangerFullAccess" {
+                    self.send_client(error(
+                        turn["id"].clone(),
+                        "Local ACP chats require Full access",
+                    ));
+                    return;
+                }
+                params.as_object_mut().unwrap().remove("permissions");
+                params["sandbox"] = json!("danger-full-access");
+            }
+            for key in ["approvalPolicy", "approvalsReviewer"] {
+                if let Some(value) = overrides.get(key).filter(|value| !value.is_null()) {
+                    params[key] = value.clone();
+                }
+            }
+            if !explicit_full_access(&params) {
+                self.send_client(error(
+                    turn["id"].clone(),
+                    "Local ACP chats require Full access",
+                ));
+                return;
+            }
+        }
         if let Some(config) = params["config"].as_object_mut() {
             config.remove("mcp_servers.claudex_agents");
         }
@@ -1306,7 +1508,7 @@ impl Router {
             tools.retain(|tool| *tool != crate::delegation::dynamic_spec());
         }
         let mut start = json!({"method":"thread/start","params":params});
-        if let Err(failure) = self.prepare_agent_tools(Side::Claude, &mut start) {
+        if let Err(failure) = self.prepare_agent_tools(side, &mut start) {
             self.send_client(error(turn["id"].clone(), failure.to_string()));
             return;
         }
@@ -1318,7 +1520,7 @@ impl Router {
         let thread_id = thread.to_owned();
         self.block_thread(&thread_id, Block::Adopt);
         self.internal_request(
-            Side::Claude,
+            side,
             ADOPT_THREAD_METHOD,
             json!({"threadId": thread_id, "params": params, "metadata": {
                 "projectId":fresh.metadata["projectId"],
@@ -1354,54 +1556,19 @@ impl Router {
             codex_params["limit"] = json!(1000);
             boundary = None;
         }
-        self.internal_request(
-            Side::Codex,
-            codex_method,
-            codex_params,
-            Continuation::Merge {
-                merge,
-                side: Side::Codex,
-            },
-        );
-        let claude_done = match kind {
-            MergeKind::Models => true,
-            MergeKind::Loaded => {
-                self.internal_request(
-                    Side::Claude,
-                    "thread/loaded/list",
-                    json!({"limit": 1000}),
-                    Continuation::Merge {
-                        merge,
-                        side: Side::Claude,
-                    },
-                );
-                false
-            }
-            MergeKind::Owners => {
-                self.internal_request(
-                    Side::Claude,
-                    "thread/attachmentOwner/list",
-                    claude_owner_query(&params, None),
-                    Continuation::Merge {
-                        merge,
-                        side: Side::Claude,
-                    },
-                );
-                false
-            }
-            MergeKind::Threads { .. } => {
-                let query = claude_list_query(&params, None);
-                self.internal_request(
-                    Side::Claude,
-                    "thread/list",
-                    query,
-                    Continuation::Merge {
-                        merge,
-                        side: Side::Claude,
-                    },
-                );
-                false
-            }
+        let query = match kind {
+            MergeKind::Models => None,
+            MergeKind::Loaded => Some(("thread/loaded/list", json!({"limit": 1000}))),
+            MergeKind::Owners => Some((
+                "thread/attachmentOwner/list",
+                claude_owner_query(&params, None),
+            )),
+            MergeKind::Threads { .. } => Some(("thread/list", claude_list_query(&params, None))),
+        };
+        let facades = if query.is_some() {
+            self.available_facades()
+        } else {
+            vec![]
         };
         self.merges.insert(
             merge,
@@ -1412,11 +1579,30 @@ impl Router {
                 boundary,
                 codex: None,
                 codex_pages: vec![],
-                claude: vec![],
-                claude_read_states: serde_json::Map::new(),
-                claude_done,
+                facade_items: vec![],
+                facade_read_states: serde_json::Map::new(),
+                pending_facades: facades.iter().copied().collect(),
             },
         );
+        self.internal_request(
+            Side::Codex,
+            codex_method,
+            codex_params,
+            Continuation::Merge {
+                merge,
+                side: Side::Codex,
+            },
+        );
+        if let Some((method, params)) = query {
+            for side in facades {
+                self.internal_request(
+                    side,
+                    method,
+                    params.clone(),
+                    Continuation::Merge { merge, side },
+                );
+            }
+        }
     }
 
     fn merge_part(&mut self, merge: u64, side: Side, result: Result<Value, Value>) {
@@ -1443,12 +1629,17 @@ impl Router {
                 }
             }
             (Side::Codex, result) => state.codex = Some(result),
-            (Side::Claude, Ok(page)) => {
-                state
-                    .claude
-                    .extend(page["data"].as_array().cloned().unwrap_or_default());
+            (side, Ok(page)) => {
+                state.facade_items.extend(
+                    page["data"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                        .map(|item| (side, item)),
+                );
                 if let Some(read_states) = page["readStates"].as_object() {
-                    state.claude_read_states.extend(read_states.clone());
+                    state.facade_read_states.extend(read_states.clone());
                 }
                 match page["nextCursor"].as_str() {
                     Some(cursor) => {
@@ -1468,13 +1659,15 @@ impl Router {
                             ),
                         });
                     }
-                    None => state.claude_done = true,
+                    None => {
+                        state.pending_facades.remove(&side);
+                    }
                 }
             }
-            // The Claude side is additive; its failures never hide Codex.
-            (Side::Claude, Err(error)) => {
-                note!("Claude list failed: {error}");
-                state.claude_done = true;
+            // A facade failure never hides the other backends.
+            (side, Err(error)) => {
+                note!("{} list failed: {error}", side.name());
+                state.pending_facades.remove(&side);
             }
         }
         if let Some((method, query)) = next_page {
@@ -1484,13 +1677,16 @@ impl Router {
     }
 
     fn finish_merges(&mut self) {
-        let models_ready = self.claude_models.is_some() || !self.claude_available();
+        let models_ready = self
+            .available_facades()
+            .into_iter()
+            .all(|side| self.facades[&side].models.is_some());
         let ready: Vec<u64> = self
             .merges
             .iter()
             .filter(|(_, m)| {
                 m.codex.is_some()
-                    && m.claude_done
+                    && m.pending_facades.is_empty()
                     && (!matches!(m.kind, MergeKind::Models) || models_ready)
             })
             .map(|(id, _)| *id)
@@ -1502,40 +1698,52 @@ impl Router {
         }
     }
 
-    fn merged(&mut self, state: Merge) -> Value {
+    fn merged(&mut self, mut state: Merge) -> Value {
         let mut result = match state.codex.unwrap() {
             Ok(result) => result,
             Err(error) => return json!({"id": state.client_id, "error": error}),
         };
         let last_page = result["nextCursor"].is_null();
+        // Preserve backend order for ties and across pages of a section.
+        state.facade_items.sort_by_key(|(side, _)| *side);
         match state.kind {
             MergeKind::Models => {
-                if last_page && let Some(models) = &self.claude_models {
-                    let data = result["data"].as_array_mut();
-                    if let Some(data) = data {
-                        data.extend(models.iter().cloned());
+                if last_page && let Some(data) = result["data"].as_array_mut() {
+                    let mut seen: HashSet<Value> =
+                        data.iter().map(|model| model["id"].clone()).collect();
+                    for side in self.available_facades() {
+                        if let Some(models) = &self.facades[&side].models {
+                            data.extend(
+                                models
+                                    .iter()
+                                    .filter(|model| seen.insert(model["id"].clone()))
+                                    .cloned(),
+                            );
+                        }
                     }
                 }
             }
             MergeKind::Loaded => {
-                for id in state.claude.iter().filter_map(Value::as_str) {
-                    self.threads.insert(id.to_owned(), Side::Claude);
+                for (side, item) in &state.facade_items {
+                    if let Some(id) = item.as_str() {
+                        self.threads.insert(id.to_owned(), *side);
+                    }
                 }
                 if last_page && let Some(data) = result["data"].as_array_mut() {
-                    data.extend(state.claude);
+                    data.extend(state.facade_items.into_iter().map(|(_, item)| item));
                     let mut seen = HashSet::new();
                     data.retain(|id| seen.insert(id.to_string()));
                 }
             }
             MergeKind::Owners => {
-                for owner in &state.claude {
+                for (side, owner) in &state.facade_items {
                     if let Some(id) = owner["threadId"].as_str() {
-                        self.threads.insert(id.to_owned(), Side::Claude);
+                        self.threads.insert(id.to_owned(), *side);
                     }
                 }
-                // Claude's owners follow Codex's, like other combined lists.
+                // Facade owners follow Codex's, like other combined lists.
                 if last_page && let Some(data) = result["data"].as_array_mut() {
-                    data.extend(state.claude);
+                    data.extend(state.facade_items.into_iter().map(|(_, item)| item));
                     let mut seen = HashSet::new();
                     data.retain(|owner| seen.insert(owner["threadId"].to_string()));
                 }
@@ -1544,15 +1752,15 @@ impl Router {
                 let field = sort_field(&state.params);
                 let descending = descending(&state.params);
                 // Codex orders a section by its own positions, which cannot
-                // interleave with the facade's: Claude's members follow Codex's.
+                // interleave with the facades': their members follow Codex's.
                 let section_order = state.params["sortKey"] == "section_position";
                 let data = result["data"].as_array().cloned().unwrap_or_default();
                 // An adopted prewarm can still exist in Codex's metadata.
-                // Claude owns that id; never publish both copies or let the
+                // Its facade owns that id; never publish both copies or let the
                 // Codex copy overwrite it when the desktop hydrates its list.
-                for thread in &state.claude {
+                for (side, thread) in &state.facade_items {
                     if let Some(id) = thread["id"].as_str() {
-                        self.threads.insert(id.to_owned(), Side::Claude);
+                        self.threads.insert(id.to_owned(), *side);
                     }
                 }
                 for item in &data {
@@ -1560,7 +1768,7 @@ impl Router {
                         self.threads.entry(id.to_owned()).or_insert(Side::Codex);
                     }
                 }
-                // Each Claude thread belongs to the page whose Codex sort
+                // Each facade thread belongs to the page whose Codex sort
                 // values bracket it, so cursors stay Codex-driven and stable.
                 let end = if last_page {
                     None
@@ -1589,17 +1797,14 @@ impl Router {
                     .filter(|item| {
                         list_thread(item)["id"]
                             .as_str()
-                            .is_none_or(|id| self.threads.get(id) != Some(&Side::Claude))
+                            .is_none_or(|id| self.threads.get(id) == Some(&Side::Codex))
                     })
                     .collect();
                 // The facade's thread/list predates the originator filter.
                 let originators = state.params["originators"]
                     .as_array()
                     .filter(|list| !list.is_empty());
-                for thread in state.claude {
-                    if let Some(id) = thread["id"].as_str() {
-                        self.threads.insert(id.to_owned(), Side::Claude);
-                    }
+                for (_, thread) in state.facade_items {
                     let placed = if section_order {
                         last_page
                     } else {
@@ -1618,14 +1823,14 @@ impl Router {
                 }
                 // Receipts come from each thread's own backend, for this page's
                 // threads only. Null still means Codex's receipts are unavailable.
-                if !state.claude_read_states.is_empty() || result["readStates"].is_object() {
+                if !state.facade_read_states.is_empty() || result["readStates"].is_object() {
                     let mut read_states = result["readStates"]
                         .as_object()
                         .cloned()
                         .unwrap_or_default();
                     for thread in &merged {
                         if let Some(id) = list_thread(thread)["id"].as_str()
-                            && let Some(read_state) = state.claude_read_states.get(id)
+                            && let Some(read_state) = state.facade_read_states.get(id)
                         {
                             read_states.insert(id.to_owned(), read_state.clone());
                         }
@@ -1662,11 +1867,11 @@ impl Router {
                 if self.agent_dynamic_call(side, &message) {
                     return;
                 }
-                if side == Side::Claude {
-                    let request_id = format!("{CLAUDE_REQUEST_ID}{id}");
+                if let Some(prefix) = side.request_prefix() {
+                    let request_id = format!("{prefix}{id}");
                     if let Some(thread) = message["params"]["threadId"].as_str() {
-                        self.claude_requests
-                            .insert(request_id.clone(), thread.to_owned());
+                        self.facade_requests
+                            .insert(request_id.clone(), (side, thread.to_owned()));
                     }
                     message["id"] = json!(request_id);
                 }
@@ -1674,7 +1879,7 @@ impl Router {
             }
             (Some(method), None) => {
                 let ids = thread_ids(&message);
-                if side == Side::Claude && ids.is_empty() {
+                if side != Side::Codex && ids.is_empty() {
                     // Facade-wide plugin events duplicate genuine Codex's own.
                     return;
                 }
@@ -1682,7 +1887,7 @@ impl Router {
                     .iter()
                     .any(|id| self.threads.get(id).is_some_and(|owner| *owner != side))
                 {
-                    // A thread that moved to Claude no longer belongs to Codex.
+                    // A thread that moved to a facade no longer belongs to Codex.
                     return;
                 }
                 self.learn(side, &message);
@@ -1698,24 +1903,24 @@ impl Router {
                         self.fresh.remove(id);
                     }
                 }
-                if side == Side::Claude
-                    && method == "serverRequest/resolved"
+                if method == "serverRequest/resolved"
+                    && let Some(prefix) = side.request_prefix()
                     && let Some(request) = message["params"].get("requestId").cloned()
                 {
-                    let request_id = format!("{CLAUDE_REQUEST_ID}{request}");
-                    self.claude_requests.remove(&request_id);
+                    let request_id = format!("{prefix}{request}");
+                    self.facade_requests.remove(&request_id);
                     message["params"]["requestId"] = json!(request_id);
                 }
-                if side == Side::Claude
+                if side != Side::Codex
                     && let Some(thread) = message["params"]["threadId"].as_str()
                 {
                     match method.as_str() {
                         "turn/started" => {
-                            self.claude_turns
+                            self.facade_turns
                                 .insert(thread.to_owned(), message["params"]["turn"].clone());
                         }
                         "turn/completed" => {
-                            self.claude_turns.remove(thread);
+                            self.facade_turns.remove(thread);
                         }
                         _ => {}
                     }
@@ -1740,12 +1945,27 @@ impl Router {
         if let Ok(result) = &result {
             self.remember_agent_snapshot(result);
         }
-        if let Some(continuation) = id.as_str().and_then(|id| self.internal.remove(id)) {
-            self.continue_with(continuation, result);
+        if let Some(key) = id.as_str()
+            && self
+                .internal
+                .get(key)
+                .is_some_and(|(owner, _)| *owner == side)
+        {
+            let (_, continuation) = self.internal.remove(key).unwrap();
+            self.continue_with(side, continuation, result);
             return;
         }
         let forwarded = self.forwarded.remove(&(side, id_key(&id)));
         if let Some(forwarded) = &forwarded {
+            if side == Side::Codex
+                && result.is_ok()
+                && forwarded.method == "thread/settings/update"
+                && let Some(fresh) = forwarded.params["threadId"]
+                    .as_str()
+                    .and_then(|thread| self.fresh.get_mut(thread))
+            {
+                remember_permissions(&mut fresh.permissions, &forwarded.params);
+            }
             if result.is_ok()
                 && matches!(
                     forwarded.method.as_str(),
@@ -1755,7 +1975,7 @@ impl Router {
             {
                 self.agent_thread_unloaded(thread);
                 // Its later turn events no longer reach this connection.
-                self.claude_turns.remove(thread);
+                self.facade_turns.remove(thread);
             }
             if result.is_ok()
                 && forwarded.method == "thread/delete"
@@ -1799,10 +2019,10 @@ impl Router {
                 message["result"]["modelProvider"] = json!("openai");
             }
         }
-        if side == Side::Claude
+        if side != Side::Codex
             && let (Some(forwarded), Err(error)) = (&forwarded, &result)
         {
-            note!("Claude {} failed: {error}", forwarded.method);
+            note!("{} {} failed: {error}", side.name(), forwarded.method);
         }
         if let Some(forwarded) = forwarded
             && let Ok(result) = &result
@@ -1821,10 +2041,10 @@ impl Router {
                 );
             }
             self.threads.insert(thread.to_owned(), side);
-            if side == Side::Claude
+            if side != Side::Codex
                 && matches!(forwarded.method.as_str(), "thread/start" | "thread/resume")
             {
-                self.claude_loaded.insert(thread.to_owned());
+                self.facade_loaded.insert(thread.to_owned());
             }
             if side == Side::Codex && forwarded.method == "thread/start" {
                 self.fresh.insert(
@@ -1832,6 +2052,7 @@ impl Router {
                     FreshThread {
                         params: forwarded.params,
                         metadata: result["thread"].clone(),
+                        permissions: json!({}),
                     },
                 );
             } else if side == Side::Codex
@@ -1845,14 +2066,23 @@ impl Router {
         self.send_client(message);
     }
 
-    fn continue_with(&mut self, continuation: Continuation, result: Result<Value, Value>) {
+    fn continue_with(
+        &mut self,
+        side: Side,
+        continuation: Continuation,
+        result: Result<Value, Value>,
+    ) {
         match continuation {
             Continuation::Ignore => {}
-            Continuation::Probe { thread_id, request } => {
+            Continuation::Probe {
+                thread_id,
+                request,
+                remaining,
+            } => {
                 let blocked = thread_id.clone();
                 match result {
                     Ok(_) => {
-                        self.threads.insert(thread_id, Side::Claude);
+                        self.threads.insert(thread_id, side);
                         self.dispatch(request);
                     }
                     Err(failure)
@@ -1861,20 +2091,26 @@ impl Router {
                                 .as_str()
                                 .is_some_and(|m| m.starts_with("Thread not found:")) =>
                     {
-                        self.threads.insert(thread_id, Side::Codex);
-                        self.dispatch(request);
+                        self.probe_thread(thread_id, request, remaining);
+                        return;
                     }
                     Err(failure) => self.send_client(json!({"id":request["id"],"error":failure})),
                 }
                 self.unblock_thread(&blocked, Block::Probe);
             }
-            Continuation::ClaudeModels => {
+            Continuation::FacadeModels => {
+                let model = (side == Side::Acp)
+                    .then_some(self.acp_model.as_deref())
+                    .flatten();
                 let models: Vec<Value> = match result {
                     Ok(result) => result["data"]
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .filter(|model| model["id"] != CLAUDE_DEFAULT_ALIAS)
+                        .filter(|entry| {
+                            entry["id"] != CLAUDE_DEFAULT_ALIAS
+                                && model.is_none_or(|id| entry["id"] == id)
+                        })
                         .map(|model| {
                             let mut model = model.clone();
                             model["isDefault"] = json!(false);
@@ -1882,27 +2118,31 @@ impl Router {
                         })
                         .collect(),
                     Err(error) => {
-                        note!("Claude model catalog failed: {error}");
+                        note!("{} model catalog failed: {error}", side.name());
                         vec![]
                     }
                 };
-                for model in &models {
-                    if let Some(id) = model["id"].as_str() {
-                        self.known_claude_models.insert(id.to_owned());
+                if side == Side::Claude {
+                    for model in &models {
+                        if let Some(id) = model["id"].as_str() {
+                            self.known_claude_models.insert(id.to_owned());
+                        }
                     }
                 }
-                self.claude_models = Some(models);
+                self.facades.get_mut(&side).unwrap().models = Some(models);
                 self.finish_merges();
-                self.unblock(Block::Models);
+                if side == Side::Claude {
+                    self.unblock(Block::Models);
+                }
             }
             Continuation::Adopt { thread_id, turn } => {
                 let blocked = thread_id.clone();
                 match result {
                     Ok(_) => {
                         self.fresh.remove(&thread_id);
-                        self.threads.insert(thread_id.clone(), Side::Claude);
-                        self.claude_loaded.insert(thread_id.clone());
-                        self.forward(Side::Claude, turn);
+                        self.threads.insert(thread_id.clone(), side);
+                        self.facade_loaded.insert(thread_id.clone());
+                        self.forward(side, turn);
                         self.internal_request(
                             Side::Codex,
                             "thread/unsubscribe",
@@ -1920,14 +2160,15 @@ impl Router {
                 let blocked = thread_id.clone();
                 match result {
                     Ok(_) => {
-                        self.claude_loaded.insert(thread_id);
-                        self.forward(Side::Claude, request);
+                        self.facade_loaded.insert(thread_id);
+                        self.forward(side, request);
                     }
                     Err(failure) => self.send_client(json!({"id":request["id"],"error":failure})),
                 }
                 self.unblock_thread(&blocked, Block::Resume);
             }
             Continuation::Section {
+                side,
                 thread_id,
                 mut request,
             } => {
@@ -1946,7 +2187,7 @@ impl Router {
                         match (section, page["nextCursor"].as_str()) {
                             (Some(section), _) => {
                                 request["params"]["claudexSection"] = section;
-                                self.forward(Side::Claude, request);
+                                self.forward(side, request);
                             }
                             (None, Some(cursor)) => {
                                 // The thread stays blocked while the next page is read.
@@ -1954,7 +2195,11 @@ impl Router {
                                     Side::Codex,
                                     "threadSection/list",
                                     json!({"cursor": cursor, "limit": 100}),
-                                    Continuation::Section { thread_id, request },
+                                    Continuation::Section {
+                                        side,
+                                        thread_id,
+                                        request,
+                                    },
                                 );
                                 return;
                             }
@@ -1986,56 +2231,67 @@ impl Router {
         }
     }
 
-    /// The facade went away: fail pending Claude work without changing ownership.
-    fn claude_failed(&mut self) {
-        if self.claude.take().is_none() {
+    /// Fail pending work for the disconnected facade without changing ownership.
+    fn facade_failed(&mut self, side: Side) {
+        let facade = self.facades.get_mut(&side).unwrap();
+        if facade.sender.take().is_none() {
             return;
         }
-        note!("lost the Claude facade connection");
-        self.agent_backend_failed(Side::Claude);
-        self.claude_initialized = false;
-        self.claude_loaded.clear();
+        *facade = Facade::default();
+        note!("lost the {} facade connection", side.name());
+        self.agent_backend_failed(side);
+        self.facade_loaded
+            .retain(|thread| self.threads.get(thread) != Some(&side));
         let failed: Vec<(Side, String)> = self
             .forwarded
             .keys()
-            .filter(|(side, _)| *side == Side::Claude)
+            .filter(|(owner, _)| *owner == side)
             .cloned()
             .collect();
         for key in failed {
             self.forwarded.remove(&key);
             if let Ok(id) = serde_json::from_str::<Value>(&key.1) {
-                self.send_client(error(id, "The Claude facade disconnected"));
+                self.send_client(error(id, format!("{} disconnected", side.service())));
             }
         }
-        let pending: Vec<String> = self.internal.keys().cloned().collect();
-        let failure = json!({"code": -32000, "message": "The Claude facade disconnected"});
+        let pending: Vec<String> = self
+            .internal
+            .iter()
+            .filter(|(_, (owner, _))| *owner == side)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let failure =
+            json!({"code": -32000, "message": format!("{} disconnected", side.service())});
         for id in pending {
-            let continuation = match self.internal.get(&id) {
-                Some(Continuation::Merge {
-                    side: Side::Claude, ..
-                })
-                | Some(Continuation::Probe { .. })
-                | Some(Continuation::ClaudeModels)
-                | Some(Continuation::Resume { .. })
-                | Some(Continuation::Adopt { .. }) => self.internal.remove(&id).unwrap(),
-                Some(Continuation::Delegation {
-                    side: Side::Claude, ..
-                }) => self.internal.remove(&id).unwrap(),
-                _ => continue,
-            };
-            self.continue_with(continuation, Err(failure.clone()));
+            let (_, continuation) = self.internal.remove(&id).unwrap();
+            self.continue_with(side, continuation, Err(failure.clone()));
         }
+        self.finish_merges();
         // The facade ends its turns on shutdown, but that notification cannot
         // reach the desktop once the connection is gone, and a crash sends none.
         // Its saved record marks the same turns interrupted when it restarts.
-        for (request_id, thread_id) in std::mem::take(&mut self.claude_requests) {
+        let requests: Vec<String> = self
+            .facade_requests
+            .iter()
+            .filter(|(_, (owner, _))| *owner == side)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in requests {
+            let (_, thread_id) = self.facade_requests.remove(&request_id).unwrap();
             self.send_client(json!({"method":"serverRequest/resolved",
                 "params":{"threadId":thread_id,"requestId":request_id}}));
         }
         let completed_at = crate::protocol::now();
-        for (thread_id, mut turn) in std::mem::take(&mut self.claude_turns) {
+        let threads: Vec<String> = self
+            .facade_turns
+            .keys()
+            .filter(|&thread| self.threads.get(thread) == Some(&side))
+            .cloned()
+            .collect();
+        for thread_id in threads {
+            let mut turn = self.facade_turns.remove(&thread_id).unwrap();
             turn["status"] = json!("interrupted");
-            turn["error"] = json!({"message":"The Claude service stopped while this turn was running",
+            turn["error"] = json!({"message":format!("{} stopped while this turn was running", side.service()),
                 "codexErrorInfo":null,"additionalDetails":null,"misalignment":null});
             // Items already streamed to the desktop stay as they are.
             turn["items"] = json!([]);
@@ -2052,15 +2308,15 @@ impl Router {
         }
     }
 
-    fn claude_connected(&mut self, sender: mpsc::Sender<Value>) {
-        note!("reconnected to the Claude facade");
-        self.claude = Some(sender);
-        self.models_requested = false;
+    fn facade_connected(&mut self, side: Side, sender: mpsc::Sender<Value>) {
+        note!("reconnected to {}", side.name());
+        let facade = self.facades.get_mut(&side).unwrap();
+        facade.sender = Some(sender);
         if let Some(params) = self.initialize_params.clone() {
-            self.claude_initialized = true;
-            self.internal_request(Side::Claude, "initialize", params, Continuation::Ignore);
-            self.send_backend(Side::Claude, json!({"method":"initialized","params":{}}));
-            self.request_claude_models();
+            facade.initialized = true;
+            self.internal_request(side, "initialize", params, Continuation::Ignore);
+            self.send_backend(side, json!({"method":"initialized","params":{}}));
+            self.request_facade_models(side);
         }
     }
 }
@@ -2112,7 +2368,18 @@ mod tests {
         let (client, mut replies) = mpsc::channel(16);
         let (codex, mut codex_requests) = mpsc::channel(16);
         let (claude, mut claude_requests) = mpsc::channel(16);
-        let mut router = Router::new(client, codex, Some(claude), true);
+        let mut router = Router::new(
+            client,
+            codex,
+            HashMap::from([(
+                Side::Claude,
+                Facade {
+                    sender: Some(claude),
+                    ..Facade::default()
+                },
+            )]),
+            None,
+        );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");
         assert_eq!(
@@ -2125,7 +2392,7 @@ mod tests {
             claude_requests.recv().await.unwrap()["method"],
             "thread/read"
         );
-        router.claude_failed();
+        router.facade_failed(Side::Claude);
         let failure = replies.recv().await.unwrap();
         assert_eq!(failure["id"], 1);
         assert_eq!(failure["error"]["code"], -32000);
@@ -2141,7 +2408,18 @@ mod tests {
         let (client, _replies) = mpsc::channel(16);
         let (codex, mut codex_requests) = mpsc::channel(16);
         let (claude, mut claude_requests) = mpsc::channel(16);
-        let mut router = Router::new(client, codex, Some(claude), true);
+        let mut router = Router::new(
+            client,
+            codex,
+            HashMap::from([(
+                Side::Claude,
+                Facade {
+                    sender: Some(claude),
+                    ..Facade::default()
+                },
+            )]),
+            None,
+        );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");
         assert_eq!(

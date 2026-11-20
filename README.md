@@ -129,7 +129,9 @@ remote routing currently supports zsh and bash login shells. See
 
 Claudex can expose [Agent Client Protocol](https://agentclientprotocol.com) v1
 agents through the same Codex-compatible interface. Sign in with the agent's own
-CLI first, then install a separate desktop connection, for example:
+CLI first. To put one ACP model alongside Claude and Codex in the same local
+desktop picker, use [local ACP setup](DESKTOP.md#one-acp-model-in-the-local-picker).
+For a separate desktop connection, use:
 
 ```sh
 claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode

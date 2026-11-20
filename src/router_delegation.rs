@@ -12,14 +12,6 @@ impl From<Harness> for Side {
         }
     }
 }
-impl From<Side> for Harness {
-    fn from(side: Side) -> Self {
-        match side {
-            Side::Codex => Self::Codex,
-            Side::Claude => Self::Claude,
-        }
-    }
-}
 
 #[derive(Clone)]
 enum Reply {
@@ -130,7 +122,8 @@ impl Router {
         side: Side,
         message: &mut Value,
     ) -> Result<Option<String>> {
-        if !self.claude_configured
+        if side == Side::Acp
+            || !self.facades.contains_key(&Side::Claude)
             || !matches!(
                 message["method"].as_str(),
                 Some("thread/start" | "thread/resume")
@@ -241,7 +234,8 @@ impl Router {
     }
 
     pub(super) fn agent_dynamic_call(&mut self, side: Side, message: &Value) -> bool {
-        if message["method"] != "item/tool/call"
+        if side == Side::Acp
+            || message["method"] != "item/tool/call"
             || message["params"]["namespace"] != delegation::NAMESPACE
         {
             return false;
@@ -673,7 +667,7 @@ impl Router {
                 }
                 self.threads.insert(agent.id.clone(), side);
                 if side == Side::Claude {
-                    self.claude_loaded.insert(agent.id.clone());
+                    self.facade_loaded.insert(agent.id.clone());
                 }
                 let child = agent.id.clone();
                 if let Err(error) = self.agents.registry.save(&agent) {
@@ -759,7 +753,7 @@ impl Router {
                     self.agents.attached.insert(child.clone());
                 }
                 if side == Side::Claude {
-                    self.claude_loaded.insert(child.clone());
+                    self.facade_loaded.insert(child.clone());
                 }
                 let agent = self.agents.registry.agents.get_mut(&child).unwrap();
                 let mut messages = agent.queued.clone();
@@ -1548,7 +1542,12 @@ mod tests {
     fn incomplete_settings_notification_does_not_confirm_stale_permissions() {
         let (client, _client_rx) = mpsc::channel(32);
         let (codex, _codex_rx) = mpsc::channel(32);
-        let mut router = Router::new(client, codex, None, true);
+        let mut router = Router::new(
+            client,
+            codex,
+            HashMap::from([(Side::Claude, Facade::default())]),
+            None,
+        );
         router.remember_agent_snapshot(&json!({"thread":{"id":"parent"},"cwd":"/tmp",
             "approvalPolicy":"on-request","approvalsReviewer":"user",
             "sandbox":{"type":"workspaceWrite"}}));
@@ -1572,7 +1571,12 @@ mod tests {
     fn restated_desktop_permissions_keep_the_native_snapshot_confirmed() {
         let (client, _client_rx) = mpsc::channel(32);
         let (codex, _codex_rx) = mpsc::channel(32);
-        let mut router = Router::new(client, codex, None, true);
+        let mut router = Router::new(
+            client,
+            codex,
+            HashMap::from([(Side::Claude, Facade::default())]),
+            None,
+        );
         let cwd = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
         let (cwd, extra) = (cwd.path().to_str().unwrap(), extra.path().to_str().unwrap());
@@ -1606,7 +1610,12 @@ mod tests {
     fn backend_disconnect_preserves_another_routers_running_agent() {
         let (client, _client_rx) = mpsc::channel(32);
         let (codex, _codex_rx) = mpsc::channel(32);
-        let mut router = Router::new(client, codex, None, true);
+        let mut router = Router::new(
+            client,
+            codex,
+            HashMap::from([(Side::Claude, Facade::default())]),
+            None,
+        );
         let state = tempfile::tempdir().unwrap();
         router.agents.registry = Registry::open(state.path().join("agents")).unwrap();
         let owned = uuid::Uuid::new_v4().to_string();

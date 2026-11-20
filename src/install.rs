@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::acp::AcpAgent;
+use crate::{acp::AcpAgent, local_acp::LocalAcp};
 
 const LABEL: &str = "com.claude-codex.desktop";
 /// Login job that points every desktop launch at the router.
@@ -307,6 +307,82 @@ impl Installation {
                 "Desktop SSH routing enabled. Reconnect this host in the client desktop to load the combined model catalog."
             );
         }
+        Ok(())
+    }
+
+    /// Upgrade the installed local router and restart the existing login job.
+    /// The generated launchers already refer to the installed binary by path.
+    pub async fn configure_local_acp(&self, agent: AcpAgent) -> Result<()> {
+        self.check_owned_files()?;
+        let launcher = self.router_codex();
+        let binary = self.root.join("bin/claude-codex-server");
+        if !self.plist.is_file() || !launcher.is_file() || !binary.is_file() {
+            bail!("Configure local ACP from an existing Claudex desktop installation");
+        }
+        let current = std::env::current_exe()?.canonicalize()?;
+        let new_binary = fs::read(current)?;
+        let previous_binary = fs::read(&binary)?;
+        let config_path = LocalAcp::config_path(&self.root);
+        let previous_config = read_optional(&config_path)?;
+        let executable = resolve_executable(&agent.executable)?;
+        let config = LocalAcp::new(agent, executable)?;
+        let metadata_path = self.root.join("installation.json");
+        let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        metadata["version"] = json!(env!("CARGO_PKG_VERSION"));
+
+        let loaded = self.loaded().await?;
+        self.require_idle(false)?;
+        if loaded {
+            self.bootout().await?;
+        }
+        let result = async {
+            if new_binary != previous_binary {
+                atomic_write(&binary, &new_binary, 0o700)?;
+            }
+            atomic_write(&config_path, &serde_json::to_vec_pretty(&config)?, 0o600)?;
+            self.bootstrap().await?;
+            self.wait_ready().await?;
+            self.wait_socket_ready(&LocalAcp::socket(&self.root))
+                .await?;
+            atomic_write(
+                &metadata_path,
+                &serde_json::to_vec_pretty(&metadata)?,
+                0o600,
+            )
+        }
+        .await;
+        if let Err(error) = result {
+            let restore = async {
+                if self.loaded().await? {
+                    self.bootout().await?;
+                }
+                if new_binary != previous_binary {
+                    atomic_write(&binary, &previous_binary, 0o700)?;
+                }
+                if previous_config.is_empty() {
+                    if config_path.exists() {
+                        fs::remove_file(&config_path)?;
+                    }
+                } else {
+                    atomic_write(&config_path, previous_config.as_bytes(), 0o600)?;
+                }
+                if loaded {
+                    self.bootstrap().await?;
+                    self.wait_ready().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            restore.await.with_context(|| {
+                format!(
+                    "Local ACP setup failed ({error:#}); could not restore the existing service"
+                )
+            })?;
+            return Err(error);
+        }
+        println!(
+            "Configured {} on the existing local Claudex service. Reopen Codex Desktop to load the updated model picker.",
+            config.model
+        );
         Ok(())
     }
 
@@ -707,7 +783,14 @@ impl Installation {
         if force {
             return Ok(());
         }
-        let threads = self.root.join("state/threads");
+        Self::require_idle_store(&self.root.join("state/threads"))?;
+        if let Some(config) = LocalAcp::read(&self.root)? {
+            Self::require_idle_store(&config.state(&self.root).join("threads"))?;
+        }
+        Ok(())
+    }
+
+    fn require_idle_store(threads: &Path) -> Result<()> {
         if !threads.exists() {
             return Ok(());
         }
@@ -719,7 +802,7 @@ impl Installation {
             let record: Value = serde_json::from_slice(&fs::read(path)?)?;
             if record["thread"]["status"]["type"] == "active" {
                 bail!(
-                    "A Claude chat is active. Wait for it to finish; service stop/restart/uninstall --force explicitly interrupts active work."
+                    "A Claudex chat is active. Wait for it to finish; service stop/restart/uninstall --force explicitly interrupts active work."
                 );
             }
         }
@@ -871,8 +954,12 @@ impl Installation {
     }
 
     async fn ready(&self) -> Result<()> {
+        Self::socket_ready(&self.socket()).await
+    }
+
+    async fn socket_ready(path: &Path) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let stream = tokio::net::UnixStream::connect(self.socket()).await?;
+            let stream = tokio::net::UnixStream::connect(path).await?;
             let (mut websocket, _) = tokio_tungstenite::client_async("ws://codex-app-server/rpc", stream).await?;
             websocket.send(Message::Text(json!({"id":"health","method":"initialize","params":{"clientInfo":{"name":"claude-codex-health","version":"1"}}}).to_string().into())).await?;
             let message = websocket.next().await.context("Service disconnected during health check")??;
@@ -886,9 +973,13 @@ impl Installation {
     }
 
     async fn wait_ready(&self) -> Result<()> {
+        self.wait_socket_ready(&self.socket()).await
+    }
+
+    async fn wait_socket_ready(&self, path: &Path) -> Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
-            match self.ready().await {
+            match Self::socket_ready(path).await {
                 Ok(()) => return Ok(()),
                 Err(error) if tokio::time::Instant::now() >= deadline => {
                     bail!(
