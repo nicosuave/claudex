@@ -1416,6 +1416,43 @@ async fn ssh_proxy_lists_both_backends_and_runs_claude_over_websocket() {
 }
 
 #[tokio::test]
+async fn native_ultrafast_capability_and_turn_override_survive_routing() {
+    let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+
+    let merged = desktop.ok("model/list", json!({})).await;
+    assert_eq!(merged["data"][0]["serviceTiers"][0]["id"], "ultrafast");
+    assert!(
+        merged["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "opus")
+    );
+
+    let native = desktop
+        .ok("model/list", json!({"modelProvider":"openai"}))
+        .await;
+    assert_eq!(
+        native["data"],
+        json!(merged["data"].as_array().unwrap()[..2])
+    );
+
+    let thread = desktop.thread(json!({"model":"gpt-fake"})).await;
+    desktop
+        .ok(
+            "turn/start",
+            json!({
+                "threadId":thread,"serviceTierForTurn":"ultrafast",
+                "input":[{"type":"text","text":"report service tier","text_elements":[]}]
+            }),
+        )
+        .await;
+    let completed = desktop.completed(&thread).await;
+    assert_eq!(completed["params"]["turn"]["items"][0]["text"], "ultrafast");
+}
+
+#[tokio::test]
 async fn one_picker_and_one_sidebar_span_codex_and_claude() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
@@ -1582,7 +1619,8 @@ async fn merged_pages_keep_every_thread_exactly_once_in_order() {
             }
             let page = desktop.ok(method, params).await;
             for item in page["data"].as_array().unwrap() {
-                let thread = if item["thread"].is_object() {
+                let thread = if method == "thread/search" {
+                    assert!(item["snippet"].is_string(), "{item}");
                     &item["thread"]
                 } else {
                     item

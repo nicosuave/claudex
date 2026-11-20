@@ -284,7 +284,8 @@ fn main() {
                 "platformFamily": "unix", "platformOs": "macos", "args": args}),
             ),
             "model/list" => Ok(json!({"data": [
-                {"id": "gpt-fake", "model": "gpt-fake", "displayName": "GPT Fake", "isDefault": true},
+                {"id": "gpt-fake", "model": "gpt-fake", "displayName": "GPT Fake", "isDefault": true,
+                    "serviceTiers": [{"id":"ultrafast", "name":"Ultrafast", "description":"Fixture speed tier"}]},
                 {"id": "gpt-fake-mini", "model": "gpt-fake-mini", "displayName": "GPT Fake Mini", "isDefault": false}
             ], "nextCursor": null})),
             "config/read" => Ok(json!({"config":{"model":default_model}})),
@@ -387,6 +388,11 @@ fn main() {
                         } else {
                             let report = if text == "permission" {
                                 "Native Codex denied without prompting".to_owned()
+                            } else if text == "report service tier" {
+                                p["serviceTierForTurn"]
+                                    .as_str()
+                                    .unwrap_or("default")
+                                    .to_owned()
                             } else {
                                 format!("Codex: {text}")
                             };
@@ -614,7 +620,7 @@ fn main() {
                     .iter()
                     .map(|t| {
                         if method == "thread/search" {
-                            json!({"thread": t})
+                            json!({"thread": t, "snippet": t["preview"]})
                         } else {
                             t.clone()
                         }

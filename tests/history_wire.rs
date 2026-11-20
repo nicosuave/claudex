@@ -783,7 +783,7 @@ async fn injected_context_rejects_unsupported_items_without_partial_mutation() {
 }
 
 fn validate_revert(value: &Value) {
-    let root: Value = serde_json::from_str(include_str!("../protocol/codex-0.166.0.json")).unwrap();
+    let root: Value = serde_json::from_str(include_str!("../protocol/codex-0.170.0.json")).unwrap();
     let mut schema = root["definitions"]["v2"]["ThreadRevertResponse"].clone();
     schema["definitions"] = root["definitions"].clone();
     let validator = jsonschema::validator_for(&schema).unwrap();
