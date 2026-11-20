@@ -55,6 +55,8 @@ const CLAUDE_LIST_FILTERS: &[&str] = &[
     "sortDirection",
     "parentThreadId",
     "ancestorThreadId",
+    "attachedToThreadId",
+    "includeAttachedThreads",
 ];
 
 /// Codex app (connector) methods. A chat's `threadId` only selects Codex's
@@ -1228,7 +1230,9 @@ impl Router {
                 }
                 self.forward(Side::Codex, message);
             }
-            "model/list" if !self.available_facades().is_empty() => {
+            "model/list"
+                if params["modelProvider"].is_null() && !self.available_facades().is_empty() =>
+            {
                 for side in self.available_facades() {
                     self.request_facade_models(side);
                 }
@@ -1748,7 +1752,7 @@ impl Router {
                     data.retain(|owner| seen.insert(owner["threadId"].to_string()));
                 }
             }
-            MergeKind::Threads { .. } => {
+            MergeKind::Threads { search } => {
                 let field = sort_field(&state.params);
                 let descending = descending(&state.params);
                 // Codex orders a section by its own positions, which cannot
@@ -1839,7 +1843,19 @@ impl Router {
                 }
                 result["data"] = json!(merged);
                 self.decorate_agent_listing(&state.params, &mut result);
-                if matches!(state.kind, MergeKind::Threads { search: false })
+                if search {
+                    for entry in result["data"].as_array_mut().unwrap() {
+                        if !entry["thread"].is_object() {
+                            let snippet = entry["name"]
+                                .as_str()
+                                .or_else(|| entry["preview"].as_str())
+                                .unwrap_or("")
+                                .to_owned();
+                            *entry = json!({"thread": entry.take(), "snippet": snippet});
+                        }
+                    }
+                }
+                if !search
                     && agents::shared_listing(&state.params)
                     && let Err(failure) = agents::paginate_listing(&state.params, &mut result)
                 {

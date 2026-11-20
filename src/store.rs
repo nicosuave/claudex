@@ -424,6 +424,7 @@ impl Record {
     }
     pub fn view(&self, include_turns: bool, loaded: bool) -> Value {
         let mut thread = self.thread.clone();
+        thread["attachedToThreadId"] = json!(self.attached_to);
         thread["turns"] = if include_turns {
             json!(self.timed_turns())
         } else {

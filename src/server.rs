@@ -2394,7 +2394,20 @@ impl Server {
                 let turns = &self.record(id)?.turns;
                 crate::occurrences::search(id, turns, p, |turn| turn_cursor(id, turn)).map(Some)
             }
-            "thread/section/move" => self.move_to_section(p).map(Some),
+            "thread/section/move" => {
+                let result = self.move_to_section(p)?;
+                let method = "thread/section/changed";
+                let changed = notification(
+                    method,
+                    json!({"threadId": p["threadId"], "sectionId": p["sectionId"]}),
+                );
+                for (&peer, connection) in &self.connections {
+                    if connection.ready && !connection.opt_out.contains(method) {
+                        self.send(peer, changed.clone());
+                    }
+                }
+                Ok(Some(result))
+            }
             "thread/unsubscribe" => {
                 supported_fields(p, &["threadId"])?;
                 let id = required_str(p, "threadId")?;
@@ -2562,7 +2575,18 @@ impl Server {
                 Ok(Some(json!({})))
             }
             "model/list" => {
-                supported_fields(p, &["cursor", "limit", "includeHidden"])?;
+                supported_fields(p, &["cursor", "limit", "includeHidden", "modelProvider"])?;
+                if let Some(provider) = p["modelProvider"].as_str()
+                    && provider != protocol::provider().id
+                {
+                    return Err(RpcError {
+                        code: -32600,
+                        message: format!("Model provider '{provider}' is not configured"),
+                        data: Some(
+                            json!({"type":"modelProviderNotConfigured","modelProvider":provider}),
+                        ),
+                    });
+                }
                 if self.model_catalog.is_some() {
                     return self.model_page(p).map(Some);
                 }
@@ -2876,6 +2900,8 @@ impl Server {
                 "sectionId",
                 "excludedThreadIds",
                 "attachedToThreadId",
+                "includeAttachedThreads",
+                "currentAccountOnly",
             ],
         )?;
         let excluded = match &p["excludedThreadIds"] {
@@ -2889,6 +2915,17 @@ impl Server {
                 ));
             }
         };
+        let include_attached = p["includeAttachedThreads"] == true;
+        if include_attached
+            && p["searchTerm"]
+                .as_str()
+                .is_none_or(|term| term.trim().is_empty())
+        {
+            return Err(RpcError::new(
+                -32600,
+                "includeAttachedThreads requires a non-empty searchTerm",
+            ));
+        }
         let relations = ["parentThreadId", "ancestorThreadId", "attachedToThreadId"];
         if relations.iter().filter(|key| !p[**key].is_null()).count() > 1 {
             return Err(RpcError::invalid(
@@ -2929,8 +2966,10 @@ impl Server {
                     (Some(_), None) => true,
                     _ => !crate::subagents::is_child(r),
                 };
-                // Side chats list only under their source, as in Codex.
-                let attached = r.attached_to.as_deref() == p["attachedToThreadId"].as_str();
+                let attached = match p["attachedToThreadId"].as_str() {
+                    Some(parent) => r.attached_to.as_deref() == Some(parent),
+                    None => r.attached_to.is_none() || (include_attached && relation.is_none()),
+                };
                 related
                     && source
                     && attached

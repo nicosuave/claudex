@@ -21,7 +21,7 @@ fn schemas() -> &'static HashMap<String, jsonschema::Validator> {
     static SCHEMAS: OnceLock<HashMap<String, jsonschema::Validator>> = OnceLock::new();
     SCHEMAS.get_or_init(|| {
         let root: Value =
-            serde_json::from_str(include_str!("../protocol/codex-0.166.0.json")).unwrap();
+            serde_json::from_str(include_str!("../protocol/codex-0.170.0.json")).unwrap();
         let mut validators = HashMap::new();
         for name in [
             "InitializeResponse",
@@ -1255,11 +1255,25 @@ async fn attached_side_chats_are_listed_under_their_source_and_deleted_first() {
         .await["thread"]
         .clone();
     assert_eq!(side["forkedFromId"], source);
+    assert_eq!(side["attachedToThreadId"], source);
     let side = side["id"].as_str().unwrap().to_owned();
 
     let ordinary = client.ok("thread/list", json!({})).await;
     assert!(ids(&ordinary).contains(&source));
     assert!(!ids(&ordinary).contains(&side));
+    client
+        .ok(
+            "thread/name/set",
+            json!({"threadId":side,"name":"Attached draft"}),
+        )
+        .await;
+    let search = json!({"includeAttachedThreads":true,"searchTerm":"Attached draft"});
+    let including_attached = client.ok("thread/list", search).await;
+    assert_eq!(ids(&including_attached), vec![side.clone()]);
+    let unfiltered = client
+        .request("thread/list", json!({"includeAttachedThreads":true}))
+        .await;
+    assert_eq!(unfiltered["error"]["code"], -32600);
     let attached = client
         .ok(
             "thread/list",
@@ -3573,6 +3587,13 @@ async fn section_moves_order_and_persist_claude_threads() {
     client
         .ok("thread/section/move", move_to(first.as_str(), Value::Null))
         .await;
+    let moved = client
+        .until(|v| v["method"] == "thread/section/changed")
+        .await;
+    assert_eq!(
+        moved["params"],
+        json!({"threadId":first,"sectionId":section_id})
+    );
     client
         .ok(
             "thread/section/move",

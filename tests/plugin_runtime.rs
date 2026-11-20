@@ -2,7 +2,6 @@ use claude_codex_server::{codex_plugins::Config, dynamic_tools::Tool, plugin_run
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -16,54 +15,7 @@ fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
 
 fn fixture() -> (tempfile::TempDir, Config) {
     let dir = tempfile::tempdir().unwrap();
-    let executable = dir.path().join("codex");
-    write(
-        &executable,
-        r#"#!/bin/sh
-set -eu
-disabled=0
-while [ "$1" = -c ]; do
-  printf '%s\n' "$2" >> "$CODEX_HOME/overrides"
-  if [ "$2" = 'plugins={"sample@fixture" = { enabled = false }}' ]; then disabled=1; fi
-  shift 2
-done
-test "$1" = app-server
-while IFS= read -r line; do
-  id=$(expr "$line" : '.*"id":"\([^"]*\)".*' || true)
-  case "$line" in
-    *'"method":"initialize"'*) printf '{"id":"%s","result":{}}\n' "$id" ;;
-    *'"method":"initialized"'*) ;;
-    *'"method":"plugin/installed"'*) printf '{"id":"%s","result":{"marketplaces":[{"name":"fixture","path":"/fixture/marketplace.json","plugins":[{"id":"sample@fixture","name":"sample"}]},{"name":"remote","path":null,"plugins":[{"id":"sites@remote","remotePluginId":"remote-sites","name":"sites"}]}]}}\n' "$id" ;;
-    *'"method":"plugin/read"'*)
-      printf '%s\n' "$line" >> "$CODEX_HOME/reads"
-      case "$line" in
-        *'"pluginName":"remote-sites"'*) printf '{"id":"%s","result":{"plugin":{"skills":[{"name":"sites-building","path":"/sites/SKILL.md"}],"apps":[{"id":"sites-connector"}],"mcpServers":[]}}}\n' "$id" ;;
-        *) printf '{"id":"%s","result":{"plugin":{"skills":[{"name":"sample:fixture-skill","path":"/fixture/SKILL.md"}],"apps":[],"mcpServers":["fixture_server"]}}}\n' "$id" ;;
-      esac ;;
-    *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"real-sidecar-id"}}}\n' "$id" ;;
-    *'"method":"skills/list"'*)
-      if [ "$disabled" = 1 ]; then enabled=false; else enabled=true; fi
-      printf '{"id":"%s","result":{"data":[{"skills":[{"name":"fixture-skill","pluginId":"sample@fixture","description":"Read fixture instructions","enabled":%s,"path":"/fixture/SKILL.md"},{"name":"sites:sites-building","pluginId":"sites@remote","description":"Build sites with the full plugin guidance preserved.","enabled":true,"path":"/sites/SKILL.md"},{"name":"other:retained","pluginId":"other@remote","enabled":true,"path":"/other/SKILL.md"},{"name":"standalone","description":"Claude owns this skill","enabled":true,"path":"/standalone/SKILL.md"}]}]}}\n' "$id" "$enabled"
-      ;;
-    *'"method":"mcpServerStatus/list"'*)
-      if [ "$disabled" = 1 ]; then printf '{"id":"%s","result":{"data":[],"nextCursor":null}}\n' "$id"
-      else
-        case "$line" in
-          *'"cursor":"page2"'*) printf '{"id":"%s","result":{"data":[],"nextCursor":null}}\n' "$id" ;;
-          *) printf '{"id":"%s","result":{"data":[{"name":"fixture_server","tools":{"qualified-key":{"name":"token","description":"Echo a nonce","inputSchema":{"type":"object","properties":{"nonce":{"type":"string"}},"required":["nonce"],"additionalProperties":false}}}},{"name":"codex_apps","tools":{"sites":{"name":"sites.list_sites","inputSchema":{"type":"object"},"_meta":{"connector_id":"sites-connector","connector_description":"Sites guidance exactly once","ui":{"resourceUri":"ui://sites","visibility":["model","app"]}}},"sites2":{"name":"sites.read_site","inputSchema":{"type":"object"},"_meta":{"connector_id":"sites-connector","connector_description":"Sites guidance exactly once"}},"app-only":{"name":"app_only","inputSchema":{"type":"object"},"_meta":{"ui":{"visibility":["app"]}}},"other":{"name":"other.tool","inputSchema":{"type":"object"},"_meta":{"connector_id":"other-connector"}}}},{"name":"codex_app","tools":{"app_tool":{"name":"app_tool","inputSchema":{"type":"object"}}}}],"nextCursor":"page2"}}\n' "$id" ;;
-        esac
-      fi
-      ;;
-    *'"method":"mcpServer/tool/call"'*)
-      printf '%s\n' "$line" >> "$CODEX_HOME/calls"
-      printf '{"id":"%s","result":{"content":[{"type":"text","text":"Executed fixture"}],"structuredContent":%s}}\n' "$id" "$line"
-      ;;
-    *) exit 2 ;;
-  esac
-done
-"#,
-    );
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_runtime.sh");
     fs::create_dir(dir.path().join("home")).unwrap();
     let config = Config {
         executable,
@@ -78,15 +30,7 @@ done
 async fn only_additional_plugin_skills_are_injected_with_full_descriptions() {
     let (_dir, config) = fixture();
     let long_description = "Complete plugin applicability and guidance. ".repeat(12);
-    let source = fs::read_to_string(&config.executable).unwrap();
-    fs::write(
-        &config.executable,
-        source.replace(
-            "Build sites with the full plugin guidance preserved.",
-            &long_description,
-        ),
-    )
-    .unwrap();
+    fs::write(config.home.join("description"), &long_description).unwrap();
     let native = ["sample@fixture".to_owned()].into_iter().collect();
     let runtime = Runtime::start_with_native_plugins(config, &[], &[], &native)
         .await
