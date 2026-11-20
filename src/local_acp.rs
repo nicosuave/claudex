@@ -1,5 +1,6 @@
-//! A single opt-in ACP model served alongside Claude by the local login service.
+//! Opt-in ACP models served alongside Claude by the local login service.
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -21,11 +22,13 @@ pub struct LocalAcp {
     pub provider_id: String,
     pub provider_name: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_models: Vec<String>,
     pub initialize_timeout_seconds: u64,
 }
 
 impl LocalAcp {
-    pub fn new(agent: AcpAgent, executable: PathBuf) -> Result<Self> {
+    pub fn new(agent: AcpAgent, executable: PathBuf, include_models: Vec<String>) -> Result<Self> {
         let config = Self {
             executable,
             args: agent.args,
@@ -34,10 +37,15 @@ impl LocalAcp {
             model: agent
                 .model
                 .context("Select the local ACP model with --model")?,
+            include_models,
             initialize_timeout_seconds: agent.initialize_timeout_seconds,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn models(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model.as_str()).chain(self.include_models.iter().map(String::as_str))
     }
 
     fn validate(&self) -> Result<()> {
@@ -53,11 +61,17 @@ impl LocalAcp {
         {
             bail!("Local ACP requires a distinct provider id");
         }
-        if self.model.trim().is_empty()
-            || self.model == crate::acp::DEFAULT_MODEL
-            || crate::router::native_claude_alias(&self.model)
-        {
-            bail!("Select a distinct, concrete local ACP model with --model");
+        let mut seen = HashSet::new();
+        for model in self.models() {
+            if model.trim().is_empty()
+                || model == crate::acp::DEFAULT_MODEL
+                || crate::router::native_claude_alias(model)
+            {
+                bail!("Select a distinct, concrete local ACP model: {model:?}");
+            }
+            if !seen.insert(model) {
+                bail!("Duplicate local ACP model: {model}");
+            }
         }
         Ok(())
     }

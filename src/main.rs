@@ -112,9 +112,13 @@ enum Command {
         #[arg(long, value_enum)]
         auth_session: Option<claude_codex_server::install::AuthSession>,
     },
-    /// Add a pinned ACP model to the existing local desktop router.
+    /// Add selected ACP models to the existing local desktop router.
     #[cfg(unix)]
-    LocalAcp,
+    LocalAcp {
+        /// Expose another model from the same agent. Repeat to include more.
+        #[arg(long = "include-model", value_name = "MODEL")]
+        include_models: Vec<String>,
+    },
     /// Check executables, service, local SSH, and native Claude authentication.
     #[cfg(unix)]
     Doctor,
@@ -242,10 +246,10 @@ async fn run(
     }
     #[cfg(unix)]
     match &args.command {
-        Some(Command::LocalAcp) => {
+        Some(Command::LocalAcp { include_models }) => {
             let agent = acp.context("Pass --acp-agent and --model for the desktop connection")?;
             return claude_codex_server::install::Installation::current(None)?
-                .configure_local_acp(agent)
+                .configure_local_acp(agent, include_models.clone())
                 .await;
         }
         Some(Command::Install {

@@ -330,7 +330,7 @@ pub struct Router {
     client: mpsc::Sender<Value>,
     codex: mpsc::Sender<Value>,
     facades: HashMap<Side, Facade>,
-    acp_model: Option<String>,
+    acp_models: HashSet<String>,
     threads: HashMap<String, Side>,
     /// Codex threads started on this connection that have not run a turn;
     /// the desktop prewarms these before the user picks a model.
@@ -502,14 +502,14 @@ pub async fn run(
     };
 
     let mut paths = HashMap::new();
-    let mut acp_model = None;
+    let mut acp_models = HashSet::new();
     if let Some(path) = &claude_socket {
         paths.insert(Side::Claude, path.clone());
         if !websocket && let Some(root) = LocalAcp::root_for_socket(path) {
             match LocalAcp::read(root) {
                 Ok(Some(config)) => {
                     paths.insert(Side::Acp, LocalAcp::socket(root));
-                    acp_model = Some(config.model);
+                    acp_models.extend(config.models().map(str::to_owned));
                 }
                 Ok(None) => {}
                 Err(error) => note!("Local ACP configuration is unavailable: {error:#}"),
@@ -539,7 +539,7 @@ pub async fn run(
             },
         );
     }
-    let mut router = Router::new(client, codex_sender, facades, acp_model);
+    let mut router = Router::new(client, codex_sender, facades, acp_models);
     let (calls, mut agent_calls) = mpsc::channel(64);
     router.agents.calls = Some(calls);
     if let Some(socket) = &claude_socket {
@@ -849,13 +849,13 @@ impl Router {
         client: mpsc::Sender<Value>,
         codex: mpsc::Sender<Value>,
         facades: HashMap<Side, Facade>,
-        acp_model: Option<String>,
+        acp_models: HashSet<String>,
     ) -> Self {
         Self {
             client,
             codex,
             facades,
-            acp_model,
+            acp_models,
             threads: HashMap::new(),
             fresh: HashMap::new(),
             initialize_params: None,
@@ -1065,7 +1065,7 @@ impl Router {
     }
 
     fn model_side(&self, model: &str) -> Option<Side> {
-        if self.acp_model.as_deref() == Some(model) {
+        if self.acp_models.contains(model) {
             return Some(Side::Acp);
         }
         self.is_claude_model(model)
@@ -2099,17 +2099,16 @@ impl Router {
                 self.unblock_thread(&blocked, Block::Probe);
             }
             Continuation::FacadeModels => {
-                let model = (side == Side::Acp)
-                    .then_some(self.acp_model.as_deref())
-                    .flatten();
                 let models: Vec<Value> = match result {
                     Ok(result) => result["data"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .filter(|entry| {
-                            entry["id"] != CLAUDE_DEFAULT_ALIAS
-                                && model.is_none_or(|id| entry["id"] == id)
+                            entry["id"].as_str().is_some_and(|id| {
+                                id != CLAUDE_DEFAULT_ALIAS
+                                    && (side != Side::Acp || self.acp_models.contains(id))
+                            })
                         })
                         .map(|model| {
                             let mut model = model.clone();
@@ -2378,7 +2377,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            None,
+            HashSet::new(),
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");
@@ -2418,7 +2417,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            None,
+            HashSet::new(),
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");

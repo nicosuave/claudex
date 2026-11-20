@@ -58,10 +58,14 @@ impl Facade {
         std::fs::create_dir(&sockets).unwrap();
         let config = claude_codex_server::local_acp::LocalAcp {
             executable: env!("CARGO_BIN_EXE_fake-acp").into(),
-            args: vec![format!("--store={}", root.join("native-acp").display())],
+            args: vec![
+                format!("--store={}", root.join("native-acp").display()),
+                "--extra-model".into(),
+            ],
             provider_id: "fake-provider".into(),
             provider_name: "Fake Provider".into(),
             model: "fake-b".into(),
+            include_models: vec!["fake-a".into()],
             initialize_timeout_seconds: 3,
         };
         std::fs::write(
@@ -1567,18 +1571,18 @@ async fn one_picker_and_one_sidebar_span_codex_and_claude() {
 }
 
 #[tokio::test]
-async fn pinned_local_acp_joins_the_picker_and_adopts_only_its_own_chats() {
+async fn selected_local_acp_models_join_the_picker_and_adopt_only_their_own_chats() {
     let mut facade = Facade::start_with_local_acp().await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
     let catalog = desktop.ok("model/list", json!({})).await;
     let models = catalog["data"].as_array().unwrap();
-    for model in ["gpt-fake", "opus", "fake-b"] {
+    for model in ["gpt-fake", "opus", "fake-a", "fake-b"] {
         assert_eq!(
             models.iter().filter(|entry| entry["id"] == model).count(),
             1
         );
     }
-    assert!(models.iter().all(|entry| entry["id"] != "fake-a"));
+    assert!(models.iter().all(|entry| entry["id"] != "fake-c"));
     assert!(
         models
             .iter()
@@ -1668,6 +1672,30 @@ async fn pinned_local_acp_joins_the_picker_and_adopts_only_its_own_chats() {
             .contains("runs on Claude")
     );
 
+    // A second picked model can use the same ACP provider in the same chat.
+    let turn = desktop.turn(&prewarmed, "fake-a", "history").await;
+    assert!(turn.get("error").is_none(), "{turn}");
+    let completed = desktop.completed(&prewarmed).await;
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let reply = desktop
+        .until(|frame| {
+            frame["method"] == "item/completed"
+                && frame["params"]["threadId"] == prewarmed
+                && frame["params"]["turnId"] == turn["result"]["turn"]["id"]
+                && frame["params"]["item"]["type"] == "agentMessage"
+        })
+        .await;
+    assert!(
+        reply["params"]["item"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("model=fake-a"),
+        "{reply}"
+    );
+
     // A new desktop connection has no memory of the adoption. Resolve the
     // persisted thread's owner before consulting any merged thread list.
     let mut reopened = Desktop::connect(&facade.socket, 0).await;
@@ -1675,7 +1703,7 @@ async fn pinned_local_acp_joins_the_picker_and_adopts_only_its_own_chats() {
         .ok("thread/read", json!({"threadId":prewarmed}))
         .await;
     assert_eq!(thread["thread"]["modelProvider"], "fake-provider");
-    assert_eq!(thread["thread"]["model"], "fake-b");
+    assert_eq!(thread["thread"]["model"], "fake-a");
     let threads = reopened.ok("thread/list", json!({})).await;
     let threads = ids(&threads);
     assert_eq!(threads.iter().filter(|id| **id == prewarmed).count(), 1);

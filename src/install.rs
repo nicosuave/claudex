@@ -312,7 +312,11 @@ impl Installation {
 
     /// Upgrade the installed local router and restart the existing login job.
     /// The generated launchers already refer to the installed binary by path.
-    pub async fn configure_local_acp(&self, agent: AcpAgent) -> Result<()> {
+    pub async fn configure_local_acp(
+        &self,
+        agent: AcpAgent,
+        include_models: Vec<String>,
+    ) -> Result<()> {
         self.check_owned_files()?;
         let launcher = self.router_codex();
         let binary = self.root.join("bin/claude-codex-server");
@@ -325,7 +329,7 @@ impl Installation {
         let config_path = LocalAcp::config_path(&self.root);
         let previous_config = read_optional(&config_path)?;
         let executable = resolve_executable(&agent.executable)?;
-        let config = LocalAcp::new(agent, executable)?;
+        let config = LocalAcp::new(agent, executable, include_models)?;
         let metadata_path = self.root.join("installation.json");
         let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path)?)?;
         metadata["version"] = json!(env!("CARGO_PKG_VERSION"));
@@ -381,7 +385,7 @@ impl Installation {
         }
         println!(
             "Configured {} on the existing local Claudex service. Reopen Codex Desktop to load the updated model picker.",
-            config.model
+            config.models().collect::<Vec<_>>().join(", ")
         );
         Ok(())
     }
