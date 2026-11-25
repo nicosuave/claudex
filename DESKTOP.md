@@ -137,6 +137,54 @@ disable local ACP, remove the installer's `local-acp.json` from
 `~/Library/Application Support/claude-codex`, restart the idle service, and reopen
 Codex Desktop. The ACP chat store remains under `state/local-acp`.
 
+### Self-hosted models in the local picker
+
+With the local Claudex router already installed and MLX-Serve running:
+
+```sh
+claudex mlx
+# A different MLX-Serve endpoint:
+claudex mlx --url http://127.0.0.1:11234/v1
+# A generic Responses-compatible server (context is a fallback when not advertised):
+claudex local-provider --url http://server:8080/v1 --name vLLM \
+  --model local/qwen --context-window 32768
+```
+
+Reopen the desktop app, start a new local chat, and select a model marked
+**(MLX-Serve)** or your provider's name. GPT, Claude and configured ACP models
+remain in the same picker. Self-hosted inference uses genuine Codex's tools,
+permissions and conversation storage; Codex connects directly to the server's
+Responses API. These commands configure one self-hosted endpoint and do not
+change Codex's global provider or `openai_base_url`, replace the ACP provider,
+or restart the Claude service.
+
+By default self-hosted chats expose ordinary Codex function tools and configured
+MCP servers. Cloud app connectors and hosted web search are disabled for those
+chats: ordinary Responses servers, including current MLX-Serve, need not
+implement Codex's specialized deferred-tool/code-mode wire types. Eagerly
+sending the full connector catalog makes local prefill impractical. Other models
+retain their connector configuration. For a server that implements those custom
+tools and client-side tool search, `--codex-tools` opts into native code mode and
+retains the user's app settings. `--reasoning` enables reasoning-effort controls
+when the server supports that parameter (the MLX-Serve preset enables it).
+
+Discovery uses the standard `/models` list, advertised capabilities when
+available, each model's working context window, and text/image modalities.
+Servers without context metadata require `--context-window`; missing modality
+metadata defaults to text. `--model` restricts discovery to that model, and
+`--env-key VARIABLE_NAME` uses an explicitly configured API-key environment
+variable without storing its value. The router refreshes metadata when listing
+models. If the server is unavailable, the saved model list remains available and
+the other providers continue working; local requests never fall back to GPT.
+
+The configuration and generated catalog live in `local-provider.json` and
+`local-provider-models.json` under `~/Library/Application Support/claude-codex`.
+Routing identities for empty desktop chats moved to a self-hosted model live in
+`local-provider-threads.json`;
+retain this file to reopen those chats. Native Codex owns their actual history.
+An empty chat can change providers before its first message. Once it has
+messages, start a new chat to switch between self-hosted and another provider.
+
 ### Connect from another computer
 
 On the remote Mac, run `claudex install`, then reconnect that Mac's

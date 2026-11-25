@@ -203,6 +203,7 @@ impl Router {
     }
 
     pub(super) fn agent_mcp_call(&mut self, call: McpCall) {
+        self.refresh_local_provider_routing();
         let reply = Reply::Mcp {
             id: call.message["id"].clone(),
             sender: call.reply,
@@ -214,7 +215,12 @@ impl Router {
         // Native Codex supplies this metadata outside model-controlled arguments.
         // A same-harness child may inherit its parent's MCP configuration; that
         // endpoint must not let it delegate with the parent's permissions.
-        if call.message["params"]["_meta"]["threadId"] != parent {
+        let native_parent = self
+            .local_provider
+            .as_ref()
+            .map(|local_provider| local_provider.native_id(&parent))
+            .unwrap_or(&parent);
+        if call.message["params"]["_meta"]["threadId"] != native_parent {
             self.agent_reply(
                 reply,
                 Err("Native MCP caller does not match its delegation scope".into()),

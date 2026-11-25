@@ -310,6 +310,40 @@ impl Installation {
         Ok(())
     }
 
+    /// Self-hosted models run inside the router's genuine Codex backend. No facade or login
+    /// service restart is needed; existing desktop processes keep their binary.
+    pub async fn configure_local_provider(
+        &self,
+        options: crate::local_provider::Config,
+    ) -> Result<()> {
+        self.check_owned_files()?;
+        let binary = self.root.join("bin/claude-codex-server");
+        if !self.router_codex().is_file() || !binary.is_file() {
+            bail!("Configure a local provider from an existing Claudex desktop installation");
+        }
+        let config = options.refresh().await?;
+        if let Some(acp) = LocalAcp::read(&self.root)? {
+            for model in &config.models {
+                if acp.models().any(|id| id == model.id) {
+                    bail!(
+                        "Self-hosted model conflicts with the local ACP provider: {}",
+                        model.id
+                    );
+                }
+            }
+        }
+        let current = std::env::current_exe()?.canonicalize()?;
+        let bytes = fs::read(current)?;
+        config.write(&self.root)?;
+        atomic_write(&binary, &bytes, 0o700)?;
+        println!(
+            "Enabled {} models from {}. Reopen the desktop app to load the updated router. Existing services and routing settings were retained.",
+            config.models.len(),
+            config.name
+        );
+        Ok(())
+    }
+
     /// Upgrade the installed local router and restart the existing login job.
     /// The generated launchers already refer to the installed binary by path.
     pub async fn configure_local_acp(
@@ -1359,7 +1393,7 @@ fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path.parent().context("File requires a parent directory")?;
     let temp = parent.join(format!(".claude-codex-{}.tmp", uuid::Uuid::new_v4()));
