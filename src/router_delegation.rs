@@ -1552,7 +1552,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         router.remember_agent_snapshot(&json!({"thread":{"id":"parent"},"cwd":"/tmp",
             "approvalPolicy":"on-request","approvalsReviewer":"user",
@@ -1581,7 +1581,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         let cwd = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
@@ -1620,7 +1620,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         let state = tempfile::tempdir().unwrap();
         router.agents.registry = Registry::open(state.path().join("agents")).unwrap();

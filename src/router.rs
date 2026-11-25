@@ -44,6 +44,7 @@ const CURSOR_PREFIX: &str = "claudex-router:";
 /// Claude's catalog alias for "whatever Claude Code defaults to"; it would only
 /// duplicate a concrete model in the shared picker.
 const CLAUDE_DEFAULT_ALIAS: &str = "default";
+const CLAUDE_PROVIDER: &str = "anthropic";
 /// Fields the facade's thread/list accepts; the desktop sends newer ones too.
 const CLAUDE_LIST_FILTERS: &[&str] = &[
     "archived",
@@ -353,7 +354,7 @@ pub struct Router {
     client: mpsc::Sender<Value>,
     codex: mpsc::Sender<Value>,
     facades: HashMap<Side, Facade>,
-    acp_models: HashSet<String>,
+    acp: Option<LocalAcp>,
     local_provider: Option<crate::local_provider::Integration>,
     events: Option<mpsc::Sender<Input>>,
     local_provider_refreshing: bool,
@@ -535,14 +536,14 @@ pub async fn run(
     };
 
     let mut paths = HashMap::new();
-    let mut acp_models = HashSet::new();
+    let mut acp = None;
     if let Some(path) = &claude_socket {
         paths.insert(Side::Claude, path.clone());
         if !websocket && let Some(root) = LocalAcp::root_for_socket(path) {
             match LocalAcp::read(root) {
                 Ok(Some(config)) => {
                     paths.insert(Side::Acp, LocalAcp::socket(root));
-                    acp_models.extend(config.models().map(str::to_owned));
+                    acp = Some(config);
                 }
                 Ok(None) => {}
                 Err(error) => note!("Local ACP configuration is unavailable: {error:#}"),
@@ -572,7 +573,7 @@ pub async fn run(
             },
         );
     }
-    let mut router = Router::new(client, codex_sender, facades, acp_models);
+    let mut router = Router::new(client, codex_sender, facades, acp);
     router.events = Some(events.clone());
     if let Some(root) = claude_socket.as_deref().and_then(LocalAcp::root_for_socket) {
         match crate::local_provider::Integration::read(root) {
@@ -890,13 +891,13 @@ impl Router {
         client: mpsc::Sender<Value>,
         codex: mpsc::Sender<Value>,
         facades: HashMap<Side, Facade>,
-        acp_models: HashSet<String>,
+        acp: Option<LocalAcp>,
     ) -> Self {
         Self {
             client,
             codex,
             facades,
-            acp_models,
+            acp,
             local_provider: None,
             events: None,
             local_provider_refreshing: false,
@@ -1128,12 +1129,46 @@ impl Router {
             .map(|models| models.iter().any(|entry| entry["id"] == model))
     }
 
+    fn is_acp_model(&self, model: &str) -> bool {
+        self.acp
+            .as_ref()
+            .is_some_and(|config| config.models().any(|id| id == model))
+    }
+
     fn model_side(&self, model: &str) -> Option<Side> {
-        if self.acp_models.contains(model) {
+        if self.is_acp_model(model) {
             return Some(Side::Acp);
         }
         self.is_claude_model(model)
             .map(|owned| if owned { Side::Claude } else { Side::Codex })
+    }
+
+    /// The backend that owns a provider. Codex owns every provider a configured
+    /// facade does not claim.
+    fn provider_side(&self, provider: &str) -> Side {
+        let side = if provider == CLAUDE_PROVIDER {
+            Side::Claude
+        } else if self
+            .acp
+            .as_ref()
+            .is_some_and(|config| config.provider_id == provider)
+        {
+            Side::Acp
+        } else {
+            return Side::Codex;
+        };
+        if self.facades.contains_key(&side) {
+            side
+        } else {
+            Side::Codex
+        }
+    }
+
+    /// Whether the desktop may pick this facade catalog entry.
+    fn selectable_model(&self, side: Side, entry: &Value) -> bool {
+        entry["id"].as_str().is_some_and(|id| {
+            id != CLAUDE_DEFAULT_ALIAS && (side != Side::Acp || self.is_acp_model(id))
+        })
     }
 
     fn request_facade_models(&mut self, side: Side) {
@@ -1327,6 +1362,13 @@ impl Router {
                     .map(|model| model.picker(&config.name, config.reasoning))
                     .collect();
                 self.send_client(json!({"id":id,"result":{"data":models,"nextCursor":null}}));
+            }
+            // The desktop scopes an existing chat's picker to its provider.
+            "model/list" => {
+                let side = params["modelProvider"]
+                    .as_str()
+                    .map_or(Side::Codex, |provider| self.provider_side(provider));
+                self.forward(side, message);
             }
             "thread/loaded/list" if !self.available_facades().is_empty() => {
                 self.start_merge(id, MergeKind::Loaded, params);
@@ -2171,6 +2213,21 @@ impl Router {
             {
                 self.agent_notification(side,&json!({"method":"turn/started","params":{"threadId":forwarded.params["threadId"],"turn":message["result"]["turn"]}}));
             }
+            if side != Side::Codex
+                && forwarded.method == "model/list"
+                && let Some(models) = message
+                    .pointer_mut("/result/data")
+                    .and_then(Value::as_array_mut)
+            {
+                models.retain(|model| self.selectable_model(side, model));
+                if side == Side::Acp
+                    && let Some(config) = &self.acp
+                {
+                    for model in models {
+                        model["isDefault"] = json!(model["id"] == config.model.as_str());
+                    }
+                }
+            }
             self.decorate_agent_pages(&forwarded.method, &forwarded.params, &mut message);
             if side == Side::Claude
                 && forwarded.method == "thread/resume"
@@ -2311,12 +2368,7 @@ impl Router {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .filter(|entry| {
-                            entry["id"].as_str().is_some_and(|id| {
-                                id != CLAUDE_DEFAULT_ALIAS
-                                    && (side != Side::Acp || self.acp_models.contains(id))
-                            })
-                        })
+                        .filter(|entry| self.selectable_model(side, entry))
                         .map(|model| {
                             let mut model = model.clone();
                             model["isDefault"] = json!(false);
@@ -2584,7 +2636,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            HashSet::new(),
+            None,
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");
@@ -2624,7 +2676,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            HashSet::new(),
+            None,
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");

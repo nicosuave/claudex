@@ -1610,6 +1610,73 @@ async fn native_ultrafast_capability_and_turn_override_survive_routing() {
 }
 
 #[tokio::test]
+async fn provider_scoped_model_lists_reach_the_backend_that_owns_the_provider() {
+    let mut facade = Facade::start_with_local_acp().await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    // The facade connections are up once the combined catalog lists both.
+    desktop.ok("model/list", json!({})).await;
+    let names = |page: &Value| -> Vec<String> {
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let query = |provider: &str| json!({"modelProvider":provider,"includeHidden":true,"limit":100});
+
+    // The desktop scopes an existing chat's picker to its thread's provider.
+    let claude = desktop.ok("model/list", query("anthropic")).await;
+    let claude_names = names(&claude);
+    for model in ["opus", "sonnet"] {
+        assert!(claude_names.contains(&model.to_owned()), "{claude_names:?}");
+    }
+    for other in ["default", "gpt-fake", "fake-a", "fake-b"] {
+        assert!(
+            !claude_names.contains(&other.to_owned()),
+            "{claude_names:?}"
+        );
+    }
+    let default = claude["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["isDefault"] == true)
+        .unwrap();
+    assert_eq!(default["id"], "opus");
+
+    // Only configured ACP models are selectable, with the primary model as default.
+    let acp = desktop.ok("model/list", query("fake-provider")).await;
+    let mut acp_names = names(&acp);
+    acp_names.sort();
+    assert_eq!(acp_names, ["fake-a", "fake-b"]);
+    for model in acp["data"].as_array().unwrap() {
+        assert_eq!(model["isDefault"], model["id"] == "fake-b", "{model}");
+    }
+
+    for provider in ["anthropic", "fake-provider"] {
+        let failure = desktop
+            .call("model/list", json!({"modelProvider":provider,"limit":0}))
+            .await;
+        assert_eq!(failure["error"]["code"], -32602, "{failure}");
+        assert!(failure.get("result").is_none(), "{failure}");
+    }
+
+    // Every other provider belongs to Codex.
+    let native = names(&desktop.ok("model/list", query("openai")).await);
+    assert_eq!(native, ["gpt-fake", "gpt-fake-mini"]);
+
+    // Let the service stop its ACP worker.
+    let pid = facade._child.id().unwrap();
+    // SAFETY: the live child PID belongs to this unreaped process.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    tokio::time::timeout(DEADLINE, facade._child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_picker_and_one_sidebar_span_codex_and_claude() {
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
     let mut desktop = Desktop::connect(&facade.socket, 0).await;
@@ -2456,6 +2523,16 @@ async fn service_restart_reconnects_without_sending_claude_requests_to_codex() {
             .contains("reconnecting"),
         "{failed}"
     );
+    let failed = desktop
+        .call("model/list", json!({"modelProvider":"anthropic"}))
+        .await;
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reconnecting"),
+        "{failed}"
+    );
     let failed = desktop.turn(&thread, "opus", "while disconnected").await;
     assert!(
         failed["error"]["message"]
@@ -2624,6 +2701,17 @@ async fn mlx_picker_and_native_threads_preserve_gpt_claude_and_acp_routes() {
         data.iter().find(|entry| entry["id"] == "gpt-fake").unwrap()["isDefault"],
         true
     );
+    let scoped = desktop
+        .ok("model/list", json!({"modelProvider":PROVIDER}))
+        .await;
+    let mut scoped_models: Vec<_> = scoped["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    scoped_models.sort_unstable();
+    assert_eq!(scoped_models, ["mlx-start-fails", "mlx-test"]);
     let mlx = desktop
         .thread(json!({"model":"mlx-test","sandbox":"workspace-write","approvalPolicy":"never"}))
         .await;

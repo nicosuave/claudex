@@ -23,7 +23,7 @@ impl Router {
             .as_ref()
             .is_some_and(|local_provider| local_provider.config.model(id).is_some())
             && !self.local_provider_conflicts.contains(id)
-            && !self.acp_models.contains(id)
+            && !self.is_acp_model(id)
     }
 
     pub(super) fn request_local_provider_models(&mut self) {
