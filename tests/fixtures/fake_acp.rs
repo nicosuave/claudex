@@ -198,6 +198,15 @@ struct Session {
     mcp_servers: Vec<Value>,
 }
 
+impl Session {
+    fn discover_mcp_tools(&self) {
+        // Some agents discover MCP tools synchronously before acknowledging the session.
+        for server in &self.mcp_servers {
+            McpClient::start(server).desktop_catalog();
+        }
+    }
+}
+
 fn session_path(store: &Path, id: &str) -> PathBuf {
     store.join(format!("{id}.json"))
 }
@@ -356,6 +365,27 @@ impl McpClient {
         let mut line = String::new();
         self.output.read_line(&mut line).unwrap();
         Some(serde_json::from_str(&line).unwrap())
+    }
+
+    fn desktop_catalog(&mut self) -> Value {
+        let init = self
+            .call(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake", "version": "1"}}}))
+            .unwrap();
+        if init["result"]["serverInfo"]["name"] != "codex_desktop" {
+            fail(&format!("bad MCP initialize {init}"));
+        }
+        self.call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        let response = self
+            .call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .unwrap();
+        if response["result"]["tools"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            fail(&format!("empty MCP catalog {response}"));
+        }
+        response["result"]["tools"].clone()
     }
 }
 
@@ -592,7 +622,7 @@ fn run_prompt(
             agent.update(session_id, json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-gone", "status": "failed"}));
             "withdrawn".into()
         }
-        "desktop-tool" => {
+        "desktop-tool" | "plugin-tool" => {
             let server = session
                 .mcp_servers
                 .first()
@@ -602,42 +632,50 @@ fn run_prompt(
                 fail("unexpected MCP server name");
             }
             let mut client = McpClient::start(&server);
-            let init = client
-                .call(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake", "version": "1"}}}))
-                .unwrap();
-            if init["result"]["serverInfo"]["name"] != "codex_desktop" {
-                fail(&format!("bad MCP initialize {init}"));
-            }
-            client.call(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-            let tools = client
-                .call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-                .unwrap();
-            let name = tools["result"]["tools"][0]["name"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let title = format!("mcp__codex_desktop__{name}");
+            let tools = client.desktop_catalog();
+            let (spec, arguments) = if script(prompt) == "plugin-tool" {
+                let spec = tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| {
+                        tool["description"].as_str().is_some_and(|description| {
+                            description.starts_with("Codex plugin tool fixture_server/token:")
+                        })
+                    })
+                    .unwrap_or_else(|| fail("missing fixture plugin tool"));
+                (spec, json!({"nonce":"acp-catalog"}))
+            } else {
+                (&tools[0], json!({"query":"abc"}))
+            };
+            let name = spec["name"].as_str().unwrap().to_owned();
+            let mut preview = arguments.clone();
+            let tool_name = if script(prompt) == "desktop-tool" {
+                preview["toolSummary"] = json!("Look up the fixture");
+                format!("mcp_codex_desktop_{name}")
+            } else {
+                format!("mcp__codex_desktop__{name}")
+            };
             agent.update(
                 session_id,
                 tool(
                     "call-desktop",
                     "other",
-                    &title,
-                    json!({"rawInput": {"query": "abc"}}),
+                    &tool_name,
+                    json!({"name":tool_name,"rawInput":preview}),
                 ),
             );
             let choice = permission(
                 agent,
                 session_id,
-                json!({"toolCallId": "call-desktop", "title": title, "rawInput": {"query": "abc"}}),
+                json!({"toolCallId":"call-desktop","name":tool_name,"title":tool_name,"rawInput":preview}),
             );
             if choice != "yes" {
                 return ("end_turn", format!("desktop {choice}"), None);
             }
             let result = client
                 .call(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                    "params": {"name": name, "arguments": {"query": "abc"}}}))
+                    "params": {"name": name, "arguments": arguments}}))
                 .unwrap();
             agent.update(session_id, json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-desktop", "status": "completed"}));
             format!(
@@ -825,6 +863,7 @@ fn main() {
                     mcp_servers: params["mcpServers"].as_array().cloned().unwrap_or_default(),
                     ..Default::default()
                 };
+                session.discover_mcp_tools();
                 save_session(&agent.flags.store, &session_id, &session);
                 let mut response = session_response(&agent.flags, &session);
                 response["sessionId"] = json!(session_id);
@@ -839,6 +878,7 @@ fn main() {
                 };
                 session.cwd = params["cwd"].as_str().unwrap().to_owned();
                 session.mcp_servers = params["mcpServers"].as_array().cloned().unwrap_or_default();
+                session.discover_mcp_tools();
                 if method == "session/load" {
                     // Replay history before answering, as the spec requires.
                     for (prompt, reply) in session.prompts.iter().zip(&session.replies) {
