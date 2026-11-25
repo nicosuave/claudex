@@ -44,6 +44,7 @@ const CURSOR_PREFIX: &str = "claudex-router:";
 /// Claude's catalog alias for "whatever Claude Code defaults to"; it would only
 /// duplicate a concrete model in the shared picker.
 const CLAUDE_DEFAULT_ALIAS: &str = "default";
+const CLAUDE_PROVIDER: &str = "anthropic";
 /// Fields the facade's thread/list accepts; the desktop sends newer ones too.
 const CLAUDE_LIST_FILTERS: &[&str] = &[
     "archived",
@@ -333,6 +334,7 @@ pub struct Router {
     codex: mpsc::Sender<Value>,
     facades: HashMap<Side, Facade>,
     acp_models: HashSet<String>,
+    acp_provider: Option<String>,
     threads: HashMap<String, Side>,
     /// Codex threads started on this connection that have not run a turn;
     /// the desktop prewarms these before the user picks a model.
@@ -505,6 +507,7 @@ pub async fn run(
 
     let mut paths = HashMap::new();
     let mut acp_models = HashSet::new();
+    let mut acp_provider = None;
     if let Some(path) = &claude_socket {
         paths.insert(Side::Claude, path.clone());
         if !websocket && let Some(root) = LocalAcp::root_for_socket(path) {
@@ -512,6 +515,7 @@ pub async fn run(
                 Ok(Some(config)) => {
                     paths.insert(Side::Acp, LocalAcp::socket(root));
                     acp_models.extend(config.models().map(str::to_owned));
+                    acp_provider = Some(config.provider_id);
                 }
                 Ok(None) => {}
                 Err(error) => note!("Local ACP configuration is unavailable: {error:#}"),
@@ -542,6 +546,7 @@ pub async fn run(
         );
     }
     let mut router = Router::new(client, codex_sender, facades, acp_models);
+    router.acp_provider = acp_provider;
     let (calls, mut agent_calls) = mpsc::channel(64);
     router.agents.calls = Some(calls);
     if let Some(socket) = &claude_socket {
@@ -858,6 +863,7 @@ impl Router {
             codex,
             facades,
             acp_models,
+            acp_provider: None,
             threads: HashMap::new(),
             fresh: HashMap::new(),
             initialize_params: None,
@@ -1074,6 +1080,30 @@ impl Router {
             .map(|owned| if owned { Side::Claude } else { Side::Codex })
     }
 
+    /// The backend that owns a provider. Codex owns every provider a configured
+    /// facade does not claim.
+    fn provider_side(&self, provider: &str) -> Side {
+        let side = if provider == CLAUDE_PROVIDER {
+            Side::Claude
+        } else if self.acp_provider.as_deref() == Some(provider) {
+            Side::Acp
+        } else {
+            return Side::Codex;
+        };
+        if self.facades.contains_key(&side) {
+            side
+        } else {
+            Side::Codex
+        }
+    }
+
+    /// Whether the desktop may pick this facade catalog entry.
+    fn selectable_model(&self, side: Side, entry: &Value) -> bool {
+        entry["id"].as_str().is_some_and(|id| {
+            id != CLAUDE_DEFAULT_ALIAS && (side != Side::Acp || self.acp_models.contains(id))
+        })
+    }
+
     fn request_facade_models(&mut self, side: Side) {
         if !self.facade_available(side) || self.facades[&side].models_requested {
             return;
@@ -1237,6 +1267,13 @@ impl Router {
                     self.request_facade_models(side);
                 }
                 self.start_merge(id, MergeKind::Models, params);
+            }
+            // The desktop scopes an existing chat's picker to its provider.
+            "model/list" => {
+                let side = params["modelProvider"]
+                    .as_str()
+                    .map_or(Side::Codex, |provider| self.provider_side(provider));
+                self.forward(side, message);
             }
             "thread/loaded/list" if !self.available_facades().is_empty() => {
                 self.start_merge(id, MergeKind::Loaded, params);
@@ -2020,6 +2057,12 @@ impl Router {
             {
                 self.agent_notification(side,&json!({"method":"turn/started","params":{"threadId":forwarded.params["threadId"],"turn":message["result"]["turn"]}}));
             }
+            if side != Side::Codex
+                && forwarded.method == "model/list"
+                && let Some(models) = message["result"]["data"].as_array_mut()
+            {
+                models.retain(|model| self.selectable_model(side, model));
+            }
             self.decorate_agent_pages(&forwarded.method, &forwarded.params, &mut message);
             if side == Side::Claude
                 && forwarded.method == "thread/resume"
@@ -2120,12 +2163,7 @@ impl Router {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .filter(|entry| {
-                            entry["id"].as_str().is_some_and(|id| {
-                                id != CLAUDE_DEFAULT_ALIAS
-                                    && (side != Side::Acp || self.acp_models.contains(id))
-                            })
-                        })
+                        .filter(|entry| self.selectable_model(side, entry))
                         .map(|model| {
                             let mut model = model.clone();
                             model["isDefault"] = json!(false);
