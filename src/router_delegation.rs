@@ -203,6 +203,7 @@ impl Router {
     }
 
     pub(super) fn agent_mcp_call(&mut self, call: McpCall) {
+        self.refresh_local_provider_routing();
         let reply = Reply::Mcp {
             id: call.message["id"].clone(),
             sender: call.reply,
@@ -214,7 +215,12 @@ impl Router {
         // Native Codex supplies this metadata outside model-controlled arguments.
         // A same-harness child may inherit its parent's MCP configuration; that
         // endpoint must not let it delegate with the parent's permissions.
-        if call.message["params"]["_meta"]["threadId"] != parent {
+        let native_parent = self
+            .local_provider
+            .as_ref()
+            .map(|local_provider| local_provider.native_id(&parent))
+            .unwrap_or(&parent);
+        if call.message["params"]["_meta"]["threadId"] != native_parent {
             self.agent_reply(
                 reply,
                 Err("Native MCP caller does not match its delegation scope".into()),
@@ -1546,7 +1552,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         router.remember_agent_snapshot(&json!({"thread":{"id":"parent"},"cwd":"/tmp",
             "approvalPolicy":"on-request","approvalsReviewer":"user",
@@ -1575,7 +1581,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         let cwd = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
@@ -1614,7 +1620,7 @@ mod tests {
             client,
             codex,
             HashMap::from([(Side::Claude, Facade::default())]),
-            HashSet::new(),
+            None,
         );
         let state = tempfile::tempdir().unwrap();
         router.agents.registry = Registry::open(state.path().join("agents")).unwrap();

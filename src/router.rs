@@ -94,6 +94,8 @@ macro_rules! note {
 
 #[path = "router_delegation.rs"]
 mod agents;
+#[path = "router_local_provider.rs"]
+mod local_provider;
 
 /// Whether `args` (everything after the codex executable) is the desktop's
 /// stdio app-server launch. Anything else runs genuine Codex unchanged.
@@ -226,10 +228,28 @@ enum Input {
     Backend(Side, Value),
     BackendClosed(Side),
     FacadeConnected(Side, mpsc::Sender<Value>),
+    LocalProviderModels(Result<crate::local_provider::Config, String>),
 }
 
 enum Continuation {
     Ignore,
+    LocalProviderDefaults,
+    LocalProviderList {
+        request: Value,
+    },
+    LocalProviderProbe {
+        thread_id: String,
+        request: Value,
+    },
+    LocalProviderStart {
+        replacement: Box<local_provider::Replacement>,
+    },
+    LocalProviderSettings {
+        replacement: Box<local_provider::Replacement>,
+    },
+    LocalProviderMetadata {
+        replacement: Box<local_provider::Replacement>,
+    },
     Probe {
         thread_id: String,
         request: Value,
@@ -294,6 +314,7 @@ struct FreshThread {
     params: Value,
     metadata: Value,
     permissions: Value,
+    settings: Value,
 }
 
 fn remember_permissions(settings: &mut Value, update: &Value) {
@@ -333,8 +354,16 @@ pub struct Router {
     client: mpsc::Sender<Value>,
     codex: mpsc::Sender<Value>,
     facades: HashMap<Side, Facade>,
-    acp_models: HashSet<String>,
-    acp_provider: Option<String>,
+    acp: Option<LocalAcp>,
+    local_provider: Option<crate::local_provider::Integration>,
+    events: Option<mpsc::Sender<Input>>,
+    local_provider_refreshing: bool,
+    local_provider_conflicts: HashSet<String>,
+    local_provider_checked: HashSet<String>,
+    local_provider_replacing: usize,
+    local_provider_notifications: Vec<Value>,
+    local_provider_discarded: HashSet<String>,
+    codex_provider: String,
     threads: HashMap<String, Side>,
     /// Codex threads started on this connection that have not run a turn;
     /// the desktop prewarms these before the user picks a model.
@@ -376,6 +405,7 @@ enum Block {
     Resume,
     Section,
     DefaultModel,
+    LocalProvider,
 }
 
 /// Run the router on stdio until the desktop or genuine Codex disconnects.
@@ -506,16 +536,14 @@ pub async fn run(
     };
 
     let mut paths = HashMap::new();
-    let mut acp_models = HashSet::new();
-    let mut acp_provider = None;
+    let mut acp = None;
     if let Some(path) = &claude_socket {
         paths.insert(Side::Claude, path.clone());
         if !websocket && let Some(root) = LocalAcp::root_for_socket(path) {
             match LocalAcp::read(root) {
                 Ok(Some(config)) => {
                     paths.insert(Side::Acp, LocalAcp::socket(root));
-                    acp_models.extend(config.models().map(str::to_owned));
-                    acp_provider = Some(config.provider_id);
+                    acp = Some(config);
                 }
                 Ok(None) => {}
                 Err(error) => note!("Local ACP configuration is unavailable: {error:#}"),
@@ -545,8 +573,14 @@ pub async fn run(
             },
         );
     }
-    let mut router = Router::new(client, codex_sender, facades, acp_models);
-    router.acp_provider = acp_provider;
+    let mut router = Router::new(client, codex_sender, facades, acp);
+    router.events = Some(events.clone());
+    if let Some(root) = claude_socket.as_deref().and_then(LocalAcp::root_for_socket) {
+        match crate::local_provider::Integration::read(root) {
+            Ok(local_provider) => router.local_provider = local_provider,
+            Err(e) => note!("self-hosted provider configuration is unavailable: {e:#}"),
+        }
+    }
     let (calls, mut agent_calls) = mpsc::channel(64);
     router.agents.calls = Some(calls);
     if let Some(socket) = &claude_socket {
@@ -561,6 +595,7 @@ pub async fn run(
             _ = tick.tick() => { router.agent_tick(); continue; },
         };
         match input {
+            Input::LocalProviderModels(result) => router.local_provider_models_received(result),
             Input::Client(message) => router.client_message(message),
             Input::Backend(side, message) => router.backend_message(side, message),
             Input::ClientClosed | Input::BackendClosed(Side::Codex) => break,
@@ -856,14 +891,22 @@ impl Router {
         client: mpsc::Sender<Value>,
         codex: mpsc::Sender<Value>,
         facades: HashMap<Side, Facade>,
-        acp_models: HashSet<String>,
+        acp: Option<LocalAcp>,
     ) -> Self {
         Self {
             client,
             codex,
             facades,
-            acp_models,
-            acp_provider: None,
+            acp,
+            local_provider: None,
+            events: None,
+            local_provider_refreshing: false,
+            local_provider_conflicts: HashSet::new(),
+            local_provider_checked: HashSet::new(),
+            local_provider_replacing: 0,
+            local_provider_notifications: vec![],
+            local_provider_discarded: HashSet::new(),
+            codex_provider: "openai".into(),
             threads: HashMap::new(),
             fresh: HashMap::new(),
             initialize_params: None,
@@ -894,7 +937,12 @@ impl Router {
         }
     }
 
-    fn send_backend_checked(&self, side: Side, message: Value) -> bool {
+    fn send_backend_checked(&self, side: Side, mut message: Value) -> bool {
+        if side == Side::Codex
+            && let Some(local_provider) = &self.local_provider
+        {
+            local_provider.to_native(&mut message);
+        }
         let sender = match side {
             Side::Codex => Some(&self.codex),
             _ => self
@@ -1028,12 +1076,21 @@ impl Router {
         {
             self.interrupt_descendants(thread);
         }
+        // Keep the original start payload for recreating an empty prewarm on
+        // either provider; Self-hosted overrides belong only to its native request.
+        let tracked_params = message["params"].clone();
+        if side == Side::Codex
+            && let Err(e) = self.apply_local_provider_settings(&mut message)
+        {
+            self.send_client(error(message["id"].clone(), e.to_string()));
+            return;
+        }
         if let Some(id) = message.get("id") {
             self.forwarded.insert(
                 (side, id_key(id)),
                 Forwarded {
                     method: message["method"].as_str().unwrap_or("").to_owned(),
-                    params: message["params"].clone(),
+                    params: tracked_params,
                     delegation_scope,
                 },
             );
@@ -1072,8 +1129,14 @@ impl Router {
             .map(|models| models.iter().any(|entry| entry["id"] == model))
     }
 
+    fn is_acp_model(&self, model: &str) -> bool {
+        self.acp
+            .as_ref()
+            .is_some_and(|config| config.models().any(|id| id == model))
+    }
+
     fn model_side(&self, model: &str) -> Option<Side> {
-        if self.acp_models.contains(model) {
+        if self.is_acp_model(model) {
             return Some(Side::Acp);
         }
         self.is_claude_model(model)
@@ -1085,7 +1148,11 @@ impl Router {
     fn provider_side(&self, provider: &str) -> Side {
         let side = if provider == CLAUDE_PROVIDER {
             Side::Claude
-        } else if self.acp_provider.as_deref() == Some(provider) {
+        } else if self
+            .acp
+            .as_ref()
+            .is_some_and(|config| config.provider_id == provider)
+        {
             Side::Acp
         } else {
             return Side::Codex;
@@ -1100,7 +1167,7 @@ impl Router {
     /// Whether the desktop may pick this facade catalog entry.
     fn selectable_model(&self, side: Side, entry: &Value) -> bool {
         entry["id"].as_str().is_some_and(|id| {
-            id != CLAUDE_DEFAULT_ALIAS && (side != Side::Acp || self.acp_models.contains(id))
+            id != CLAUDE_DEFAULT_ALIAS && (side != Side::Acp || self.is_acp_model(id))
         })
     }
 
@@ -1225,6 +1292,7 @@ impl Router {
     }
 
     fn dispatch(&mut self, message: Value) {
+        self.refresh_local_provider_routing();
         let Some(method) = message["method"].as_str().map(str::to_owned) else {
             self.send_backend(Side::Codex, message);
             return;
@@ -1242,6 +1310,18 @@ impl Router {
             return;
         };
         let params = message["params"].clone();
+        if matches!(method.as_str(), "thread/list" | "thread/search")
+            && self.local_provider.is_some()
+            && params["modelProviders"].is_null()
+        {
+            self.internal_request(
+                Side::Codex,
+                "config/read",
+                json!({"includeLayers":false,"cwd":null}),
+                Continuation::LocalProviderList { request: message },
+            );
+            return;
+        }
         match method.as_str() {
             "initialize" => {
                 self.initialize_params = Some(params.clone());
@@ -1261,12 +1341,27 @@ impl Router {
                 self.forward(Side::Codex, message);
             }
             "model/list"
-                if params["modelProvider"].is_null() && !self.available_facades().is_empty() =>
+                if params["modelProvider"].is_null()
+                    && (!self.available_facades().is_empty() || self.local_provider.is_some()) =>
             {
+                self.request_local_provider_models();
                 for side in self.available_facades() {
                     self.request_facade_models(side);
                 }
                 self.start_merge(id, MergeKind::Models, params);
+            }
+            "model/list"
+                if params["modelProvider"] == crate::local_provider::PROVIDER
+                    && self.local_provider.is_some() =>
+            {
+                let config = &self.local_provider.as_ref().unwrap().config;
+                let models: Vec<Value> = config
+                    .models
+                    .iter()
+                    .filter(|model| self.local_provider_model(&model.id))
+                    .map(|model| model.picker(&config.name, config.reasoning))
+                    .collect();
+                self.send_client(json!({"id":id,"result":{"data":models,"nextCursor":null}}));
             }
             // The desktop scopes an existing chat's picker to its provider.
             "model/list" => {
@@ -1349,6 +1444,9 @@ impl Router {
             None => Side::Codex,
         };
         let method = message["method"].as_str().unwrap_or("").to_owned();
+        if side == Side::Codex && self.route_local_provider_selection(thread, &message) {
+            return;
+        }
         if let Some(model) = selected_model(&message["params"]).map(str::to_owned) {
             let Some(target) = self.model_side(&model) else {
                 self.block(Block::Models, message);
@@ -1721,7 +1819,8 @@ impl Router {
         let models_ready = self
             .available_facades()
             .into_iter()
-            .all(|side| self.facades[&side].models.is_some());
+            .all(|side| self.facades[&side].models.is_some())
+            && !self.local_provider_refreshing;
         let ready: Vec<u64> = self
             .merges
             .iter()
@@ -1762,9 +1861,40 @@ impl Router {
                             );
                         }
                     }
+                    if let Some(local_provider) = &self.local_provider {
+                        self.local_provider_conflicts = local_provider
+                            .config
+                            .models
+                            .iter()
+                            .filter(|model| seen.contains(&json!(model.id)))
+                            .map(|model| model.id.clone())
+                            .collect();
+                        data.extend(
+                            local_provider
+                                .config
+                                .models
+                                .iter()
+                                .filter(|model| seen.insert(json!(model.id)))
+                                .map(|model| {
+                                    model.picker(
+                                        &local_provider.config.name,
+                                        local_provider.config.reasoning,
+                                    )
+                                }),
+                        );
+                    }
                 }
             }
             MergeKind::Loaded => {
+                if let Some(local_provider) = &self.local_provider
+                    && let Some(data) = result["data"].as_array_mut()
+                {
+                    for id in data {
+                        if let Some(native) = id.as_str() {
+                            *id = json!(local_provider.public_id(native));
+                        }
+                    }
+                }
                 for (side, item) in &state.facade_items {
                     if let Some(id) = item.as_str() {
                         self.threads.insert(id.to_owned(), *side);
@@ -1911,6 +2041,12 @@ impl Router {
     }
 
     fn backend_message(&mut self, side: Side, mut message: Value) {
+        if side == Side::Codex {
+            self.refresh_local_provider_routing();
+        }
+        if side == Side::Codex && !self.local_provider_incoming(&mut message) {
+            return;
+        }
         let method = message["method"].as_str().map(str::to_owned);
         let id = message.get("id").cloned();
         match (method, id) {
@@ -2011,6 +2147,19 @@ impl Router {
         let forwarded = self.forwarded.remove(&(side, id_key(&id)));
         if let Some(forwarded) = &forwarded {
             if side == Side::Codex
+                && let Ok(result) = &result
+            {
+                self.remember_local_provider_result(forwarded, result);
+                if forwarded.method == "initialize" && self.local_provider.is_some() {
+                    self.internal_request(
+                        Side::Codex,
+                        "config/read",
+                        json!({"includeLayers":false,"cwd":null}),
+                        Continuation::LocalProviderDefaults,
+                    );
+                }
+            }
+            if side == Side::Codex
                 && result.is_ok()
                 && forwarded.method == "thread/settings/update"
                 && let Some(fresh) = forwarded.params["threadId"]
@@ -2018,6 +2167,13 @@ impl Router {
                     .and_then(|thread| self.fresh.get_mut(thread))
             {
                 remember_permissions(&mut fresh.permissions, &forwarded.params);
+                if let Some(settings) = forwarded.params.as_object() {
+                    for (key, value) in settings {
+                        if key != "threadId" {
+                            fresh.settings[key] = value.clone();
+                        }
+                    }
+                }
             }
             if result.is_ok()
                 && matches!(
@@ -2059,9 +2215,18 @@ impl Router {
             }
             if side != Side::Codex
                 && forwarded.method == "model/list"
-                && let Some(models) = message["result"]["data"].as_array_mut()
+                && let Some(models) = message
+                    .pointer_mut("/result/data")
+                    .and_then(Value::as_array_mut)
             {
                 models.retain(|model| self.selectable_model(side, model));
+                if side == Side::Acp
+                    && let Some(config) = &self.acp
+                {
+                    for model in models {
+                        model["isDefault"] = json!(model["id"] == config.model.as_str());
+                    }
+                }
             }
             self.decorate_agent_pages(&forwarded.method, &forwarded.params, &mut message);
             if side == Side::Claude
@@ -2112,6 +2277,7 @@ impl Router {
                         params: forwarded.params,
                         metadata: result["thread"].clone(),
                         permissions: json!({}),
+                        settings: json!({}),
                     },
                 );
             } else if side == Side::Codex
@@ -2133,6 +2299,45 @@ impl Router {
     ) {
         match continuation {
             Continuation::Ignore => {}
+            Continuation::LocalProviderDefaults => {
+                if let Ok(result) = result {
+                    self.codex_provider = result["config"]["model_provider"]
+                        .as_str()
+                        .unwrap_or("openai")
+                        .into();
+                }
+            }
+            Continuation::LocalProviderList { mut request } => match result {
+                Ok(result) => {
+                    self.codex_provider = result["config"]["model_provider"]
+                        .as_str()
+                        .unwrap_or("openai")
+                        .into();
+                    request["params"]["modelProviders"] =
+                        json!([self.codex_provider, crate::local_provider::PROVIDER]);
+                    self.dispatch(request);
+                }
+                Err(e) => self.send_client(json!({"id":request["id"],"error":e})),
+            },
+            Continuation::LocalProviderProbe { thread_id, request } => {
+                self.local_provider_probe_received(thread_id, request, result)
+            }
+            Continuation::LocalProviderStart { replacement } => {
+                self.local_provider_start_received(replacement, result)
+            }
+            Continuation::LocalProviderSettings { replacement } => match result {
+                Ok(_) => self.local_provider_restore_metadata(replacement),
+                Err(e) => self.local_provider_replacement_failed(replacement, e),
+            },
+            Continuation::LocalProviderMetadata { mut replacement } => match result {
+                Ok(result) => {
+                    if result["thread"].is_object() {
+                        replacement.started.as_mut().unwrap()["thread"] = result["thread"].clone();
+                    }
+                    self.local_provider_replacement_ready(replacement);
+                }
+                Err(e) => self.local_provider_replacement_failed(replacement, e),
+            },
             Continuation::Probe {
                 thread_id,
                 request,
@@ -2431,7 +2636,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            HashSet::new(),
+            None,
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");
@@ -2471,7 +2676,7 @@ mod tests {
                     ..Facade::default()
                 },
             )]),
-            HashSet::new(),
+            None,
         );
         router.client_message(json!({"id":0,"method":"initialize","params":{}}));
         assert_eq!(codex_requests.recv().await.unwrap()["method"], "initialize");

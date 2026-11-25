@@ -51,6 +51,38 @@ Genuine Codex requests retain their runtime configuration. Approval and sandbox
 settings retain their native semantics; workspace tests use the desktop's actual
 workspace-write and automatic-review payload, rather than substituting full access.
 
+## Native self-hosted providers
+
+The opt-in `claudex local-provider` configuration adds a Responses-compatible
+endpoint to the merged picker; `claudex mlx` supplies the MLX-Serve preset.
+These models stay on genuine Codex. Only their start/resume/fork
+requests receive the local provider and generated model catalog; GPT's global
+provider, catalog and inference URL are retained. The catalog uses the server's
+working context window and text/image modalities, and disables hosted search
+and remote compaction for the self-hosted provider.
+
+Ordinary self-hosted endpoints use direct function tools with cloud apps disabled
+on their per-thread configuration. Current MLX-Serve supports function/namespace
+tools but not specialized tool-search or custom code-mode calls; deferral therefore
+cannot be advertised, and an eager cloud connector catalog would otherwise
+dominate local prefill. Compatible endpoints can opt in with `--codex-tools`.
+Native tools, configured MCP servers, AGENTS instructions and existing providers
+retain their usual behavior.
+
+Codex fixes each chat's provider at creation. If the desktop chooses MLX for a
+verified still-empty prewarm, the router creates a replacement native chat,
+restores applicable settings and project metadata, and durably aliases its id
+before releasing notifications or the first turn. Only typed thread identities
+are translated; user content, tool arguments, turn/item ids and rollout paths
+retain their bytes. Aliases are shared across router processes. The native MCP
+caller is authenticated against the actual native id while delegation retains
+the public id.
+
+After a chat has messages, cross-provider changes require a new chat. Normal
+facade adoption continues to handle empty chats selected for Claude or ACP.
+An unavailable MLX server retains cached picker metadata and does not change
+the native GPT/Claude/ACP routes or silently replay a request on another model.
+
 ## Service lifecycle
 
 A Claude service restart must not turn a Claude model into a Codex model. The
