@@ -15,6 +15,8 @@ pub mod history_recovery;
 pub mod install;
 #[cfg(unix)]
 pub mod local_acp;
+#[cfg(unix)]
+pub mod local_provider;
 pub mod occurrences;
 pub mod plugins;
 pub mod protocol;

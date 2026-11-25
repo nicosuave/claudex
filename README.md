@@ -92,6 +92,12 @@ details and [the router contract](docs/router-desktop-flow.md) for thread
 creation, model selection, metadata, and reconnection behavior. Claude
 [prompt-bar predictions](docs/prompt-predictions.md) also use the router.
 
+To add self-hosted Responses-compatible models to the same picker, use
+`claudex local-provider`; `claudex mlx` is the MLX-Serve preset. Reopen the
+desktop app to load the models. These chats use genuine Codex's tools and
+permissions with direct inference; GPT, Claude and ACP routing stay available.
+See [self-hosted setup](DESKTOP.md#self-hosted-models-in-the-local-picker).
+
 ## Cross-harness agents
 
 In a routed chat, Codex can delegate a task to Claude, and Claude can delegate to

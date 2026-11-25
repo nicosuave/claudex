@@ -300,11 +300,19 @@ fn main() {
                 )
             }
             "thread/start" => {
+                let provider = p["modelProvider"].as_str().unwrap_or("openai");
+                if p["model"] == "mlx-start-fails" {
+                    emit(
+                        json!({"id":id,"error":{"code":-32600,"message":"fixture refused MLX start"}}),
+                    );
+                    continue;
+                }
                 serial += 1;
                 let id = format!("0199{serial:04}-0000-7000-8000-000000000000");
                 let model = p["model"].as_str().unwrap_or("gpt-fake");
                 let created = 2_000_000_000 + serial as i64;
-                let started = thread(&id, created, model, 0);
+                let mut started = thread(&id, created, model, 0);
+                started["modelProvider"] = json!(provider);
                 thread_configs.insert(id.clone(), p["config"].clone());
                 effective.insert(id.clone(), settings(p));
                 if p["config"]["mcp_servers.claudex_agents"].is_object() {
@@ -320,6 +328,7 @@ fn main() {
                 let mut result = effective[&id].clone();
                 result["thread"] = started;
                 result["model"] = json!(model);
+                result["modelProvider"] = json!(provider);
                 Ok(result)
             }
             "turn/start" => {
@@ -434,6 +443,7 @@ fn main() {
                             .unwrap_or_else(|| json!({}));
                         result["thread"] = thread;
                         result["model"] = t["model"].clone();
+                        result["modelProvider"] = t["modelProvider"].clone();
                         result
                     })
                     .ok_or("thread not found")
@@ -499,6 +509,8 @@ fn main() {
             },
             "thread/unsubscribe" => {
                 unsubscribed.push(p["threadId"].as_str().unwrap_or("").to_owned());
+                emit(json!({"method":"thread/closed","params":{"threadId":p["threadId"]}}));
+                threads.retain(|t| t["id"] != p["threadId"] || t["fakeTurns"] != 0);
                 Ok(json!({"status": "unsubscribed"}))
             }
             "thread/loaded/list" => Ok(
@@ -589,7 +601,12 @@ fn main() {
                 let mut listed: Vec<Value> = threads
                     .iter()
                     .filter(|t| {
-                        (p["parentThreadId"].is_null()
+                        p["modelProviders"].as_array().map_or(
+                            t["modelProvider"] == "openai",
+                            |providers| {
+                                providers.is_empty() || providers.contains(&t["modelProvider"])
+                            },
+                        ) && (p["parentThreadId"].is_null()
                             || t["parentThreadId"] == p["parentThreadId"])
                             && (p["ancestorThreadId"].is_null()
                                 || t["parentThreadId"] == p["ancestorThreadId"])

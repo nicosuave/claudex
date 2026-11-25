@@ -119,6 +119,34 @@ enum Command {
         #[arg(long = "include-model", value_name = "MODEL")]
         include_models: Vec<String>,
     },
+    /// Add MLX-Serve models to the existing picker using native Codex tools.
+    #[cfg(unix)]
+    Mlx {
+        /// MLX-Serve's OpenAI-compatible API base URL.
+        #[arg(long, default_value = claude_codex_server::local_provider::MLX_URL)]
+        url: String,
+    },
+    /// Add a self-hosted Responses-compatible endpoint to the local picker.
+    #[cfg(unix)]
+    LocalProvider {
+        /// OpenAI-compatible base URL; the server must implement /responses.
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "Self-hosted")]
+        name: String,
+        /// Working context window for models whose server does not advertise one.
+        #[arg(long)]
+        context_window: Option<u64>,
+        /// Environment variable containing the server's API key (never the key itself).
+        #[arg(long)]
+        env_key: Option<String>,
+        /// Server implements Codex custom tools and client-side tool search.
+        #[arg(long)]
+        codex_tools: bool,
+        /// Server supports the Responses reasoning-effort parameter.
+        #[arg(long)]
+        reasoning: bool,
+    },
     /// Check executables, service, local SSH, and native Claude authentication.
     #[cfg(unix)]
     Doctor,
@@ -246,6 +274,31 @@ async fn run(
     }
     #[cfg(unix)]
     match &args.command {
+        Some(Command::Mlx { url }) => {
+            let mut config = claude_codex_server::local_provider::Config::new(url, "MLX-Serve");
+            config.reasoning = true;
+            return claude_codex_server::install::Installation::current(None)?
+                .configure_local_provider(config)
+                .await;
+        }
+        Some(Command::LocalProvider {
+            url,
+            name,
+            context_window,
+            env_key,
+            codex_tools,
+            reasoning,
+        }) => {
+            let mut config = claude_codex_server::local_provider::Config::new(url, name);
+            config.context_window = *context_window;
+            config.env_key = env_key.clone();
+            config.codex_tools = *codex_tools;
+            config.reasoning = *reasoning;
+            config.selected_models = args.model.clone().into_iter().collect();
+            return claude_codex_server::install::Installation::current(None)?
+                .configure_local_provider(config)
+                .await;
+        }
         Some(Command::LocalAcp { include_models }) => {
             let agent = acp.context("Pass --acp-agent and --model for the desktop connection")?;
             return claude_codex_server::install::Installation::current(None)?

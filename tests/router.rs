@@ -27,11 +27,68 @@ const DESKTOP_ARGS: &[&str] = &[
     "--analytics-default-enabled",
 ];
 
+struct MlxFixture(tokio::task::JoinHandle<()>);
+
+impl MlxFixture {
+    async fn enable(facade: &Facade) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let models = ["mlx-test", "mlx-start-fails", "gpt-fake"].map(|id| {
+            json!({
+            "id":id,"context_length":32768,"capabilities":["chat","tool_use","streaming"],
+            "input_modalities":["text"]})
+        });
+        let body = json!({"data":models}).to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                use tokio::io::AsyncReadExt;
+                let mut request = [0; 8192];
+                if stream.read(&mut request).await.is_err() {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let config = claude_codex_server::local_provider::Config::discover(&url)
+            .await
+            .unwrap();
+        config.write(facade._state.path()).unwrap();
+        Self(task)
+    }
+}
+
+impl Drop for MlxFixture {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The facade's login-session service, listening on its private socket.
 struct Facade {
     _child: Child,
     socket: std::path::PathBuf,
     _state: tempfile::TempDir,
+    process_group: Option<u32>,
+}
+
+impl Drop for Facade {
+    fn drop(&mut self) {
+        if let Some(group) = self.process_group {
+            // This test-owned service and its supervised ACP worker share a
+            // private process group, so a failed test cannot leave workers.
+            unsafe {
+                libc::kill(-(group as i32), libc::SIGTERM);
+            }
+        }
+    }
 }
 
 impl Facade {
@@ -47,6 +104,7 @@ impl Facade {
             _child: child,
             socket,
             _state: state,
+            process_group: None,
         }
     }
 
@@ -74,6 +132,8 @@ impl Facade {
         )
         .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
         }
@@ -98,6 +158,7 @@ impl Facade {
             .spawn()
             .unwrap();
         let acp_socket = claude_codex_server::local_acp::LocalAcp::socket(root);
+        let process_group = child.id();
         tokio::time::timeout(DEADLINE, async {
             for path in [&socket, &acp_socket] {
                 while tokio::net::UnixStream::connect(path).await.is_err() {
@@ -111,6 +172,7 @@ impl Facade {
             _child: child,
             socket,
             _state: state,
+            process_group,
         }
     }
 
@@ -356,6 +418,37 @@ fn reports(completed: &Value) -> Vec<Value> {
         .as_str()
         .unwrap();
     serde_json::from_str(text).unwrap()
+}
+
+fn streamed_answer(desktop: &Desktop, completed: &Value) -> String {
+    // Current Codex can return a completed turn with itemsView=notLoaded.
+    // The subscribed stream remains the source of its actual answer text.
+    let params = &completed["params"];
+    let turn = &params["turn"]["id"];
+    let messages: Vec<&Value> = desktop
+        .history
+        .iter()
+        .filter(|message| {
+            message["params"]["threadId"] == params["threadId"]
+                && message["params"]["turnId"] == *turn
+        })
+        .collect();
+    let final_text: String = messages
+        .iter()
+        .filter(|message| {
+            message["method"] == "item/completed"
+                && message["params"]["item"]["type"] == "agentMessage"
+        })
+        .filter_map(|message| message["params"]["item"]["text"].as_str())
+        .collect();
+    if !final_text.is_empty() {
+        return final_text;
+    }
+    messages
+        .iter()
+        .filter(|message| message["method"] == "item/agentMessage/delta")
+        .filter_map(|message| message["params"]["delta"].as_str())
+        .collect()
 }
 
 fn result(report: &Value) -> Value {
@@ -2507,4 +2600,471 @@ async fn other_codex_invocations_run_genuine_codex() {
         String::from_utf8_lossy(&output.stdout),
         "codex-cli 9.9.9-fake\n"
     );
+}
+
+#[tokio::test]
+async fn mlx_picker_and_native_threads_preserve_gpt_claude_and_acp_routes() {
+    use claude_codex_server::local_provider::PROVIDER;
+    let facade = Facade::start_with_local_acp().await;
+    let _mlx = MlxFixture::enable(&facade).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let models = desktop.ok("model/list", json!({})).await;
+    let data = models["data"].as_array().unwrap();
+    for model in ["gpt-fake", "opus", "fake-a", "fake-b", "mlx-test"] {
+        assert!(data.iter().any(|entry| entry["id"] == model), "{models}");
+    }
+    // A server advertising a native model id cannot take over the GPT entry.
+    assert_eq!(
+        data.iter()
+            .filter(|entry| entry["id"] == "gpt-fake")
+            .count(),
+        1
+    );
+    assert_eq!(
+        data.iter().find(|entry| entry["id"] == "gpt-fake").unwrap()["isDefault"],
+        true
+    );
+    let mlx = desktop
+        .thread(json!({"model":"mlx-test","sandbox":"workspace-write","approvalPolicy":"never"}))
+        .await;
+    desktop.turn(&mlx, "mlx-test", "local first turn").await;
+    desktop.completed(&mlx).await;
+    let read = desktop.ok("thread/read", json!({"threadId":mlx})).await;
+    assert_eq!(read["thread"]["modelProvider"], PROVIDER);
+    assert_eq!(read["sandbox"]["type"], "workspaceWrite");
+    let resumed = desktop
+        .ok(
+            "thread/resume",
+            json!({"threadId":mlx,"modelProvider":"openai"}),
+        )
+        .await;
+    assert_eq!(resumed["thread"]["modelProvider"], PROVIDER);
+
+    let gpt = desktop.thread(json!({"model":"gpt-fake"})).await;
+    desktop.turn(&gpt, "gpt-fake", "native GPT").await;
+    desktop.completed(&gpt).await;
+    let claude = desktop
+        .thread(json!({"model":"opus","sandbox":"danger-full-access"}))
+        .await;
+    desktop.turn(&claude, "opus", "native Claude").await;
+    desktop.completed(&claude).await;
+    let acp = desktop
+        .thread(json!({"model":"fake-b","sandbox":"danger-full-access"}))
+        .await;
+    desktop.turn(&acp, "fake-b", "native ACP").await;
+    desktop.completed(&acp).await;
+    for (id, provider) in [
+        (&gpt, "openai"),
+        (&claude, "anthropic"),
+        (&acp, "fake-provider"),
+    ] {
+        assert_eq!(
+            desktop.ok("thread/read", json!({"threadId":id})).await["thread"]["modelProvider"],
+            provider
+        );
+    }
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(state["threadConfigs"][&mlx][format!("model_providers.{PROVIDER}")].is_object());
+    assert!(state["threadConfigs"][&gpt]["model_catalog_json"].is_null());
+    let listed = desktop.ok("thread/list", json!({})).await;
+    for id in [&mlx, &gpt, &claude, &acp] {
+        assert!(ids(&listed).contains(id), "{listed}");
+    }
+    assert!(desktop.turn(&gpt, "mlx-test", "wrong provider").await["error"].is_object());
+    assert!(desktop.turn(&mlx, "gpt-fake", "wrong provider").await["error"].is_object());
+}
+
+#[tokio::test]
+async fn mlx_prewarm_keeps_public_identity_metadata_permissions_and_notifications() {
+    use claude_codex_server::local_provider::{Integration, PROVIDER};
+    let facade = Facade::start_with_local_acp().await;
+    let _mlx = MlxFixture::enable(&facade).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop.ok("model/list", json!({})).await;
+    let thread = desktop
+        .thread(
+            json!({"model":"gpt-fake","sandbox":"workspace-write","approvalPolicy":"on-request"}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":"my-project"}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"approvalPolicy":"never"}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"mlx-test"}),
+        )
+        .await;
+    let routing = Integration::read(facade._state.path()).unwrap().unwrap();
+    let native = routing.native_id(&thread).to_owned();
+    assert_ne!(native, thread);
+    let read = desktop.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["thread"]["id"], thread);
+    assert_eq!(read["thread"]["modelProvider"], PROVIDER);
+    assert_eq!(read["thread"]["projectId"], "my-project");
+    assert_eq!(read["approvalPolicy"], "never");
+    assert_eq!(read["sandbox"]["type"], "workspaceWrite");
+    desktop.turn(&thread, "mlx-test", "first").await;
+    desktop.completed(&thread).await;
+    desktop.turn(&thread, "mlx-test", "follow up").await;
+    desktop.completed(&thread).await;
+    let loaded = desktop.ok("thread/loaded/list", json!({})).await;
+    assert!(loaded["data"].as_array().unwrap().contains(&json!(thread)));
+    assert!(!loaded["data"].as_array().unwrap().contains(&json!(native)));
+    let listed = desktop.ok("thread/list", json!({})).await;
+    assert_eq!(
+        ids(&listed).iter().filter(|id| **id == thread).count(),
+        1,
+        "{listed}"
+    );
+    assert!(!ids(&listed).contains(&native));
+    let resumed = desktop
+        .ok(
+            "thread/resume",
+            json!({"threadId":thread,"modelProvider":"openai"}),
+        )
+        .await;
+    assert_eq!(resumed["thread"]["id"], thread);
+    assert_eq!(resumed["thread"]["modelProvider"], PROVIDER);
+    assert!(
+        !desktop
+            .history
+            .iter()
+            .any(|message| message["method"] == "thread/closed"
+                && message["params"]["threadId"] == thread)
+    );
+    assert!(
+        !desktop
+            .history
+            .iter()
+            .any(|message| message["params"]["thread"]["id"] == native)
+    );
+}
+
+#[tokio::test]
+async fn mlx_empty_selection_can_return_to_gpt_and_failed_replacement_keeps_original() {
+    let facade = Facade::start_with_local_acp().await;
+    let _mlx = MlxFixture::enable(&facade).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop.ok("model/list", json!({})).await;
+    let thread = desktop.thread(json!({"model":"gpt-fake"})).await;
+    let failed = desktop
+        .call(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"mlx-start-fails"}),
+        )
+        .await;
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refused MLX start")
+    );
+    assert_eq!(
+        desktop.ok("thread/read", json!({"threadId":thread})).await["thread"]["modelProvider"],
+        "openai"
+    );
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"mlx-test"}),
+        )
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"gpt-fake"}),
+        )
+        .await;
+    let read = desktop.ok("thread/read", json!({"threadId":thread})).await;
+    assert_eq!(read["thread"]["id"], thread);
+    assert_eq!(read["thread"]["modelProvider"], "openai");
+    desktop
+        .turn(&thread, "gpt-fake", "GPT after changing selection")
+        .await;
+    desktop.completed(&thread).await;
+}
+
+#[tokio::test]
+async fn mlx_offline_discovery_keeps_cached_models_and_existing_routes_available() {
+    let facade = Facade::start_with_local_acp().await;
+    let mlx = MlxFixture::enable(&facade).await;
+    drop(mlx);
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    let models = desktop.ok("model/list", json!({})).await;
+    for model in ["gpt-fake", "opus", "fake-b", "mlx-test"] {
+        assert!(
+            models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == model),
+            "{models}"
+        );
+    }
+    let thread = desktop.thread(json!({"model":"gpt-fake"})).await;
+    desktop
+        .turn(&thread, "gpt-fake", "works with MLX offline")
+        .await;
+    desktop.completed(&thread).await;
+}
+
+#[tokio::test]
+async fn mlx_empty_selection_uses_existing_claude_and_acp_adoption() {
+    let facade = Facade::start_with_local_acp().await;
+    let _mlx = MlxFixture::enable(&facade).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop.ok("model/list", json!({})).await;
+    for (model, provider) in [("opus", "anthropic"), ("fake-b", "fake-provider")] {
+        let thread = desktop
+            .thread(json!({"model":"gpt-fake","sandbox":"danger-full-access"}))
+            .await;
+        desktop
+            .ok(
+                "thread/settings/update",
+                json!({"threadId":thread,"model":"mlx-test"}),
+            )
+            .await;
+        desktop
+            .ok(
+                "thread/settings/update",
+                json!({"threadId":thread,"model":model}),
+            )
+            .await;
+        desktop
+            .turn(&thread, model, "uses the selected native facade")
+            .await;
+        desktop.completed(&thread).await;
+        assert_eq!(
+            desktop.ok("thread/read", json!({"threadId":thread})).await["thread"]["modelProvider"],
+            provider
+        );
+    }
+    let state = desktop.ok("fake/state", json!({})).await;
+    assert!(
+        !state["requests"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("turn/start")),
+        "A facade model was sent to native Codex: {state}"
+    );
+}
+
+#[tokio::test]
+async fn mlx_aliased_mcp_parent_is_authenticated_without_authorizing_an_inherited_child() {
+    let facade = Facade::start_with_local_acp().await;
+    let _mlx = MlxFixture::enable(&facade).await;
+    let mut desktop = Desktop::connect(&facade.socket, 0).await;
+    desktop.ok("model/list", json!({})).await;
+    let thread = desktop
+        .thread(json!({"model":"gpt-fake","sandbox":"workspace-write"}))
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":"mlx-test"}),
+        )
+        .await;
+    let text = script(json!([
+        {"tool":"list_agents","arguments":{}},
+        {"tool":"list_agents","arguments":{},"meta":{"threadId":"a-different-native-child"}}
+    ]));
+    desktop.turn(&thread, "mlx-test", &text).await;
+    let results = reports(&desktop.completed(&thread).await);
+    assert_ne!(results[0]["isError"], true, "{results:?}");
+    assert_eq!(results[1]["isError"], true, "{results:?}");
+    assert!(
+        results[1]
+            .to_string()
+            .contains("does not match its delegation scope")
+    );
+}
+
+/// Opt-in end-to-end check against the installed genuine Codex and MLX-Serve.
+/// Creates only its own disposable chats and executes printf / sleep in a temp
+/// workspace. Run with CLAUDEX_LIVE_CODEX and, optionally, CLAUDEX_MLX_MODEL.
+#[tokio::test]
+#[ignore = "requires real Codex authentication and a running MLX-Serve"]
+async fn mlx_live_native_tools_stream_interrupt_fork_and_cold_resume() {
+    use claude_codex_server::local_provider::{Config, PROVIDER};
+    let codex = std::env::var("CLAUDEX_LIVE_CODEX")
+        .expect("Set CLAUDEX_LIVE_CODEX to the genuine Codex executable");
+    let url = std::env::var("CLAUDEX_MLX_URL")
+        .unwrap_or_else(|_| claude_codex_server::local_provider::MLX_URL.into());
+    let model = std::env::var("CLAUDEX_MLX_MODEL")
+        .unwrap_or_else(|_| "ddalcu/Inkling-2-Mini-MLX-8bit".into());
+    let gpt_model = std::env::var("CLAUDEX_GPT_MODEL").unwrap_or_else(|_| "gpt-6.2-sol".into());
+    let facade = Facade::start_with_local_acp().await;
+    let mut options = Config::new(&url, "MLX-Serve");
+    options.reasoning = true;
+    let config = options.refresh().await.expect("MLX-Serve model discovery");
+    assert!(
+        config.model(&model).is_some(),
+        "MLX-Serve does not advertise {model}"
+    );
+    config.write(facade._state.path()).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let local_test_config = json!({"model_reasoning_effort":"low"});
+    let mut desktop =
+        Desktop::connect_with_codex(&facade.socket, 0, &codex, Duration::from_secs(180)).await;
+    let models = desktop.ok("model/list", json!({})).await;
+    for id in [&model, &gpt_model, &"opus".to_owned(), &"fake-b".to_owned()] {
+        assert!(
+            models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["model"] == *id),
+            "{id} absent from merged catalog"
+        );
+    }
+    let thread = desktop
+        .thread(json!({"cwd":workspace.path(),"model":gpt_model,
+        "sandbox":"workspace-write","approvalPolicy":"never","historyMode":"paginated",
+        "config":local_test_config}))
+        .await;
+    desktop
+        .ok(
+            "thread/settings/update",
+            json!({"threadId":thread,"model":model,"effort":"low"}),
+        )
+        .await;
+    desktop.turn(&thread,&model,"Use the shell tool to run `printf MLX_TOOL_OK`. You must actually run it. Then reply with the command output.").await;
+    let completed = desktop.completed(&thread).await;
+    assert_eq!(
+        completed["params"]["turn"]["status"], "completed",
+        "{completed}"
+    );
+    let command = desktop.history.iter().find(|message| {
+        message["method"] == "item/completed"
+            && message["params"]["threadId"] == thread
+            && message["params"]["item"]["type"] == "commandExecution"
+            && message["params"]["item"]["aggregatedOutput"]
+                .as_str()
+                .is_some_and(|s| s.contains("MLX_TOOL_OK"))
+    });
+    assert!(
+        command.is_some(),
+        "No real command execution returned MLX_TOOL_OK: {completed}"
+    );
+    assert!(
+        desktop
+            .history
+            .iter()
+            .any(|message| message["method"] == "item/agentMessage/delta"
+                && message["params"]["threadId"] == thread),
+        "No streamed answer delta"
+    );
+    eprintln!("MLX live: native shell execution and streaming passed");
+    // This native Codex version creates the durable rollout on the first
+    // turn; metadata writes to an empty native prewarm are not supported.
+    desktop
+        .ok(
+            "thread/metadata/update",
+            json!({"threadId":thread,"projectId":""}),
+        )
+        .await;
+    // The post-restart turn below also verifies a real history-dependent follow-up.
+    let interrupted = desktop.turn(&thread,&model,"Run the shell command `sleep 30; printf INTERRUPT_PROBE_DONE` now. Do not answer before it finishes.").await;
+    let turn_id = interrupted["result"]["turn"]["id"].clone();
+    desktop
+        .until(|message| {
+            message["method"] == "item/started"
+                && message["params"]["threadId"] == thread
+                && message["params"]["item"]["type"] == "commandExecution"
+                && message["params"]["item"]["command"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("sleep 30"))
+        })
+        .await;
+    desktop
+        .ok(
+            "turn/interrupt",
+            json!({"threadId":thread,"turnId":turn_id}),
+        )
+        .await;
+    assert_eq!(
+        desktop.completed(&thread).await["params"]["turn"]["status"],
+        "interrupted"
+    );
+    eprintln!("MLX live: follow-up and native interruption passed");
+    desktop._child.kill().await.unwrap();
+    desktop._child.wait().await.unwrap();
+    drop(desktop);
+    let mut desktop =
+        Desktop::connect_with_codex(&facade.socket, 0, &codex, Duration::from_secs(180)).await;
+    let listed = desktop
+        .ok("thread/list", json!({"cwd":workspace.path(),"limit":100}))
+        .await;
+    assert!(
+        ids(&listed).contains(&thread),
+        "Cold list lost the public prewarm identity: {listed}"
+    );
+    let resumed = desktop
+        .ok(
+            "thread/resume",
+            json!({"threadId":thread,"modelProvider":"openai","excludeTurns":true,"config":local_test_config}),
+        )
+        .await;
+    assert_eq!(resumed["thread"]["id"], thread);
+    assert_eq!(resumed["thread"]["modelProvider"], PROVIDER);
+    desktop
+        .turn(
+            &thread,
+            &model,
+            "Recall the first successful shell command's output. Reply with that marker only.",
+        )
+        .await;
+    let resumed_turn = desktop.completed(&thread).await;
+    assert_eq!(
+        resumed_turn["params"]["turn"]["status"], "completed",
+        "{resumed_turn}"
+    );
+    assert!(
+        streamed_answer(&desktop, &resumed_turn).contains("MLX_TOOL_OK"),
+        "{resumed_turn}"
+    );
+    let fork = desktop
+        .ok(
+            "thread/fork",
+            json!({"threadId":thread,"excludeTurns":true}),
+        )
+        .await;
+    let fork_id = fork["thread"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(fork["thread"]["forkedFromId"], thread, "{fork}");
+    assert_eq!(fork["thread"]["modelProvider"], PROVIDER);
+    eprintln!("MLX live: cold list/resume and native fork identity passed");
+    let gpt = desktop.thread(json!({"cwd":workspace.path(),"model":gpt_model,
+        "sandbox":"workspace-write","approvalPolicy":"never","config":{"model_reasoning_effort":"low"}})).await;
+    let gpt_read = desktop.ok("thread/read", json!({"threadId":gpt})).await;
+    assert_eq!(gpt_read["thread"]["modelProvider"], "openai");
+    desktop
+        .turn(
+            &gpt,
+            &gpt_model,
+            "Reply with exactly GPT_ROUTE_OK. Do not use tools.",
+        )
+        .await;
+    let gpt_turn = desktop.completed(&gpt).await;
+    assert_eq!(
+        gpt_turn["params"]["turn"]["status"], "completed",
+        "{gpt_turn}"
+    );
+    assert!(
+        streamed_answer(&desktop, &gpt_turn).contains("GPT_ROUTE_OK"),
+        "{gpt_turn}"
+    );
+    eprintln!("MLX live: real GPT completion through the existing provider passed");
+    for id in [fork_id, thread, gpt] {
+        desktop.ok("thread/delete", json!({"threadId":id})).await;
+    }
 }
