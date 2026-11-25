@@ -4883,7 +4883,20 @@ impl Server {
                 .iter()
                 .find(|t| t.mcp_name == name)
         {
-            let data = match spec.validate_arguments(input) {
+            let mut input = input.clone();
+            let mut validation = spec.validate_arguments(&input);
+            // Antigravity adds a summary to its MCP permission preview. The
+            // bridge validates the actual tools/call arguments independently.
+            if validation.is_err()
+                && request["acp_tool_name"] == format!("mcp_codex_desktop_{name}")
+                && spec.input_schema["properties"].get("toolSummary").is_none()
+                && let Some(arguments) = input.as_object_mut()
+                && arguments.get("toolSummary").is_some_and(Value::is_string)
+            {
+                arguments.remove("toolSummary");
+                validation = spec.validate_arguments(&input);
+            }
+            let data = match validation {
                 Ok(()) => json!({"behavior":"allow","updatedInput":input}),
                 Err(error) => json!({"behavior":"deny","message":error.to_string()}),
             };

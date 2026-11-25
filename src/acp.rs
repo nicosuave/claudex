@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
@@ -419,8 +419,8 @@ impl AcpBackend {
             .await
             .map_err(|_| anyhow!("ACP event consumer closed"))?;
         let (bridge_calls, bridge_rx) = mpsc::channel(32);
-        if let Some(bridge) = &mut backend.bridge {
-            bridge.serve(bridge_calls, cancel.clone());
+        if let Some(bridge) = &backend.bridge {
+            bridge.calls.set(bridge_calls).expect("new ACP bridge");
         }
         let (prompt_tx, prompt_rx) = mpsc::channel(1);
         let driver = Driver {
@@ -478,7 +478,8 @@ impl AcpBackend {
         let mcp_servers = if options.dynamic_tools.is_empty() {
             json!([])
         } else {
-            let bridge = Bridge::bind(options.dynamic_tools.clone())?;
+            // Agents may synchronously discover MCP tools during session setup.
+            let bridge = Bridge::start(options.dynamic_tools.clone(), self.cancel.clone())?;
             let servers = json!([bridge.server_entry()?]);
             self.bridge = Some(bridge);
             servers
@@ -718,9 +719,7 @@ impl AcpBackend {
         if let Ok(mut stdin) = self.connection.stdin.try_lock() {
             stdin.take();
         }
-        if let Some(bridge) = self.bridge.take() {
-            bridge.remove();
-        }
+        drop(self.bridge.take());
         Ok(())
     }
 }
@@ -730,9 +729,6 @@ impl Drop for AcpBackend {
         self.cancel.cancel();
         if self.alive.load(Ordering::Acquire) {
             kill_group(self.process_id);
-        }
-        if let Some(bridge) = self.bridge.take() {
-            bridge.remove();
         }
     }
 }
@@ -1154,7 +1150,7 @@ impl Driver {
         );
         self.emit(json!({"type":"control_request","request_id":key,"request":{
             "subtype":"can_use_tool","tool_name":tool,"input":input,"tool_use_id":call_id,
-            "decision_reason":state["title"]}}))
+            "acp_tool_name":state["name"],"decision_reason":state["title"]}}))
             .await
     }
 
@@ -1357,45 +1353,31 @@ fn permission_subject(call: &Value, desktop_names: &[String]) -> (String, Value)
 struct Bridge {
     directory: PathBuf,
     socket: PathBuf,
-    listener: Option<tokio::net::UnixListener>,
-    tools: Vec<Value>,
+    calls: Arc<OnceLock<mpsc::Sender<BridgeCall>>>,
 }
 
 impl Bridge {
-    fn bind(tools: Vec<Value>) -> Result<Self> {
+    fn start(tools: Vec<Value>, cancel: CancellationToken) -> Result<Self> {
         // Socket paths are limited to about 100 bytes, so use the short
         // temporary directory rather than the facade state directory.
         let directory = std::env::temp_dir().join(format!(
             "claudex-mcp-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
-        std::fs::create_dir(&directory).context("creating MCP bridge directory")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let socket = directory.join("mcp.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).context("binding MCP bridge")?;
-        Ok(Self {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .context("creating MCP bridge directory")?;
+        let bridge = Self {
+            socket: directory.join("mcp.sock"),
             directory,
-            socket,
-            listener: Some(listener),
-            tools,
-        })
-    }
-
-    fn server_entry(&self) -> Result<Value> {
-        let executable = std::env::current_exe().context("locating facade executable")?;
-        Ok(json!({"name":DESKTOP_SERVER,"command":executable,
-            "args":["mcp-bridge","--socket",self.socket],"env":[]}))
-    }
-
-    fn serve(&mut self, calls: mpsc::Sender<BridgeCall>, cancel: CancellationToken) {
-        let Some(listener) = self.listener.take() else {
-            return;
+            calls: Arc::default(),
         };
-        let tools = Arc::new(self.tools.clone());
+        let listener =
+            tokio::net::UnixListener::bind(&bridge.socket).context("binding MCP bridge")?;
+        let tools = Arc::new(tools);
+        let calls = bridge.calls.clone();
         tokio::spawn(async move {
             loop {
                 let stream = tokio::select! {
@@ -1413,9 +1395,18 @@ impl Bridge {
                 ));
             }
         });
+        Ok(bridge)
     }
 
-    fn remove(&self) {
+    fn server_entry(&self) -> Result<Value> {
+        let executable = std::env::current_exe().context("locating facade executable")?;
+        Ok(json!({"name":DESKTOP_SERVER,"command":executable,
+            "args":["mcp-bridge","--socket",self.socket],"env":[]}))
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_dir(&self.directory);
     }
@@ -1424,7 +1415,7 @@ impl Bridge {
 async fn serve_bridge_connection(
     stream: tokio::net::UnixStream,
     tools: Arc<Vec<Value>>,
-    calls: mpsc::Sender<BridgeCall>,
+    calls: Arc<OnceLock<mpsc::Sender<BridgeCall>>>,
     cancel: CancellationToken,
 ) {
     let (read, mut write) = stream.into_split();
@@ -1459,6 +1450,13 @@ async fn serve_bridge_connection(
             }
             crate::backend::McpLocal::Notification => {}
             crate::backend::McpLocal::Call => {
+                let Some(calls) = calls.get() else {
+                    let _ = reply_tx
+                        .send(json!({"jsonrpc":"2.0","id":message["id"],"error":{
+                            "code":-32000,"message":"ACP session setup is still in progress"}}))
+                        .await;
+                    continue;
+                };
                 if calls
                     .send(BridgeCall {
                         message,

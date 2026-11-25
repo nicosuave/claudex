@@ -109,6 +109,15 @@ impl Client {
 
     /// `facade_args` are passed to the facade itself.
     async fn spawn_with(state: &Path, agent_flags: &[&str], facade_args: &[&str]) -> Self {
+        Self::spawn_with_env(state, agent_flags, facade_args, &[]).await
+    }
+
+    async fn spawn_with_env(
+        state: &Path,
+        agent_flags: &[&str],
+        facade_args: &[&str],
+        env: &[(&str, &Path)],
+    ) -> Self {
         schemas();
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
         command
@@ -138,8 +147,10 @@ impl Client {
             command.arg(format!("--acp-arg={flag}"));
         }
         command.args(facade_args);
-        // Plugin runtime coverage lives in plugin tests; keep the host's Codex out.
-        command.env_remove("CLAUDE_CODEX_PLUGIN_EXECUTABLE");
+        // Opt into a fixture plugin runtime without inheriting the host's Codex.
+        command
+            .env_remove("CLAUDE_CODEX_PLUGIN_EXECUTABLE")
+            .envs(env.iter().copied());
         let mut child = command
             .arg("--state-dir")
             .arg(state.join("facade"))
@@ -886,7 +897,8 @@ async fn desktop_tools_reach_the_agent_through_the_mcp_bridge() {
         .thread(json!({"sandbox":"danger-full-access","dynamicTools":[
             {"type":"namespace","name":"desktop","description":"Desktop tools","tools":[
                 {"type":"function","name":"lookup","description":"Look something up",
-                 "inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}}]}]}))
+                 "inputSchema":{"type":"object","properties":{"query":{"type":"string"}},
+                                "required":["query"],"additionalProperties":false}}]}]}))
         .await;
     let turn = client.start(&thread, "desktop-tool").await;
     let call = client.server_request("item/tool/call", &turn).await;
@@ -918,6 +930,57 @@ async fn desktop_tools_reach_the_agent_through_the_mcp_bridge() {
         .collect();
     assert_eq!(dynamic.len(), 1, "{completed}");
     assert_eq!(dynamic[0]["success"], true);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn codex_connector_tools_are_discoverable_in_new_and_resumed_acp_sessions() {
+    let state = tempfile::tempdir().unwrap();
+    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_runtime.sh");
+    let mut client = Client::spawn_with_env(
+        state.path(),
+        &[],
+        &["--idle-session-timeout-seconds", "0"],
+        &[
+            ("CLAUDE_CODEX_PLUGIN_EXECUTABLE", &codex),
+            ("CLAUDE_CODEX_PLUGIN_HOME", state.path()),
+        ],
+    )
+    .await;
+    let thread = client.thread(full_access()).await;
+    for _ in 0..2 {
+        let turn = client.start(&thread, "plugin-tool").await;
+        let approval = client
+            .server_request("item/tool/requestUserInput", &turn)
+            .await;
+        assert!(
+            approval["params"]["questions"][0]["question"]
+                .as_str()
+                .unwrap()
+                .contains("codex_plugin_")
+        );
+        client
+            .answer(
+                &approval,
+                json!({"answers":{"permission":{"answers":["Allow"]}}}),
+            )
+            .await;
+        let completed = client.completed(&turn).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        assert_eq!(
+            Client::reply(&completed),
+            "desktop result: Executed fixture"
+        );
+        assert!(
+            completed["items"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "mcpToolCall"
+                    && item["server"] == "fixture_server"
+                    && item["tool"] == "token"
+                    && item["status"] == "completed"
+            }),
+            "{completed}"
+        );
+    }
     client.close().await;
 }
 
