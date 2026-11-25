@@ -379,9 +379,9 @@ impl McpClient {
         let response = self
             .call(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             .unwrap();
-        if !response["result"]["tools"]
+        if response["result"]["tools"]
             .as_array()
-            .is_some_and(|tools| !tools.is_empty())
+            .is_none_or(Vec::is_empty)
         {
             fail(&format!("empty MCP catalog {response}"));
         }
